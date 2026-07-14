@@ -1,0 +1,41 @@
+[package]
+name = "obr-mod-updater"
+version = "0.5.2"
+edition = "2024"
+rust-version = "1.95"
+description = "Report-first mod analyzer and guarded updater for Oblivion Remastered"
+license-file = "LICENSE"
+publish = false
+default-run = "obr-mod-updater"
+
+[dependencies]
+anyhow = "1.0.103"
+arboard = "3.6.1"
+base64 = "0.22.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+directories = "6.0.0"
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+regex = "1.12"
+rfd = { version = "0.17.2", default-features = false, features = ["common-controls-v6"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sevenz-rust = { version = "0.6.1", default-features = false }
+sha2 = "0.11.0"
+slint = { version = "=1.12.1", default-features = false, features = ["accessibility", "backend-winit", "compat-1-2", "renderer-femtovg", "std"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+tempfile = "3.27.0"
+unrar = "0.5.8"
+walkdir = "2.5.0"
+winreg = "0.56.0"
+zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+slint-build = "=1.12.1"
+winresource = { version = "0.1.31", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = "symbols"

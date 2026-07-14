@@ -1,0 +1,744 @@
+import {
+    Button,
+    CheckBox,
+    LineEdit,
+    Palette,
+    TextEdit
+} from "std-widgets.slint";
+
+import { Theme } from "theme.slint";
+import { PathField } from "components/PathField.slint";
+import { PrimaryButton } from "components/PrimaryButton.slint";
+import { DangerButton } from "components/DangerButton.slint";
+import { StatusLine } from "components/StatusLine.slint";
+
+export component AppWindow inherits Window {
+    title: "OBR Mod Updater";
+    preferred-width: 1120px;
+    preferred-height: 760px;
+    min-width: 920px;
+    min-height: 680px;
+
+    in-out property <string> mod-path: "";
+    in-out property <string> application-version: "";
+    in-out property <string> game-path: "";
+    in-out property <string> output-path: "";
+    in-out property <bool> game-valid: false;
+    in-out property <string> game-status: "Choose the Oblivion Remastered installation folder.";
+    in-out property <int> game-tone: 0;
+    in-out property <string> runtime-tools-status: "Runtime tools will be checked after you choose a mod.";
+    in-out property <int> runtime-tools-tone: 0;
+    in-out property <string> runtime-tools-path: "Choose a valid game folder to show the install path.";
+    in-out property <string> connected-tools-status: "Built in: retoc + UAssetGUI. No external dependency sources saved.";
+    in-out property <string> preflight-status: "Safety checks run automatically with the update.";
+    in-out property <bool> preflight-ready: false;
+    in-out property <string> last-report-path: "";
+    in-out property <string> status-title: "Ready";
+    in-out property <string> status-message: "Choose a mod. The updater verifies every safety gate before creating a candidate.";
+    in-out property <int> status-tone: 0;
+    in-out property <int> progress: 0;
+    in-out property <string> log-text: "";
+    in-out property <string> live-warning: "";
+    in-out property <bool> update-running: false;
+    in-out property <bool> update-complete: false;
+    in-out property <bool> experimental-notice-visible: true;
+    in-out property <bool> modlist-warning-visible: false;
+    in-out property <bool> modlist-risk-accepted: false;
+
+    out property <bool> can-copy-log: root.log-text != "";
+    out property <bool> can-open-output: root.update-complete;
+    out property <bool> can-open-report: root.last-report-path != "";
+    out property <bool> can-update: !root.update-running
+        && !root.experimental-notice-visible
+        && root.mod-path != ""
+        && root.game-valid
+        && root.output-path != "";
+    out property <bool> can-fix-modlist: !root.update-running
+        && !root.experimental-notice-visible
+        && !root.modlist-warning-visible
+        && root.game-valid
+        && root.output-path != "";
+
+    callback choose-archive();
+    callback choose-mod-folder();
+    callback choose-game-folder();
+    callback choose-output-folder();
+    callback find-game();
+    callback attach-tools();
+    callback attach-tool-folder();
+    callback clear-tools();
+    callback copy-log();
+    callback open-output();
+    callback open-report();
+    callback update-mod();
+    callback fix-modlist();
+    callback mod-path-edited();
+    callback game-path-edited();
+    callback output-path-edited();
+
+    background: Theme.window-background;
+
+    init => {
+        Palette.color-scheme = ColorScheme.dark;
+    }
+
+    changed log-text => {
+        if (!live-log.has-focus) {
+            live-log.viewport-y = min(0px, live-log.visible-height - live-log.viewport-height);
+        }
+    }
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Rectangle {
+            height: 68px;
+            vertical-stretch: 0;
+            background: Theme.chrome-background;
+            border-color: Theme.border;
+            border-width: 1px;
+            border-radius: 7px;
+
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 18px;
+                spacing: 20px;
+
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+
+                    Text {
+                        text: "OBR Mod Updater";
+                        color: Theme.text-primary;
+                        font-size: 23px;
+                        font-weight: 700;
+                    }
+
+                    Text {
+                        text: "Guarded updates for Oblivion Remastered mods";
+                        color: Theme.text-muted;
+                        font-size: 12px;
+                    }
+                }
+
+                VerticalLayout {
+                    width: 240px;
+                    alignment: center;
+                    spacing: 4px;
+
+                    Text {
+                        text: "VERSION " + root.application-version;
+                        color: Theme.text-muted;
+                        font-size: 11px;
+                        font-weight: 600;
+                        horizontal-alignment: right;
+                    }
+
+                    StatusLine {
+                        align-end: true;
+                        text: root.update-running ? "Update in progress"
+                            : root.game-valid ? "Game connected"
+                            : "Setup required";
+                        tone: root.update-running ? 2 : root.game-valid ? 1 : 0;
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 12px;
+            vertical-stretch: 1;
+
+            Rectangle {
+                width: 420px;
+                horizontal-stretch: 0;
+                background: Theme.surface;
+                border-color: Theme.border;
+                border-width: 1px;
+                border-radius: 7px;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        min-height: 44px;
+                        max-height: 44px;
+                        vertical-stretch: 0;
+                        spacing: 2px;
+
+                        Text {
+                            text: "Update setup";
+                            color: Theme.text-primary;
+                            font-size: 18px;
+                            font-weight: 650;
+                        }
+
+                        Text {
+                            text: "Choose the files the updater needs.";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                        }
+                    }
+
+                    Rectangle {
+                        height: 1px;
+                        vertical-stretch: 0;
+                        background: Theme.border;
+                    }
+
+                    PathField {
+                        label: "SOURCE MOD";
+                        placeholder: "ZIP, 7Z, or extracted folder";
+                        primary-action: "Archive";
+                        secondary-action: "Folder";
+                        show-secondary: true;
+                        primary-width: 82px;
+                        secondary-width: 72px;
+                        value <=> root.mod-path;
+                        enabled: !root.update-running;
+                        primary-clicked => { root.choose-archive(); }
+                        secondary-clicked => { root.choose-mod-folder(); }
+                        edited => { root.mod-path-edited(); }
+                    }
+
+                    VerticalLayout {
+                        min-height: 86px;
+                        max-height: 86px;
+                        vertical-stretch: 0;
+                        spacing: 4px;
+
+                        PathField {
+                            label: "GAME INSTALLATION";
+                            placeholder: "Oblivion Remastered folder";
+                            primary-action: "Find game";
+                            secondary-action: "Folder";
+                            show-secondary: true;
+                            primary-width: 86px;
+                            secondary-width: 72px;
+                            value <=> root.game-path;
+                            enabled: !root.update-running;
+                            primary-clicked => { root.find-game(); }
+                            secondary-clicked => { root.choose-game-folder(); }
+                            edited => { root.game-path-edited(); }
+                        }
+
+                        StatusLine {
+                            text: root.game-status;
+                            tone: root.game-tone;
+                        }
+                    }
+
+                    VerticalLayout {
+                        min-height: 154px;
+                        max-height: 154px;
+                        vertical-stretch: 0;
+                        spacing: 5px;
+
+                        Text {
+                            text: "DEPENDENCIES & RUNTIME TOOLS";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            font-weight: 600;
+                        }
+
+                        StatusLine {
+                            text: root.connected-tools-status;
+                            tone: 0;
+                        }
+
+                        StatusLine {
+                            text: root.runtime-tools-status;
+                            tone: root.runtime-tools-tone;
+                        }
+
+                        VerticalLayout {
+                            height: 42px;
+                            vertical-stretch: 0;
+                            spacing: 3px;
+
+                            Text {
+                                text: "RUNTIME INSTALL PATH";
+                                color: Theme.text-muted;
+                                font-size: 10px;
+                                font-weight: 600;
+                            }
+
+                            LineEdit {
+                                height: 26px;
+                                text: root.runtime-tools-path;
+                                read-only: true;
+                                accessible-label: "Runtime tools install path";
+                            }
+                        }
+
+                        HorizontalLayout {
+                            height: 38px;
+                            vertical-stretch: 0;
+                            spacing: 8px;
+
+                            Button {
+                                text: "Add archives";
+                                horizontal-stretch: 1;
+                                enabled: !root.update-running;
+                                clicked => { root.attach-tools(); }
+                            }
+
+                            Button {
+                                text: "Add folder";
+                                horizontal-stretch: 1;
+                                enabled: !root.update-running;
+                                clicked => { root.attach-tool-folder(); }
+                            }
+
+                            Button {
+                                text: "Clear";
+                                width: 68px;
+                                enabled: !root.update-running;
+                                clicked => { root.clear-tools(); }
+                            }
+                        }
+                    }
+
+                    PathField {
+                        label: "SAVE UPDATED MOD TO";
+                        placeholder: "Output folder";
+                        primary-action: "Browse";
+                        primary-width: 82px;
+                        value <=> root.output-path;
+                        enabled: !root.update-running;
+                        primary-clicked => { root.choose-output-folder(); }
+                        edited => { root.output-path-edited(); }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: transparent;
+                    }
+
+                    HorizontalLayout {
+                        height: 18px;
+                        vertical-stretch: 0;
+                        spacing: 12px;
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "All checks and file operations run locally on this computer.";
+                            color: Theme.text-muted;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            text: "MADE BY LOREX_";
+                            color: Theme.text-muted;
+                            font-size: 10px;
+                            font-weight: 600;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+                background: Theme.surface;
+                border-color: Theme.border;
+                border-width: 1px;
+                border-radius: 7px;
+
+                VerticalLayout {
+                    padding: 16px;
+                    spacing: 12px;
+
+                    HorizontalLayout {
+                        height: 96px;
+                        vertical-stretch: 0;
+                        spacing: 16px;
+
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            alignment: center;
+                            spacing: 3px;
+
+                            Text {
+                                text: root.status-title;
+                                color: root.status-tone == 1 ? Theme.success
+                                    : root.status-tone == 2 ? Theme.warning
+                                    : root.status-tone == 3 ? Theme.danger
+                                    : Theme.text-primary;
+                                font-size: 19px;
+                                font-weight: 650;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.status-message;
+                                color: Theme.text-secondary;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        VerticalLayout {
+                            width: 184px;
+                            spacing: 8px;
+
+                            PrimaryButton {
+                                width: 184px;
+                                text: root.update-running ? "Working…" : "Analyze & update";
+                                enabled: root.can-update;
+                                clicked => { root.update-mod(); }
+                            }
+
+                            DangerButton {
+                                width: 184px;
+                                text: "Fix installed modlist";
+                                enabled: root.can-fix-modlist;
+                                clicked => {
+                                    root.modlist-risk-accepted = false;
+                                    root.modlist-warning-visible = true;
+                                }
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        min-height: 54px;
+                        max-height: 54px;
+                        vertical-stretch: 0;
+                        spacing: 7px;
+
+                        HorizontalLayout {
+                            height: 20px;
+                            vertical-stretch: 0;
+                            spacing: 12px;
+
+                            Text {
+                                horizontal-stretch: 1;
+                                text: root.preflight-ready ? "Safety checks passed"
+                                    : root.update-running ? "Safety checks running"
+                                    : root.preflight-status;
+                                color: root.preflight-ready ? Theme.success
+                                    : root.update-running ? Theme.link
+                                    : Theme.text-secondary;
+                                font-size: 12px;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: root.progress + "%";
+                                color: Theme.text-primary;
+                                font-family: "Consolas";
+                                font-size: 12px;
+                                font-weight: 600;
+                                horizontal-alignment: right;
+                            }
+                        }
+
+                        Rectangle {
+                            height: 8px;
+                            vertical-stretch: 0;
+                            background: Theme.surface-raised;
+                            border-color: Theme.border;
+                            border-width: 1px;
+                            border-radius: 4px;
+
+                            Rectangle {
+                                x: 1px;
+                                y: 1px;
+                                width: max(0px, (parent.width - 2px) * root.progress / 100);
+                                height: parent.height - 2px;
+                                background: root.status-tone == 3 ? Theme.danger
+                                    : root.update-complete ? Theme.success
+                                    : Theme.link;
+                                border-radius: 3px;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        min-height: 230px;
+                        vertical-stretch: 1;
+                        background: Theme.terminal;
+                        border-color: Theme.border;
+                        border-width: 1px;
+                        border-radius: 6px;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+
+                            HorizontalLayout {
+                                height: 34px;
+                                vertical-stretch: 0;
+                                spacing: 10px;
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 1px;
+
+                                    Text {
+                                        text: "Live activity";
+                                        color: Theme.text-primary;
+                                        font-size: 14px;
+                                        font-weight: 600;
+                                    }
+
+                                    Text {
+                                        text: "READ ONLY — SELECT TEXT OR PRESS CTRL+C";
+                                        color: Theme.text-muted;
+                                        font-size: 10px;
+                                    }
+                                }
+
+                                Button {
+                                    text: "Copy log";
+                                    width: 90px;
+                                    enabled: root.can-copy-log;
+                                    clicked => { root.copy-log(); }
+                                }
+                            }
+
+                            if root.live-warning != "" : Rectangle {
+                                height: 30px;
+                                vertical-stretch: 0;
+                                background: Theme.warning-surface;
+                                border-color: Theme.warning-border;
+                                border-width: 1px;
+                                border-radius: 4px;
+
+                                Text {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    text: root.live-warning;
+                                    color: Theme.warning;
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                    accessible-label: "Unsupported mod warning";
+                                }
+                            }
+
+                            live-log := TextEdit {
+                                vertical-stretch: 1;
+                                text: root.log-text;
+                                read-only: true;
+                                wrap: word-wrap;
+                                font-size: 13px;
+                                accessible-label: "Live read-only updater activity";
+                                placeholder-text: "Activity will appear here after you start the update.";
+                            }
+                        }
+                    }
+
+                    HorizontalLayout {
+                        height: 40px;
+                        vertical-stretch: 0;
+                        spacing: 8px;
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: root.update-complete ? "Updated mod is ready."
+                                : root.can-open-report ? "A diagnostic report is available."
+                                : "Results appear here when processing finishes.";
+                            color: root.update-complete ? Theme.success : Theme.text-muted;
+                            font-size: 12px;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+
+                        Button {
+                            text: "Open report";
+                            width: 112px;
+                            enabled: root.can-open-report;
+                            clicked => { root.open-report(); }
+                        }
+
+                        Button {
+                            text: "Open output";
+                            width: 112px;
+                            enabled: root.can-open-output;
+                            clicked => { root.open-output(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.experimental-notice-visible : Rectangle {
+        z: 100;
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: #b8000000;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            x: max(16px, (parent.width - self.width) / 2);
+            y: max(16px, (parent.height - self.height) / 2);
+            width: min(560px, parent.width - 32px);
+            height: min(286px, parent.height - 32px);
+            background: Theme.surface;
+            border-color: Theme.border-strong;
+            border-width: 1px;
+            border-radius: 8px;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 14px;
+
+                Text {
+                    text: "Experimental Software Notice";
+                    color: Theme.text-primary;
+                    font-size: 21px;
+                    font-weight: 700;
+                }
+
+                Rectangle {
+                    height: 1px;
+                    vertical-stretch: 0;
+                    background: Theme.border;
+                }
+
+                Text {
+                    vertical-stretch: 1;
+                    text: "OBR Mod Updater is experimental software, and compatibility with every mod is not guaranteed. If an update does not work as expected, please report the issue in the release thread and include the generated output and updater log. These files provide the diagnostic information needed to investigate the problem.";
+                    color: Theme.text-secondary;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "Made by Lorex_";
+                    color: Theme.text-muted;
+                    font-size: 11px;
+                    horizontal-alignment: right;
+                }
+
+                PrimaryButton {
+                    height: 44px;
+                    vertical-stretch: 0;
+                    text: "I understand";
+                    clicked => { root.experimental-notice-visible = false; }
+                }
+            }
+        }
+    }
+
+    if root.modlist-warning-visible : Rectangle {
+        z: 110;
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: #c0000000;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            x: max(16px, (parent.width - self.width) / 2);
+            y: max(16px, (parent.height - self.height) / 2);
+            width: min(640px, parent.width - 32px);
+            height: min(450px, parent.height - 32px);
+            background: Theme.surface;
+            border-color: Theme.danger-border;
+            border-width: 2px;
+            border-radius: 8px;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 14px;
+
+                Text {
+                    text: "Fix installed modlist?";
+                    color: Theme.text-primary;
+                    font-size: 22px;
+                    font-weight: 700;
+                }
+
+                Rectangle {
+                    height: 58px;
+                    vertical-stretch: 0;
+                    background: Theme.danger-surface;
+                    border-color: Theme.danger-border;
+                    border-width: 1px;
+                    border-radius: 6px;
+
+                    Text {
+                        x: 16px;
+                        width: parent.width - 32px;
+                        text: "WARNING: THIS MAY BREAK YOUR MODS — USE AT YOUR OWN RISK";
+                        color: Theme.danger;
+                        font-size: 15px;
+                        font-weight: 750;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                    }
+                }
+
+                Text {
+                    vertical-stretch: 1;
+                    text: "This experimental batch operation will inspect every PAK/UCAS/UTOC container set in the game's ~mods directory. Containers that pass a proven adapter will be rebuilt and will overwrite their installed originals. A successful structural check does not prove that a mod will work in-game. Mods may develop missing textures, clipping, crashes, or may stop loading entirely. Unsupported and ambiguous containers will be skipped. Close the game before continuing.";
+                    color: Theme.text-secondary;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "Verified backups and the batch report will be saved outside ~mods to:\n" + root.output-path;
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                CheckBox {
+                    text: "I understand the updater may break installed mods, and I accept the risk.";
+                    checked <=> root.modlist-risk-accepted;
+                    accessible-label: "Acknowledge the installed modlist overwrite risk";
+                }
+
+                HorizontalLayout {
+                    height: 44px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+
+                    Button {
+                        horizontal-stretch: 1;
+                        text: "Cancel";
+                        clicked => {
+                            root.modlist-warning-visible = false;
+                            root.modlist-risk-accepted = false;
+                        }
+                    }
+
+                    DangerButton {
+                        horizontal-stretch: 1;
+                        text: "Overwrite eligible mods";
+                        enabled: root.modlist-risk-accepted;
+                        clicked => {
+                            root.fix-modlist();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

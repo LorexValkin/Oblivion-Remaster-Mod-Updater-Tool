@@ -1,0 +1,5 @@
+Optional: place original UE4SS and TesSyncMapInjector ZIP/7Z archives here.
+
+They are not bundled with this application. The updater scans this folder and
+identifies compatible archives by their contents. You can also use Attach tools
+inside the application.

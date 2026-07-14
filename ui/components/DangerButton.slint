@@ -1,0 +1,55 @@
+import { Theme } from "../theme.slint";
+
+export component DangerButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    out property <bool> pressed: root.enabled && touch.pressed;
+    callback clicked();
+
+    min-width: 176px;
+    min-height: 44px;
+    max-height: 44px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    border-width: focus.has-focus ? 2px : 1px;
+    border-color: !root.enabled ? Theme.border
+        : focus.has-focus ? Theme.focus-ring
+        : Theme.danger-border;
+    background: !root.enabled ? Theme.action-disabled
+        : root.pressed ? Theme.danger-action-pressed
+        : touch.has-hover ? Theme.danger-action-hover
+        : Theme.danger-action;
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { touch.clicked(); }
+
+    animate background { duration: 150ms; }
+
+    Text {
+        text: root.text;
+        color: root.enabled ? #ffffff : Theme.text-muted;
+        font-size: 14px;
+        font-weight: 650;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == "\n") {
+                touch.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}

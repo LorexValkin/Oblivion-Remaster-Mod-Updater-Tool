@@ -1,0 +1,59 @@
+import { Button, LineEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+export component PathField inherits VerticalLayout {
+    in property <string> label;
+    in property <string> placeholder;
+    in property <string> primary-action;
+    in property <string> secondary-action;
+    in property <bool> show-secondary: false;
+    in property <bool> enabled: true;
+    in property <length> primary-width: 88px;
+    in property <length> secondary-width: 76px;
+    in-out property <string> value;
+
+    callback primary-clicked();
+    callback secondary-clicked();
+    callback edited();
+
+    min-height: 62px;
+    max-height: 62px;
+    vertical-stretch: 0;
+    spacing: 5px;
+
+    Text {
+        text: root.label;
+        color: Theme.text-secondary;
+        font-size: 12px;
+        font-weight: 600;
+    }
+
+    HorizontalLayout {
+        height: 40px;
+        vertical-stretch: 0;
+        spacing: 8px;
+
+        LineEdit {
+            horizontal-stretch: 1;
+            text <=> root.value;
+            placeholder-text: root.placeholder;
+            enabled: root.enabled;
+            accessible-label: root.label;
+            edited => { root.edited(); }
+        }
+
+        Button {
+            text: root.primary-action;
+            width: root.primary-width;
+            enabled: root.enabled;
+            clicked => { root.primary-clicked(); }
+        }
+
+        if root.show-secondary : Button {
+            text: root.secondary-action;
+            width: root.secondary-width;
+            enabled: root.enabled;
+            clicked => { root.secondary-clicked(); }
+        }
+    }
+}

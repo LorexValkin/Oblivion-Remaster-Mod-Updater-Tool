@@ -6,8 +6,9 @@ use crate::dependencies::{
 };
 use crate::game::validate_game_install;
 use crate::replacement::{
-    ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER, ReplacementProbeSummary,
-    TEXTURE_REPLACEMENT_ADAPTER, probe_input, probe_mixed_armor_input, probe_texture_input,
+    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
+    ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER, probe_additive_static_mesh_input,
+    probe_input, probe_mixed_armor_input, probe_texture_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -613,16 +614,20 @@ pub fn analyze_with_progress(
         mixed_armor_probe_error,
         texture_probe,
         texture_probe_error,
+        additive_static_mesh_probe,
+        additive_static_mesh_probe_error,
     ) = if replacement_shape {
         progress("Classifying replacement assets and comparing them with the current game");
         if let Some(game) = game.as_ref().filter(|value| value.valid) {
             match probe_input(&request.mod_input, &game.root) {
-                Ok(summary) => (Some(summary), None, None, None, None, None),
+                Ok(summary) => (Some(summary), None, None, None, None, None, None, None),
                 Err(armor_error) => match probe_mixed_armor_input(&request.mod_input, &game.root) {
                     Ok(summary) => (
                         None,
                         Some(format!("{armor_error:#}")),
                         Some(summary),
+                        None,
+                        None,
                         None,
                         None,
                         None,
@@ -635,23 +640,41 @@ pub fn analyze_with_progress(
                             Some(format!("{mixed_error:#}")),
                             Some(summary),
                             None,
+                            None,
+                            None,
                         ),
-                        Err(texture_error) => (
-                            None,
-                            Some(format!("{armor_error:#}")),
-                            None,
-                            Some(format!("{mixed_error:#}")),
-                            None,
-                            Some(format!("{texture_error:#}")),
-                        ),
+                        Err(texture_error) => {
+                            match probe_additive_static_mesh_input(&request.mod_input, &game.root) {
+                                Ok(summary) => (
+                                    None,
+                                    Some(format!("{armor_error:#}")),
+                                    None,
+                                    Some(format!("{mixed_error:#}")),
+                                    None,
+                                    Some(format!("{texture_error:#}")),
+                                    Some(summary),
+                                    None,
+                                ),
+                                Err(static_error) => (
+                                    None,
+                                    Some(format!("{armor_error:#}")),
+                                    None,
+                                    Some(format!("{mixed_error:#}")),
+                                    None,
+                                    Some(format!("{texture_error:#}")),
+                                    None,
+                                    Some(format!("{static_error:#}")),
+                                ),
+                            }
+                        }
                     },
                 },
             }
         } else {
-            let message =
-                    "A complete target game is required to prove replacement package paths, IDs, classes, formats, and dependencies."
-                        .to_owned();
+            let message = "A complete target game is required to prove replacement package paths, IDs, classes, formats, and dependencies.".to_owned();
             (
+                None,
+                Some(message.clone()),
                 None,
                 Some(message.clone()),
                 None,
@@ -661,12 +684,13 @@ pub fn analyze_with_progress(
             )
         }
     } else {
-        (None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None)
     };
     let replacement_probe = armor_probe
         .as_ref()
         .or(mixed_armor_probe.as_ref())
         .or(texture_probe.as_ref())
+        .or(additive_static_mesh_probe.as_ref())
         .cloned();
     progress("Checking embedded engines and connected runtime tools");
     let candidates = if exists {
@@ -875,7 +899,7 @@ pub fn analyze_with_progress(
                 })
             });
         let failure = format!(
-            "No proven replacement adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {}",
+            "No proven replacement adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} Additive static mesh: {}",
             armor_probe_error
                 .as_deref()
                 .unwrap_or("not evaluated as armor."),
@@ -884,7 +908,10 @@ pub fn analyze_with_progress(
                 .unwrap_or("not evaluated as mixed armor."),
             texture_probe_error
                 .as_deref()
-                .unwrap_or("not evaluated as Texture2D.")
+                .unwrap_or("not evaluated as Texture2D."),
+            additive_static_mesh_probe_error
+                .as_deref()
+                .unwrap_or("not evaluated as an additive static mesh.")
         );
         checks.push(check(
             "replacement-contract",
@@ -911,8 +938,13 @@ pub fn analyze_with_progress(
         replacement_shape && mixed_armor_probe.is_some() && adapter_blockers.is_empty();
     let texture_can_update =
         replacement_shape && texture_probe.is_some() && adapter_blockers.is_empty();
-    let can_update =
-        additive_can_update || armor_can_update || mixed_armor_can_update || texture_can_update;
+    let additive_static_mesh_can_update =
+        replacement_shape && additive_static_mesh_probe.is_some() && adapter_blockers.is_empty();
+    let can_update = additive_can_update
+        || armor_can_update
+        || mixed_armor_can_update
+        || texture_can_update
+        || additive_static_mesh_can_update;
     let mut capabilities = vec![Capability {
         id: "report-only-v1".to_owned(),
         available: inventory.is_some(),
@@ -966,6 +998,17 @@ pub fn analyze_with_progress(
             adapter_blockers.clone()
         } else {
             vec!["mod-layout-does-not-match-proven-texture-replacement-adapter".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
+        id: ADDITIVE_STATIC_MESH_ADAPTER.to_owned(),
+        available: additive_static_mesh_can_update,
+        evidence_level: "guarded-custom-static-mesh-rebase".to_owned(),
+        description: "Custom Unreal project Content paths containing only SM_ StaticMesh assets are accepted when every imported package resolves within the mod or the current game. The rebuilt containers must preserve the complete package inventory and pass a current-Zen roundtrip. Blueprints, materials, scripts, unresolved dependencies, and mixed package types remain report-only.".to_owned(),
+        blockers: if additive_static_mesh_probe.is_some() {
+            adapter_blockers.clone()
+        } else {
+            vec!["mod-layout-does-not-match-guarded-custom-static-mesh-adapter".to_owned()]
         },
     });
     capabilities.push(Capability {
@@ -1031,6 +1074,8 @@ pub fn analyze_with_progress(
             Some(MIXED_ARMOR_REPLACEMENT_ADAPTER.to_owned())
         } else if texture_can_update {
             Some(TEXTURE_REPLACEMENT_ADAPTER.to_owned())
+        } else if additive_static_mesh_can_update {
+            Some(ADDITIVE_STATIC_MESH_ADAPTER.to_owned())
         } else {
             None
         },

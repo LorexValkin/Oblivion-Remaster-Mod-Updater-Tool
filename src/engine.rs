@@ -5,9 +5,10 @@ use crate::container::lint_equal_order_overrides;
 use crate::dependencies::{DependencyReport, check_or_install, game_is_running, scan_dependencies};
 use crate::game::{save_settings, validate_game_install};
 use crate::replacement::{
-    ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER, TEXTURE_REPLACEMENT_ADAPTER,
-    canonical_package_path, inspect_mixed_armor_staged, inspect_staged, inspect_texture_staged,
-    stage_input,
+    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
+    TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
+    inspect_additive_static_mesh_staged, inspect_mixed_armor_staged, inspect_staged,
+    inspect_texture_staged, stage_input,
 };
 use crate::retoc::{PackageEntry, RetocTool};
 use crate::tes4::{
@@ -16,9 +17,9 @@ use crate::tes4::{
 };
 use crate::uasset::{
     BodySetupRepair, MaterialImportRepair, PayloadEquivalenceReport, SkeletalCompatibilityProfile,
-    TextureAssetDiagnostic, derive_skeletal_compatibility_profile, inspect_texture_asset,
-    repair_legacy_body_setups, repair_skeletal_mesh_imports, verify_preserved_export_payloads,
-    verify_rebased_payloads,
+    TextureAssetDiagnostic, derive_skeletal_compatibility_profile, inspect_static_mesh_asset,
+    inspect_texture_asset, repair_legacy_body_setups, repair_skeletal_mesh_imports,
+    verify_preserved_export_payloads, verify_rebased_payloads,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -626,6 +627,7 @@ pub fn run_update(
         ARMOR_REPLACEMENT_ADAPTER => run_armor_replacement_update(request, callback),
         MIXED_ARMOR_REPLACEMENT_ADAPTER => run_mixed_armor_replacement_update(request, callback),
         TEXTURE_REPLACEMENT_ADAPTER => run_texture_replacement_update(request, callback),
+        ADDITIVE_STATIC_MESH_ADAPTER => run_additive_static_mesh_update(request, callback),
         adapter => bail!("preflight selected an unknown or empty update adapter: {adapter}"),
     }
 }
@@ -2225,6 +2227,277 @@ fn run_texture_replacement_update(
     })
 }
 
+fn find_additive_static_mesh_asset(root: &Path, package_path: &str) -> Result<PathBuf> {
+    let expected = canonical_additive_static_mesh_path(package_path)?.to_ascii_lowercase();
+    let matches = WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
+        })
+        .filter(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .and_then(|relative| {
+                    canonical_additive_static_mesh_path(&relative.to_string_lossy()).ok()
+                })
+                .is_some_and(|candidate| candidate.to_ascii_lowercase() == expected)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!(
+            "expected one extracted additive static mesh for {package_path}; found {}",
+            matches.len()
+        );
+    }
+    Ok(matches[0].clone())
+}
+
+fn run_additive_static_mesh_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let input_hash = if mod_input.is_file() {
+        sha256_file(&mod_input)?
+    } else {
+        sha256_directory(&mod_input)?
+    };
+    let game = validate_game_install(&request.game_root, "native UI");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    if !request.output_parent.is_dir() {
+        bail!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        );
+    }
+    let output_directory = request.output_parent.join(format!(
+        "{}-current-candidate-{}",
+        safe_leaf(&mod_input),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    if output_directory.exists() || output_archive.exists() {
+        bail!("timestamped output already exists; wait one second and try again");
+    }
+    if request.persist_settings {
+        save_settings(&game.root, &request.output_parent)?;
+    }
+    let paks = game.root.join(r"OblivionRemastered\Content\Paks");
+    let global_utoc = paks.join("global.utoc");
+    let global_ucas = paks.join("global.ucas");
+    let work = tempfile::Builder::new()
+        .prefix("obr-additive-static-mesh-update-")
+        .tempdir()?;
+    let staged = work.path().join("source");
+    let retoc = RetocTool::materialize()?;
+    stage(
+        callback,
+        1,
+        "Classifying custom StaticMesh packages and resolving imports",
+    );
+    stage_input(&mod_input, &staged)?;
+    let inspection = inspect_additive_static_mesh_staged(&staged, &game.root, &retoc)?;
+    fs::create_dir_all(&output_directory)?;
+    copy_tree(&staged, &output_directory)?;
+    let mut results = Vec::new();
+    for container in &inspection.containers {
+        let root = work.path().join("containers").join(&container.name);
+        let input = root.join("input");
+        let legacy = root.join("legacy");
+        let rebuilt = root.join("rebuilt");
+        let verify_input = root.join("verify-input");
+        let verify_legacy = root.join("verify-legacy");
+        let json_work = root.join("payload-verification");
+        for dir in [
+            &input,
+            &legacy,
+            &rebuilt,
+            &verify_input,
+            &verify_legacy,
+            &json_work,
+        ] {
+            fs::create_dir_all(dir)?;
+        }
+        for source in [
+            &global_utoc,
+            &global_ucas,
+            &container.utoc,
+            &container.ucas,
+            &container.pak,
+        ] {
+            copy_file(source, &input.join(source.file_name().unwrap()))?;
+        }
+        stage(
+            callback,
+            2,
+            &format!(
+                "Extracting guarded custom static meshes from {}",
+                container.name
+            ),
+        );
+        let run = retoc.run(args([
+            OsString::from("to-legacy"),
+            input.as_os_str().to_owned(),
+            legacy.as_os_str().to_owned(),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            OsString::from("--no-shaders"),
+            OsString::from("--no-script-objects"),
+            OsString::from("--no-parallel"),
+        ]))?;
+        let (count, failed) = RetocTool::extraction_summary(
+            &run,
+            &format!("custom static-mesh extraction {}", container.name),
+        )?;
+        if failed != 0 || count != container.packages.len() {
+            bail!(
+                "custom static-mesh extraction {} expected {} assets, extracted {count}, failed {failed}",
+                container.name,
+                container.packages.len()
+            );
+        }
+        for package in &container.packages {
+            inspect_static_mesh_asset(&find_additive_static_mesh_asset(&legacy, &package.path)?)?;
+        }
+        stage(
+            callback,
+            3,
+            &format!("Rebuilding {} against current Zen metadata", container.name),
+        );
+        let utoc = rebuilt.join(format!("{}.utoc", container.name));
+        let zen = retoc.run(args([
+            OsString::from("to-zen"),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            legacy.as_os_str().to_owned(),
+            utoc.as_os_str().to_owned(),
+        ]))?;
+        RetocTool::assert_success(&zen, &format!("retoc to-zen {}", container.name))?;
+        let ucas = utoc.with_extension("ucas");
+        let pak = utoc.with_extension("pak");
+        for path in [&utoc, &ucas, &pak] {
+            if !path.is_file() {
+                bail!("rebuilt static-mesh output missing: {}", path.display());
+            }
+        }
+        retoc.verify(&utoc, &format!("retoc verify rebuilt {}", container.name))?;
+        let (_, entries) = retoc.package_entries(&utoc)?;
+        let expected = container
+            .packages
+            .iter()
+            .map(|e| {
+                Ok((
+                    canonical_additive_static_mesh_path(&e.path)?.to_ascii_lowercase(),
+                    e.package_id,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let actual = entries
+            .iter()
+            .map(|e| {
+                Ok((
+                    canonical_additive_static_mesh_path(&e.path)?.to_ascii_lowercase(),
+                    e.package_id,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if expected != actual {
+            bail!("rebuilt package inventory changed for {}", container.name);
+        }
+        let (_, store) = retoc.package_store_entries(&utoc)?;
+        for original in &container.package_store {
+            let rebuilt_entry = store
+                .iter()
+                .find(|e| e.package_id == original.package_id)
+                .with_context(|| {
+                    format!("rebuilt package store is missing {}", original.package_id)
+                })?;
+            if BTreeSet::from_iter(rebuilt_entry.imported_package_ids.iter().copied())
+                != BTreeSet::from_iter(original.imported_package_ids.iter().copied())
+            {
+                bail!("rebuilt package imports changed for {}", original.path);
+            }
+        }
+        for source in [&global_utoc, &global_ucas, &utoc, &ucas, &pak] {
+            copy_file(source, &verify_input.join(source.file_name().unwrap()))?;
+        }
+        let roundtrip = retoc.run(args([
+            OsString::from("to-legacy"),
+            verify_input.as_os_str().to_owned(),
+            verify_legacy.as_os_str().to_owned(),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            OsString::from("--no-shaders"),
+            OsString::from("--no-script-objects"),
+            OsString::from("--no-parallel"),
+        ]))?;
+        let (verify_count, verify_failed) = RetocTool::extraction_summary(
+            &roundtrip,
+            &format!("custom static-mesh roundtrip {}", container.name),
+        )?;
+        if verify_failed != 0 || verify_count != container.packages.len() {
+            bail!(
+                "custom static-mesh roundtrip {} expected {} assets, extracted {verify_count}, failed {verify_failed}",
+                container.name,
+                container.packages.len()
+            );
+        }
+        let payload = verify_preserved_export_payloads(&legacy, &verify_legacy, &json_work)?;
+        let candidate_utoc = output_directory.join(&container.relative_utoc);
+        let candidate_ucas = candidate_utoc.with_extension("ucas");
+        let candidate_pak = candidate_utoc.with_extension("pak");
+        copy_file(&utoc, &candidate_utoc)?;
+        copy_file(&ucas, &candidate_ucas)?;
+        copy_file(&pak, &candidate_pak)?;
+        results.push(json!({"name":container.name,"packages":container.packages,"payloadEquivalence":payload}));
+    }
+    let report_path = output_directory.join("custom-static-mesh-update-report.json");
+    fs::write(
+        &report_path,
+        serde_json::to_vec_pretty(
+            &json!({"schema":"obr-custom-static-mesh-update-report","version":1,"adapter":ADDITIVE_STATIC_MESH_ADAPTER,"status":"candidate_ready_for_runtime_test","structurallyVerified":true,"runtimeVerified":false,"sourceSha256":input_hash,"gamePackageInventory":inspection.target_utoc,"containers":results,"verification":{"packagePathsAndIdsPreserved":true,"packageImportsPreserved":true,"roundtripFileSetsPreserved":true,"productionRuntimeGateRequired":true}}),
+        )?,
+    )?;
+    stage(
+        callback,
+        4,
+        "Creating portable custom StaticMesh candidate archive",
+    );
+    create_zip_from_paths(
+        &output_archive,
+        &output_directory,
+        std::slice::from_ref(&output_directory),
+    )?;
+    if !output_archive.is_file() {
+        bail!(
+            "output archive was not created: {}",
+            output_archive.display()
+        );
+    }
+    stage(
+        callback,
+        5,
+        "Custom static-mesh candidate complete; shipping-game test still required",
+    );
+    Ok(UpdateOutcome {
+        adapter: ADDITIVE_STATIC_MESH_ADAPTER.to_owned(),
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: inspection.packages.len(),
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -415,6 +415,49 @@ pub fn inspect_texture_asset(asset: &Path) -> Result<TextureAssetDiagnostic> {
     let document: Value = serde_json::from_slice(&fs::read(&json)?)?;
     inspect_texture_document(&document, asset)
 }
+pub fn inspect_static_mesh_asset(asset: &Path) -> Result<()> {
+    let tool = UAssetGuiTool::materialize()?;
+    let work = tempfile::Builder::new()
+        .prefix("obr-static-mesh-inspect-")
+        .tempdir()?;
+    let json = work.path().join("static-mesh.json");
+    tool.to_json(asset, &json)?;
+    let document: Value = serde_json::from_slice(&fs::read(&json)?)?;
+    let exports = document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("StaticMesh UAsset JSON has no Exports")?;
+    let meshes = exports
+        .iter()
+        .filter(|export| {
+            texture_class_name(&document, export)
+                .is_ok_and(|class| class.eq_ignore_ascii_case("StaticMesh"))
+        })
+        .collect::<Vec<_>>();
+    if meshes.len() != 1 {
+        bail!(
+            "additive static-mesh package must contain exactly one StaticMesh export; found {} in {}",
+            meshes.len(),
+            asset.display()
+        );
+    }
+    let object_name = meshes[0]
+        .get("ObjectName")
+        .and_then(Value::as_str)
+        .context("StaticMesh export has no ObjectName")?;
+    let expected = asset
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("StaticMesh filename is not UTF-8")?;
+    if !object_name.eq_ignore_ascii_case(expected)
+        || !object_name.to_ascii_lowercase().starts_with("sm_")
+    {
+        bail!(
+            "StaticMesh export name {object_name} does not match SM_ package filename {expected}"
+        );
+    }
+    Ok(())
+}
 
 fn contains_ascii(data: &[u8], needle: &[u8]) -> bool {
     data.windows(needle.len()).any(|window| window == needle)

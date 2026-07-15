@@ -1,6 +1,6 @@
 use crate::archive::{copy_tree, extract_archive};
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
-use crate::uasset::{TextureAssetDiagnostic, inspect_texture_asset};
+use crate::uasset::{TextureAssetDiagnostic, inspect_static_mesh_asset, inspect_texture_asset};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 pub const ARMOR_REPLACEMENT_ADAPTER: &str = "native-armor-replacement-v1";
 pub const MIXED_ARMOR_REPLACEMENT_ADAPTER: &str = "native-mixed-armor-expansion-v1";
 pub const TEXTURE_REPLACEMENT_ADAPTER: &str = "native-texture-replacement-v1";
+pub const ADDITIVE_STATIC_MESH_ADAPTER: &str = "native-additive-static-mesh-v1";
 const MAX_REPLACEMENT_PACKAGES: usize = 4096;
 const ARMOR_PATH_PREFIX: &str = "oblivionremastered/content/art/armor/";
 const ARMOR_FORM_PATH_PREFIX: &str = "oblivionremastered/content/forms/items/armor/";
@@ -21,6 +22,7 @@ enum ReplacementScope {
     Armor,
     MixedArmor,
     Texture,
+    AdditiveStaticMesh,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +85,29 @@ pub(crate) fn canonical_package_path(raw: &str) -> Result<String> {
         bail!("package path contains traversal after normalization: {raw}");
     }
     Ok(canonical)
+}
+pub(crate) fn canonical_additive_static_mesh_path(raw: &str) -> Result<String> {
+    let normalized = raw.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .skip_while(|part| *part == "..")
+        .collect::<Vec<_>>();
+    if parts.len() < 3
+        || !parts[1].eq_ignore_ascii_case("Content")
+        || parts.iter().any(|part| *part == "..")
+        || parts[0].eq_ignore_ascii_case("OblivionRemastered")
+    {
+        bail!(
+            "additive static-mesh package must use a custom <Project>/Content path without traversal: {raw}"
+        );
+    }
+    let path = parts.join("/");
+    let leaf = path.rsplit('/').next().unwrap_or_default();
+    if !leaf.to_ascii_lowercase().starts_with("sm_") || !leaf.ends_with(".uasset") {
+        bail!("additive static-mesh package must be an SM_ UAsset: {raw}");
+    }
+    Ok(path)
 }
 
 fn package_key(path: &str) -> Result<String> {
@@ -181,7 +206,12 @@ fn discover_containers(
         retoc.verify(&utoc, &format!("retoc verify replacement source {name}"))?;
         let (_, mut package_store) = retoc.package_store_entries(&utoc)?;
         for package in &mut package_store {
-            package.path = canonical_package_path(&package.path)?;
+            package.path = match scope {
+                ReplacementScope::AdditiveStaticMesh => {
+                    canonical_additive_static_mesh_path(&package.path)?
+                }
+                _ => canonical_package_path(&package.path)?,
+            };
             match scope {
                 ReplacementScope::Armor if !is_armor_skeletal_mesh(&package.path) => {
                     bail!(
@@ -204,6 +234,7 @@ fn discover_containers(
                         package.path
                     );
                 }
+                ReplacementScope::AdditiveStaticMesh => {}
                 _ => {}
             }
         }
@@ -589,6 +620,74 @@ pub fn inspect_texture_staged(
     Ok(inspection)
 }
 
+pub fn inspect_additive_static_mesh_staged(
+    root: &Path,
+    game_root: &Path,
+    retoc: &RetocTool,
+) -> Result<ReplacementInspection> {
+    let containers = discover_containers(root, retoc, ReplacementScope::AdditiveStaticMesh)?;
+    let mut packages = containers
+        .iter()
+        .flat_map(|container| container.packages.iter().cloned())
+        .collect::<Vec<_>>();
+    if packages.is_empty() || packages.len() > MAX_REPLACEMENT_PACKAGES {
+        bail!("additive static-mesh input must contain 1..={MAX_REPLACEMENT_PACKAGES} packages");
+    }
+    packages.sort_by(|left, right| {
+        left.path
+            .to_ascii_lowercase()
+            .cmp(&right.path.to_ascii_lowercase())
+    });
+    for pair in packages.windows(2) {
+        if pair[0].path.eq_ignore_ascii_case(&pair[1].path)
+            || pair[0].package_id == pair[1].package_id
+        {
+            bail!("additive static-mesh packages must have unique paths and package IDs");
+        }
+    }
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    let (_, target_entries) = retoc.package_store_entries(&target_utoc)?;
+    let target_by_id = target_entries
+        .iter()
+        .map(|entry| (entry.package_id, entry))
+        .collect::<HashMap<_, _>>();
+    let source_ids = packages
+        .iter()
+        .map(|package| package.package_id)
+        .collect::<HashSet<_>>();
+    let mut target_dependencies = HashMap::new();
+    for package in containers
+        .iter()
+        .flat_map(|container| &container.package_store)
+    {
+        for dependency in &package.imported_package_ids {
+            if source_ids.contains(dependency) {
+                continue;
+            };
+            let target = target_by_id.get(dependency).with_context(|| {
+                format!(
+                    "additive static-mesh package {} has unresolved external dependency {}",
+                    package.path, dependency
+                )
+            })?;
+            target_dependencies.insert(
+                *dependency,
+                PackageEntry {
+                    package_id: *dependency,
+                    path: target.path.clone(),
+                },
+            );
+        }
+    }
+    Ok(ReplacementInspection {
+        containers,
+        packages,
+        target_utoc,
+        target_dependencies,
+        target_package_imports: HashMap::new(),
+    })
+}
 pub fn probe_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
     let work = tempfile::Builder::new()
         .prefix("obr-armor-replacement-probe-")
@@ -703,6 +802,107 @@ fn extract_texture_package(
     find_extracted_asset(output, &package.path)
 }
 
+fn find_extracted_additive_static_mesh(root: &Path, package_path: &str) -> Result<PathBuf> {
+    let expected = canonical_additive_static_mesh_path(package_path)?.to_ascii_lowercase();
+    let matches = WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
+        })
+        .filter(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .and_then(|relative| {
+                    canonical_additive_static_mesh_path(&relative.to_string_lossy()).ok()
+                })
+                .is_some_and(|path| path.to_ascii_lowercase() == expected)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        bail!(
+            "expected one extracted additive static mesh for {package_path}; found {}",
+            matches.len()
+        );
+    }
+    Ok(matches[0].clone())
+}
+
+pub fn probe_additive_static_mesh_input(
+    mod_input: &Path,
+    game_root: &Path,
+) -> Result<ReplacementProbeSummary> {
+    let work = tempfile::Builder::new()
+        .prefix("obr-additive-static-mesh-probe-")
+        .tempdir()?;
+    let staged = work.path().join("source");
+    stage_input(mod_input, &staged)?;
+    let retoc = RetocTool::materialize()?;
+    let inspection = inspect_additive_static_mesh_staged(&staged, game_root, &retoc)?;
+    let paks = game_root.join(r"OblivionRemastered\Content\Paks");
+    let global_utoc = paks.join("global.utoc");
+    let global_ucas = paks.join("global.ucas");
+    for container in &inspection.containers {
+        let root = work.path().join("containers").join(&container.name);
+        let input = root.join("input");
+        let legacy = root.join("legacy");
+        fs::create_dir_all(&input)?;
+        for source in [
+            &global_utoc,
+            &global_ucas,
+            &container.utoc,
+            &container.ucas,
+            &container.pak,
+        ] {
+            copy_probe_file(source, &input.join(source.file_name().unwrap()))?;
+        }
+        let result = retoc.run([
+            OsString::from("to-legacy"),
+            input.as_os_str().to_owned(),
+            legacy.as_os_str().to_owned(),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            OsString::from("--no-shaders"),
+            OsString::from("--no-script-objects"),
+            OsString::from("--no-parallel"),
+        ])?;
+        let (extracted, failed) =
+            RetocTool::extraction_summary(&result, "additive static-mesh source extraction")?;
+        if failed != 0 || extracted != container.packages.len() {
+            bail!(
+                "additive static-mesh source extraction expected {} assets, extracted {extracted}, failed {failed}",
+                container.packages.len()
+            );
+        }
+        for package in &container.packages {
+            inspect_static_mesh_asset(&find_extracted_additive_static_mesh(
+                &legacy,
+                &package.path,
+            )?)
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{} did not pass structural StaticMesh inspection",
+                    package.path
+                )
+            })?;
+        }
+    }
+    Ok(ReplacementProbeSummary {
+        container_count: inspection.containers.len(),
+        package_count: inspection.packages.len(),
+        asset_kind: "additive-custom-static-mesh".to_owned(),
+        package_paths: inspection
+            .packages
+            .iter()
+            .map(|package| package.path.clone())
+            .collect(),
+        texture_assets: Vec::new(),
+    })
+}
 pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
     let work = tempfile::Builder::new()
         .prefix("obr-texture-replacement-probe-")
@@ -825,6 +1025,32 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
 mod tests {
     use super::*;
 
+    #[test]
+    fn accepts_only_safe_custom_static_mesh_content_paths() {
+        assert_eq!(
+            canonical_additive_static_mesh_path(
+                "../../../BackpackQuivers/Content/Art/Equipment/Weapons/Ebony/SM_Ebony_Quiver.uasset"
+            )
+            .unwrap(),
+            "BackpackQuivers/Content/Art/Equipment/Weapons/Ebony/SM_Ebony_Quiver.uasset"
+        );
+        assert!(
+            canonical_additive_static_mesh_path(
+                "BackpackQuivers/Content/Art/Equipment/Weapons/Ebony/BP_Quiver.uasset"
+            )
+            .is_err()
+        );
+        assert!(
+            canonical_additive_static_mesh_path(
+                "OblivionRemastered/Content/Art/SM_NotCustom.uasset"
+            )
+            .is_err()
+        );
+        assert!(
+            canonical_additive_static_mesh_path("BackpackQuivers/Content/../SM_Traversal.uasset")
+                .is_err()
+        );
+    }
     #[test]
     fn canonicalizes_retoc_paths_case_insensitively() {
         assert_eq!(

@@ -2,7 +2,7 @@ use crate::archive::{copy_tree, extract_archive};
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::uasset::{
     TextureAssetDiagnostic, inspect_static_mesh_asset, inspect_texture_asset,
-    repair_static_mesh_imports,
+    repair_legacy_body_setups, repair_static_mesh_imports,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -964,6 +964,7 @@ pub fn probe_additive_static_mesh_input(
                 }
             }
         }
+        repair_legacy_body_setups(&legacy)?;
     }
     Ok(ReplacementProbeSummary {
         container_count: inspection.containers.len(),

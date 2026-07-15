@@ -2393,6 +2393,7 @@ fn run_additive_static_mesh_update(
                 }
             }
         }
+        let body_setup_repairs = repair_legacy_body_setups(&legacy)?;
         stage(
             callback,
             3,
@@ -2504,13 +2505,13 @@ fn run_additive_static_mesh_update(
         copy_file(&utoc, &candidate_utoc)?;
         copy_file(&ucas, &candidate_ucas)?;
         copy_file(&pak, &candidate_pak)?;
-        results.push(json!({"name":container.name,"packages":container.packages,"staticMeshImportRepairs":static_mesh_import_repairs,"payloadEquivalence":payload}));
+        results.push(json!({"name":container.name,"packages":container.packages,"staticMeshImportRepairs":static_mesh_import_repairs,"bodySetupRepairs":body_setup_repairs,"payloadEquivalence":payload}));
     }
     let report_path = output_directory.join("custom-static-mesh-update-report.json");
     fs::write(
         &report_path,
         serde_json::to_vec_pretty(
-            &json!({"schema":"obr-custom-static-mesh-update-report","version":1,"adapter":ADDITIVE_STATIC_MESH_ADAPTER,"status":"candidate_ready_for_runtime_test","structurallyVerified":true,"runtimeVerified":false,"sourceSha256":input_hash,"gamePackageInventory":inspection.target_utoc,"containers":results,"verification":{"packagePathsAndIdsPreserved":true,"packageImportsPreserved":true,"roundtripFileSetsPreserved":true,"productionRuntimeGateRequired":true}}),
+            &json!({"schema":"obr-custom-static-mesh-update-report","version":1,"adapter":ADDITIVE_STATIC_MESH_ADAPTER,"status":"candidate_ready_for_runtime_test","structurallyVerified":true,"runtimeVerified":false,"sourceSha256":input_hash,"gamePackageInventory":inspection.target_utoc,"containers":results,"verification":{"packagePathsAndIdsPreserved":true,"packageImportsPreserved":true,"bodySetupCookedPhysicsNormalized":true,"roundtripFileSetsPreserved":true,"productionRuntimeGateRequired":true}}),
         )?,
     )?;
     stage(

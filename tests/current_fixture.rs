@@ -353,5 +353,18 @@ fn updates_current_additive_static_mesh_fixture() {
     assert_eq!(report["runtimeVerified"], false);
     assert_eq!(report["verification"]["packagePathsAndIdsPreserved"], true);
     assert_eq!(report["verification"]["packageImportsPreserved"], true);
+    assert_eq!(
+        report["verification"]["bodySetupCookedPhysicsNormalized"],
+        true
+    );
+    let body_repairs = report["containers"][0]["bodySetupRepairs"]
+        .as_array()
+        .unwrap();
+    assert!(!body_repairs.is_empty());
+    assert!(
+        body_repairs
+            .iter()
+            .all(|repair| repair["collisionRemoved"] == true)
+    );
     assert_eq!(report["verification"]["roundtripFileSetsPreserved"], true);
 }

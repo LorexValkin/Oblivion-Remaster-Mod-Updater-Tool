@@ -1,4 +1,4 @@
-OBLIVION REMASTER MOD UPDATER v0.5.2
+OBLIVION REMASTER MOD UPDATER v0.5.3
 EXPERIMENTAL TEST RELEASE
 
 Made by Lorex_
@@ -13,8 +13,10 @@ to be tested in the game.
 
 Current guarded lanes include selected additive SyncMap equipment mods, pure
 existing SK_ armor replacements, separated mixed armor/form replacements, and
-pure existing Texture2D replacement containers. Mixed body-dependent armor can
-use one installed or connected custom body archive to rebind its current body
+pure existing Texture2D replacement containers. Custom-project SM_ StaticMesh
+containers can also be updated when their dependencies and material slots
+resolve uniquely against the current game. Mixed body-dependent armor can use
+one installed or connected custom body archive to rebind its current body
 material and skeleton automatically. The body replacer stays external and is
 never bundled into the result. Texture packages must match the current game's
 package identity and pixel format and may not include material, blueprint,
@@ -95,6 +97,10 @@ Preserve the generated filenames and keep all files from a container set
 together. Make sure an older version of the same mod is not still installed.
 Test the affected item in game, including its model, textures, materials,
 animation, collision, and physics where applicable.
+
+For legacy custom meshes, the updater may remove incompatible cooked physics
+bytes from BodySetup while preserving its serialized collision properties. The
+report records this as a BodySetup repair. Always test collision in-game.
 
 REPORTING A PROBLEM
 

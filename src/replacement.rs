@@ -1,6 +1,9 @@
 use crate::archive::{copy_tree, extract_archive};
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
-use crate::uasset::{TextureAssetDiagnostic, inspect_static_mesh_asset, inspect_texture_asset};
+use crate::uasset::{
+    TextureAssetDiagnostic, inspect_static_mesh_asset, inspect_texture_asset,
+    repair_static_mesh_imports,
+};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -110,6 +113,25 @@ pub(crate) fn canonical_additive_static_mesh_path(raw: &str) -> Result<String> {
     Ok(path)
 }
 
+pub(crate) fn additive_static_mesh_filter(packages: &[PackageEntry]) -> Result<String> {
+    let first = packages
+        .first()
+        .context("custom StaticMesh container has no packages")?;
+    let canonical = canonical_additive_static_mesh_path(&first.path)?;
+    let project = canonical
+        .split('/')
+        .next()
+        .context("custom StaticMesh package has no project segment")?;
+    if packages.iter().any(|package| {
+        canonical_additive_static_mesh_path(&package.path)
+            .ok()
+            .and_then(|path| path.split('/').next().map(str::to_owned))
+            .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(project))
+    }) {
+        bail!("each custom StaticMesh container must use one <Project>/Content root");
+    }
+    Ok(format!("{project}/Content/"))
+}
 fn package_key(path: &str) -> Result<String> {
     Ok(canonical_package_path(path)?.to_ascii_lowercase())
 }
@@ -656,7 +678,18 @@ pub fn inspect_additive_static_mesh_staged(
         .iter()
         .map(|package| package.package_id)
         .collect::<HashSet<_>>();
-    let mut target_dependencies = HashMap::new();
+    let target_dependencies = target_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.package_id,
+                PackageEntry {
+                    package_id: entry.package_id,
+                    path: entry.path.clone(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
     for package in containers
         .iter()
         .flat_map(|container| &container.package_store)
@@ -665,19 +698,12 @@ pub fn inspect_additive_static_mesh_staged(
             if source_ids.contains(dependency) {
                 continue;
             };
-            let target = target_by_id.get(dependency).with_context(|| {
+            target_by_id.get(dependency).with_context(|| {
                 format!(
                     "additive static-mesh package {} has unresolved external dependency {}",
                     package.path, dependency
                 )
             })?;
-            target_dependencies.insert(
-                *dependency,
-                PackageEntry {
-                    package_id: *dependency,
-                    path: target.path.clone(),
-                },
-            );
         }
     }
     Ok(ReplacementInspection {
@@ -832,6 +858,29 @@ fn find_extracted_additive_static_mesh(root: &Path, package_path: &str) -> Resul
     Ok(matches[0].clone())
 }
 
+fn create_additive_probe_view(game_root: &Path) -> Result<tempfile::TempDir> {
+    let paks = game_root.join(r"OblivionRemastered\Content\Paks");
+    let view = tempfile::Builder::new()
+        .prefix(".obr-static-mesh-probe-")
+        .tempdir_in(game_root)
+        .context("creating a temporary dependency view beside the game")?;
+    for name in [
+        "global.utoc",
+        "global.ucas",
+        "OblivionRemastered-Windows.utoc",
+        "OblivionRemastered-Windows.ucas",
+        "OblivionRemastered-Windows.pak",
+    ] {
+        let source = paks.join(name);
+        if !source.is_file() {
+            bail!("required game container file is missing: {name}");
+        }
+        fs::hard_link(&source, view.path().join(name)).with_context(|| {
+            format!("creating a temporary hard link for dependency container {name}")
+        })?;
+    }
+    Ok(view)
+}
 pub fn probe_additive_static_mesh_input(
     mod_input: &Path,
     game_root: &Path,
@@ -843,52 +892,77 @@ pub fn probe_additive_static_mesh_input(
     stage_input(mod_input, &staged)?;
     let retoc = RetocTool::materialize()?;
     let inspection = inspect_additive_static_mesh_staged(&staged, game_root, &retoc)?;
-    let paks = game_root.join(r"OblivionRemastered\Content\Paks");
-    let global_utoc = paks.join("global.utoc");
-    let global_ucas = paks.join("global.ucas");
     for container in &inspection.containers {
         let root = work.path().join("containers").join(&container.name);
-        let input = root.join("input");
         let legacy = root.join("legacy");
-        fs::create_dir_all(&input)?;
-        for source in [
-            &global_utoc,
-            &global_ucas,
-            &container.utoc,
-            &container.ucas,
-            &container.pak,
-        ] {
-            copy_probe_file(source, &input.join(source.file_name().unwrap()))?;
+        fs::create_dir_all(&legacy)?;
+        let view = create_additive_probe_view(game_root)?;
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            copy_probe_file(source, &view.path().join(source.file_name().unwrap()))?;
         }
+        let filter = additive_static_mesh_filter(&container.packages)?;
         let result = retoc.run([
             OsString::from("to-legacy"),
-            input.as_os_str().to_owned(),
+            view.path().as_os_str().to_owned(),
             legacy.as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
             OsString::from("--no-shaders"),
             OsString::from("--no-script-objects"),
             OsString::from("--no-parallel"),
+            OsString::from("--filter"),
+            OsString::from(filter),
         ])?;
         let (extracted, failed) =
             RetocTool::extraction_summary(&result, "additive static-mesh source extraction")?;
-        if failed != 0 || extracted != container.packages.len() {
+        let extracted_uasset_count = WalkDir::new(&legacy)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
+            })
+            .count();
+        if failed != 0
+            || extracted < container.packages.len()
+            || extracted_uasset_count != container.packages.len()
+        {
             bail!(
                 "additive static-mesh source extraction expected {} assets, extracted {extracted}, failed {failed}",
                 container.packages.len()
             );
         }
         for package in &container.packages {
-            inspect_static_mesh_asset(&find_extracted_additive_static_mesh(
-                &legacy,
-                &package.path,
-            )?)
-            .map_err(|_| {
+            let asset = find_extracted_additive_static_mesh(&legacy, &package.path)?;
+            let imports = inspect_static_mesh_asset(&asset).map_err(|error| {
                 anyhow::anyhow!(
-                    "{} did not pass structural StaticMesh inspection",
+                    "{} did not pass structural StaticMesh inspection: {error:#}",
                     package.path
                 )
             })?;
+            if imports
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+            {
+                repair_static_mesh_imports(
+                    &asset,
+                    &inspection.target_dependencies,
+                    &root
+                        .join("import-repairs")
+                        .join(package.package_id.to_string()),
+                )?;
+                let repaired_imports = inspect_static_mesh_asset(&asset)?;
+                if repaired_imports
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+                {
+                    bail!("{} retained unresolved imports after repair", package.path);
+                }
+            }
         }
     }
     Ok(ReplacementProbeSummary {

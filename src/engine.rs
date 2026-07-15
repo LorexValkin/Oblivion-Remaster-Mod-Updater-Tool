@@ -6,9 +6,9 @@ use crate::dependencies::{DependencyReport, check_or_install, game_is_running, s
 use crate::game::{save_settings, validate_game_install};
 use crate::replacement::{
     ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
-    TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
-    inspect_additive_static_mesh_staged, inspect_mixed_armor_staged, inspect_staged,
-    inspect_texture_staged, stage_input,
+    TEXTURE_REPLACEMENT_ADAPTER, additive_static_mesh_filter, canonical_additive_static_mesh_path,
+    canonical_package_path, inspect_additive_static_mesh_staged, inspect_mixed_armor_staged,
+    inspect_staged, inspect_texture_staged, stage_input,
 };
 use crate::retoc::{PackageEntry, RetocTool};
 use crate::tes4::{
@@ -19,7 +19,7 @@ use crate::uasset::{
     BodySetupRepair, MaterialImportRepair, PayloadEquivalenceReport, SkeletalCompatibilityProfile,
     TextureAssetDiagnostic, derive_skeletal_compatibility_profile, inspect_static_mesh_asset,
     inspect_texture_asset, repair_legacy_body_setups, repair_skeletal_mesh_imports,
-    verify_preserved_export_payloads, verify_rebased_payloads,
+    repair_static_mesh_imports, verify_preserved_export_payloads, verify_rebased_payloads,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -2293,9 +2293,7 @@ fn run_additive_static_mesh_update(
     if request.persist_settings {
         save_settings(&game.root, &request.output_parent)?;
     }
-    let paks = game.root.join(r"OblivionRemastered\Content\Paks");
-    let global_utoc = paks.join("global.utoc");
-    let global_ucas = paks.join("global.ucas");
+
     let work = tempfile::Builder::new()
         .prefix("obr-additive-static-mesh-update-")
         .tempdir()?;
@@ -2313,31 +2311,18 @@ fn run_additive_static_mesh_update(
     let mut results = Vec::new();
     for container in &inspection.containers {
         let root = work.path().join("containers").join(&container.name);
-        let input = root.join("input");
         let legacy = root.join("legacy");
         let rebuilt = root.join("rebuilt");
-        let verify_input = root.join("verify-input");
         let verify_legacy = root.join("verify-legacy");
         let json_work = root.join("payload-verification");
-        for dir in [
-            &input,
-            &legacy,
-            &rebuilt,
-            &verify_input,
-            &verify_legacy,
-            &json_work,
-        ] {
+        for dir in [&legacy, &rebuilt, &verify_legacy, &json_work] {
             fs::create_dir_all(dir)?;
         }
-        for source in [
-            &global_utoc,
-            &global_ucas,
-            &container.utoc,
-            &container.ucas,
-            &container.pak,
-        ] {
-            copy_file(source, &input.join(source.file_name().unwrap()))?;
+        let input_view = create_isolated_stock_view(&game.root)?;
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            copy_file(source, &input_view.path().join(source.file_name().unwrap()))?;
         }
+        let filter = additive_static_mesh_filter(&container.packages)?;
         stage(
             callback,
             2,
@@ -2348,27 +2333,65 @@ fn run_additive_static_mesh_update(
         );
         let run = retoc.run(args([
             OsString::from("to-legacy"),
-            input.as_os_str().to_owned(),
+            input_view.path().as_os_str().to_owned(),
             legacy.as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
             OsString::from("--no-shaders"),
             OsString::from("--no-script-objects"),
             OsString::from("--no-parallel"),
+            OsString::from("--filter"),
+            OsString::from(filter.clone()),
         ]))?;
         let (count, failed) = RetocTool::extraction_summary(
             &run,
             &format!("custom static-mesh extraction {}", container.name),
         )?;
-        if failed != 0 || count != container.packages.len() {
+        let extracted_uasset_count = WalkDir::new(&legacy)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
+            })
+            .count();
+        if failed != 0
+            || count < container.packages.len()
+            || extracted_uasset_count != container.packages.len()
+        {
             bail!(
                 "custom static-mesh extraction {} expected {} assets, extracted {count}, failed {failed}",
                 container.name,
                 container.packages.len()
             );
         }
+        let mut static_mesh_import_repairs = Vec::new();
         for package in &container.packages {
-            inspect_static_mesh_asset(&find_additive_static_mesh_asset(&legacy, &package.path)?)?;
+            let asset = find_additive_static_mesh_asset(&legacy, &package.path)?;
+            let imports = inspect_static_mesh_asset(&asset)?;
+            if imports
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+            {
+                static_mesh_import_repairs.push(repair_static_mesh_imports(
+                    &asset,
+                    &inspection.target_dependencies,
+                    &root
+                        .join("import-repairs")
+                        .join(package.package_id.to_string()),
+                )?);
+                let repaired_imports = inspect_static_mesh_asset(&asset)?;
+                if repaired_imports
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+                {
+                    bail!("{} retained unresolved imports after repair", package.path);
+                }
+            }
         }
         stage(
             callback,
@@ -2419,7 +2442,7 @@ fn run_additive_static_mesh_update(
         for original in &container.package_store {
             let rebuilt_entry = store
                 .iter()
-                .find(|e| e.package_id == original.package_id)
+                .find(|entry| entry.package_id == original.package_id)
                 .with_context(|| {
                     format!("rebuilt package store is missing {}", original.package_id)
                 })?;
@@ -2429,24 +2452,45 @@ fn run_additive_static_mesh_update(
                 bail!("rebuilt package imports changed for {}", original.path);
             }
         }
-        for source in [&global_utoc, &global_ucas, &utoc, &ucas, &pak] {
-            copy_file(source, &verify_input.join(source.file_name().unwrap()))?;
+        let verify_view = create_isolated_stock_view(&game.root)?;
+        for source in [&utoc, &ucas, &pak] {
+            copy_file(
+                source,
+                &verify_view.path().join(source.file_name().unwrap()),
+            )?;
         }
         let roundtrip = retoc.run(args([
             OsString::from("to-legacy"),
-            verify_input.as_os_str().to_owned(),
+            verify_view.path().as_os_str().to_owned(),
             verify_legacy.as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
             OsString::from("--no-shaders"),
             OsString::from("--no-script-objects"),
             OsString::from("--no-parallel"),
+            OsString::from("--filter"),
+            OsString::from(filter),
         ]))?;
         let (verify_count, verify_failed) = RetocTool::extraction_summary(
             &roundtrip,
             &format!("custom static-mesh roundtrip {}", container.name),
         )?;
-        if verify_failed != 0 || verify_count != container.packages.len() {
+        let verify_uasset_count = WalkDir::new(&verify_legacy)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
+            })
+            .count();
+        if verify_failed != 0
+            || verify_count < container.packages.len()
+            || verify_uasset_count != container.packages.len()
+        {
             bail!(
                 "custom static-mesh roundtrip {} expected {} assets, extracted {verify_count}, failed {verify_failed}",
                 container.name,
@@ -2460,7 +2504,7 @@ fn run_additive_static_mesh_update(
         copy_file(&utoc, &candidate_utoc)?;
         copy_file(&ucas, &candidate_ucas)?;
         copy_file(&pak, &candidate_pak)?;
-        results.push(json!({"name":container.name,"packages":container.packages,"payloadEquivalence":payload}));
+        results.push(json!({"name":container.name,"packages":container.packages,"staticMeshImportRepairs":static_mesh_import_repairs,"payloadEquivalence":payload}));
     }
     let report_path = output_directory.join("custom-static-mesh-update-report.json");
     fs::write(

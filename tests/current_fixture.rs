@@ -316,3 +316,42 @@ fn updates_current_texture_replacement_fixture() {
     assert_eq!(report["verification"]["roundtripFileSetsPreserved"], true);
     assert_eq!(report["verification"]["uexpAndUbulkBytePreserved"], true);
 }
+#[test]
+#[ignore = "requires an installed game and a local additive StaticMesh fixture"]
+fn updates_current_additive_static_mesh_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-additive-static-mesh-v1".to_owned(),
+            mod_input: required("OBR_TEST_STATIC_MESH_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "additive StaticMesh update failed:\n{error:#}\n{}",
+            log.join("\n")
+        )
+    });
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    assert_eq!(outcome.adapter, "native-additive-static-mesh-v1");
+    assert_eq!(outcome.package_count, 1);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["structurallyVerified"], true);
+    assert_eq!(report["runtimeVerified"], false);
+    assert_eq!(report["verification"]["packagePathsAndIdsPreserved"], true);
+    assert_eq!(report["verification"]["packageImportsPreserved"], true);
+    assert_eq!(report["verification"]["roundtripFileSetsPreserved"], true);
+}

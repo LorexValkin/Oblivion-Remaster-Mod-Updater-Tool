@@ -415,7 +415,18 @@ pub fn inspect_texture_asset(asset: &Path) -> Result<TextureAssetDiagnostic> {
     let document: Value = serde_json::from_slice(&fs::read(&json)?)?;
     inspect_texture_document(&document, asset)
 }
-pub fn inspect_static_mesh_asset(asset: &Path) -> Result<()> {
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaticMeshImportRepair {
+    pub asset: String,
+    pub repaired_material_import_count: usize,
+    pub material_slot_names: Vec<String>,
+    pub target_package_ids: Vec<u64>,
+    pub target_package_paths: Vec<String>,
+    pub exports_byte_identical: bool,
+    pub uexp_byte_identical: bool,
+}
+pub fn inspect_static_mesh_asset(asset: &Path) -> Result<Vec<String>> {
     let tool = UAssetGuiTool::materialize()?;
     let work = tempfile::Builder::new()
         .prefix("obr-static-mesh-inspect-")
@@ -456,9 +467,255 @@ pub fn inspect_static_mesh_asset(asset: &Path) -> Result<()> {
             "StaticMesh export name {object_name} does not match SM_ package filename {expected}"
         );
     }
-    Ok(())
+    let package_imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("StaticMesh UAsset JSON has no Imports")?
+        .iter()
+        .filter(|import| import.get("ClassName").and_then(Value::as_str) == Some("Package"))
+        .filter_map(|import| import.get("ObjectName").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    Ok(package_imports)
 }
 
+pub fn repair_static_mesh_imports(
+    asset: &Path,
+    target_dependencies: &HashMap<u64, PackageEntry>,
+    work: &Path,
+) -> Result<StaticMeshImportRepair> {
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work.join("static-source.json");
+    let patched_json = work.join("static-patched.json");
+    let rebuilt_asset = work.join(
+        asset
+            .file_name()
+            .context("StaticMesh path has no filename")?,
+    );
+    let verify_json = work.join("static-verified.json");
+    tool.to_json(asset, &source_json)?;
+    let mut document: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    let original_exports = export_data(&document)?;
+    let imports_snapshot = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("StaticMesh UAsset JSON has no Imports")?
+        .clone();
+    let exports = document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("StaticMesh UAsset JSON has no Exports")?;
+    let mesh = exports
+        .iter()
+        .filter(|export| {
+            export
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with("sm_"))
+        })
+        .collect::<Vec<_>>();
+    if mesh.len() != 1 {
+        bail!(
+            "StaticMesh import repair requires exactly one SM_ export; found {}",
+            mesh.len()
+        );
+    }
+    let encoded = mesh[0]
+        .get("Data")
+        .and_then(Value::as_str)
+        .or_else(|| mesh[0].get("Extras").and_then(Value::as_str))
+        .context("StaticMesh export has no raw payload")?;
+    let bytes = BASE64
+        .decode(encoded)
+        .context("StaticMesh payload is not base64")?;
+    let unknown_packages = imports_snapshot
+        .iter()
+        .enumerate()
+        .filter(|(_, import)| {
+            import.get("ClassName").and_then(Value::as_str) == Some("Package")
+                && import
+                    .get("ObjectName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if unknown_packages.is_empty() {
+        bail!("StaticMesh has no unresolved material imports to repair");
+    }
+    let mut patches = Vec::<(usize, usize, ImportTarget)>::new();
+    for package_index in unknown_packages {
+        let outer = -i64::try_from(package_index)? - 1;
+        let children = imports_snapshot
+            .iter()
+            .enumerate()
+            .filter(|(_, import)| {
+                import.get("OuterIndex").and_then(Value::as_i64) == Some(outer)
+                    && import.get("ObjectName").and_then(Value::as_str) == Some("UnknownExport")
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if children.len() != 1 {
+            bail!(
+                "unresolved StaticMesh package import {package_index} must have exactly one UnknownExport child; found {}",
+                children.len()
+            );
+        }
+        let object_index = children[0];
+        let reference = -i32::try_from(object_index)? - 1;
+        let pattern = reference.to_le_bytes();
+        let mut names = BTreeSet::new();
+        for offset in 0..bytes.len().saturating_sub(11) {
+            if bytes[offset..offset + 4] != pattern {
+                continue;
+            }
+            let Some(name_index) = little_i32(&bytes, offset + 4) else {
+                continue;
+            };
+            let Some(name_number) = little_i32(&bytes, offset + 8) else {
+                continue;
+            };
+            if name_number != 0 {
+                continue;
+            }
+            let Some(name) = usize::try_from(name_index)
+                .ok()
+                .and_then(|index| document.get("NameMap")?.as_array()?.get(index))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let target_count = target_dependencies
+                .values()
+                .filter(|entry| {
+                    Path::new(&entry.path)
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|leaf| leaf.eq_ignore_ascii_case(name))
+                })
+                .count();
+            if target_count > 0 {
+                names.insert(name.to_owned());
+            }
+        }
+        if names.len() != 1 {
+            bail!(
+                "unresolved StaticMesh object import {object_index} must resolve through one serialized current-game material slot name; found {:?}",
+                names
+            );
+        }
+        let slot_name = names.into_iter().next().unwrap();
+        let targets = target_dependencies
+            .values()
+            .filter(|entry| {
+                Path::new(&entry.path)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&slot_name))
+            })
+            .collect::<Vec<_>>();
+        if targets.len() != 1 {
+            bail!(
+                "serialized StaticMesh material slot {slot_name} must match exactly one current-game package; found {}",
+                targets.len()
+            );
+        }
+        patches.push((
+            package_index,
+            object_index,
+            ImportTarget {
+                package_id: targets[0].package_id,
+                package_path: game_package_path(&targets[0].path)?,
+                object_name: slot_name,
+                class_name: "MaterialInstanceConstant".to_owned(),
+            },
+        ));
+    }
+    let imports = document
+        .get_mut("Imports")
+        .and_then(Value::as_array_mut)
+        .context("StaticMesh UAsset JSON Imports is not an array")?;
+    for (package_index, object_index, target) in &patches {
+        imports[*package_index]["ObjectName"] = Value::String(target.package_path.clone());
+        imports[*object_index]["ObjectName"] = Value::String(target.object_name.clone());
+        imports[*object_index]["ClassPackage"] = Value::String("/Script/Engine".to_owned());
+        imports[*object_index]["ClassName"] = Value::String(target.class_name.clone());
+    }
+    let names = document
+        .get_mut("NameMap")
+        .and_then(Value::as_array_mut)
+        .context("StaticMesh UAsset JSON has no NameMap")?;
+    for name in patches.iter().flat_map(|(_, _, target)| {
+        [
+            target.package_path.as_str(),
+            target.object_name.as_str(),
+            target.class_name.as_str(),
+        ]
+    }) {
+        if !names.iter().any(|value| value.as_str() == Some(name)) {
+            names.push(Value::String(name.to_owned()));
+        }
+    }
+    let intended_exports = export_data(&document)?;
+    if original_exports != intended_exports {
+        bail!("StaticMesh import repair changed raw export data before rebuild");
+    }
+    fs::write(&patched_json, serde_json::to_vec(&document)?)?;
+    tool.import_json(&patched_json, &rebuilt_asset)?;
+    let source_uexp = asset.with_extension("uexp");
+    let rebuilt_uexp = rebuilt_asset.with_extension("uexp");
+    if source_uexp.is_file() != rebuilt_uexp.is_file() {
+        bail!("StaticMesh import repair changed UEXP presence");
+    }
+    let uexp_byte_identical =
+        !source_uexp.is_file() || sha256_file(&source_uexp)? == sha256_file(&rebuilt_uexp)?;
+    if !uexp_byte_identical {
+        bail!("StaticMesh import repair changed raw UEXP payload bytes");
+    }
+    tool.to_json(&rebuilt_asset, &verify_json)?;
+    let verified: Value = serde_json::from_slice(&fs::read(&verify_json)?)?;
+    if intended_exports != export_data(&verified)? {
+        bail!("StaticMesh import repair did not preserve raw exports through UAsset rebuild");
+    }
+    let verified_imports = verified
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("verified StaticMesh UAsset has no Imports")?;
+    for (package_index, object_index, target) in &patches {
+        if verified_imports[*package_index]["ObjectName"].as_str()
+            != Some(target.package_path.as_str())
+            || verified_imports[*object_index]["ObjectName"].as_str()
+                != Some(target.object_name.as_str())
+            || verified_imports[*object_index]["ClassName"].as_str()
+                != Some(target.class_name.as_str())
+        {
+            bail!("StaticMesh material import repair did not survive UAsset rebuild");
+        }
+    }
+    fs::copy(&rebuilt_asset, asset)?;
+    if rebuilt_uexp.is_file() {
+        fs::copy(&rebuilt_uexp, &source_uexp)?;
+    }
+    Ok(StaticMeshImportRepair {
+        asset: asset.to_string_lossy().replace('\\', "/"),
+        repaired_material_import_count: patches.len(),
+        material_slot_names: patches
+            .iter()
+            .map(|(_, _, target)| target.object_name.clone())
+            .collect(),
+        target_package_ids: patches
+            .iter()
+            .map(|(_, _, target)| target.package_id)
+            .collect(),
+        target_package_paths: patches
+            .iter()
+            .map(|(_, _, target)| target.package_path.clone())
+            .collect(),
+        exports_byte_identical: true,
+        uexp_byte_identical,
+    })
+}
 fn contains_ascii(data: &[u8], needle: &[u8]) -> bool {
     data.windows(needle.len()).any(|window| window == needle)
 }

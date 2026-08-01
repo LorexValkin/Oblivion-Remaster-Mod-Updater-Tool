@@ -1,5 +1,6 @@
 /target/
 /dist/
+/artifacts/
 /.tmp/
 /.serena/
 *.pdb

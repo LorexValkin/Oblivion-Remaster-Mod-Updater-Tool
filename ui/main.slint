@@ -233,8 +233,8 @@ export component AppWindow inherits Window {
                     }
 
                     VerticalLayout {
-                        min-height: 154px;
-                        max-height: 154px;
+                        min-height: 170px;
+                        max-height: 170px;
                         vertical-stretch: 0;
                         spacing: 5px;
 
@@ -253,6 +253,7 @@ export component AppWindow inherits Window {
                         StatusLine {
                             text: root.runtime-tools-status;
                             tone: root.runtime-tools-tone;
+                            multiline: true;
                         }
 
                         VerticalLayout {

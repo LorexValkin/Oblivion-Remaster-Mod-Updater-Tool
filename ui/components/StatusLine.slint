@@ -4,9 +4,10 @@ export component StatusLine inherits HorizontalLayout {
     in property <string> text;
     in property <int> tone: 0;
     in property <bool> align-end: false;
+    in property <bool> multiline: false;
 
-    min-height: 20px;
-    max-height: 20px;
+    min-height: root.multiline ? 36px : 20px;
+    max-height: root.multiline ? 36px : 20px;
     vertical-stretch: 0;
     spacing: 8px;
     alignment: root.align-end ? end : start;
@@ -30,7 +31,8 @@ export component StatusLine inherits HorizontalLayout {
             : root.tone == 3 ? Theme.danger
             : Theme.text-secondary;
         font-size: 12px;
-        overflow: elide;
+        overflow: root.multiline ? clip : elide;
+        wrap: root.multiline ? word-wrap : no-wrap;
         horizontal-alignment: root.align-end ? right : left;
         vertical-alignment: center;
     }

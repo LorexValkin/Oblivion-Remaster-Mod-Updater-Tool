@@ -234,12 +234,12 @@ fn refresh_dependencies(app: &AppWindow, shared: &SharedState, include_nearby: b
     } else {
         app.set_runtime_tools_status(
             format!(
-                "Missing: {}. Put the archives beside the mod or use Attach tools.",
+                "Not connected: {}. If requested, use Add archives or Add folder below.",
                 missing.join(", ")
             )
             .into(),
         );
-        app.set_runtime_tools_tone(Tone::Error as i32);
+        app.set_runtime_tools_tone(Tone::Warning as i32);
     }
 }
 

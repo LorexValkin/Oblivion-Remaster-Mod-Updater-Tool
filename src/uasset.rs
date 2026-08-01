@@ -720,13 +720,6 @@ fn contains_ascii(data: &[u8], needle: &[u8]) -> bool {
     data.windows(needle.len()).any(|window| window == needle)
 }
 
-fn is_equipment_asset(path: &Path) -> bool {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase()
-        .contains("/content/art/equipment/")
-}
-
 fn package_relative_path(root: &Path, asset: &Path) -> String {
     asset
         .strip_prefix(root)
@@ -853,13 +846,6 @@ fn repair_document(document: &mut Value, asset: &Path) -> Result<Vec<BodySetupRe
         if data.len().saturating_sub(anchor + 12) < MIN_COOKED_PHYSICS_BYTES {
             continue;
         }
-        if !is_equipment_asset(asset) {
-            bail!(
-                "{} contains legacy cooked StaticMesh collision. Automatic collision removal is limited to /Art/Equipment; this world asset needs a real current-engine collision recook",
-                asset.display()
-            );
-        }
-
         // Shipping 1.512.105.0 consumes the four-byte cooked marker followed by
         // one false collision-presence byte, then ends this BodySetup export.
         // The exact boundary was proven by the game's Serial size mismatch and
@@ -876,7 +862,7 @@ fn repair_document(document: &mut Value, asset: &Path) -> Result<Vec<BodySetupRe
             new_serial_size: new_size,
             removed_cooked_physics_bytes: declared_size - new_size,
             collision_removed: true,
-            policy: "equipment-static-mesh-runtime-boundary-v1.512.105.0".to_owned(),
+            policy: "structural-static-mesh-runtime-boundary-v1.512.105.0".to_owned(),
         });
     }
     Ok(repairs)
@@ -2995,17 +2981,17 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_remove_collision_from_world_assets() {
-        let path = Path::new(r"C:\mod\Content\Art\Environment\SM_Door.uasset");
+    fn collision_repair_is_structural_not_location_based() {
+        let path = Path::new(r"C:\mod\Content\Unexpected\MeshWithoutAPrefix.uasset");
         let mut document = fixture(path, false, 128);
-        let error = repair_document(&mut document, path).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("real current-engine collision recook")
+        let repairs = repair_document(&mut document, path).unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].new_serial_size, 16);
+        assert_eq!(
+            repairs[0].policy,
+            "structural-static-mesh-runtime-boundary-v1.512.105.0"
         );
     }
-
     #[test]
     fn ignores_an_already_empty_bodysetup() {
         let path = Path::new(r"C:\mod\Content\Art\Equipment\armor\SM_Test.uasset");

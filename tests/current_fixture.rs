@@ -13,6 +13,23 @@ fn updates_current_offhand_staves_fixture() {
         .map(PathBuf::from)
         .into_iter()
         .collect();
+    let expected_package_count = std::env::var("OBR_TEST_ADDITIVE_PACKAGE_COUNT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("invalid OBR_TEST_ADDITIVE_PACKAGE_COUNT")
+        })
+        .unwrap_or(6);
+    let expected_body_setup_repair_count =
+        std::env::var("OBR_TEST_ADDITIVE_BODY_SETUP_REPAIR_COUNT")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("invalid OBR_TEST_ADDITIVE_BODY_SETUP_REPAIR_COUNT")
+            })
+            .unwrap_or(2);
     let mut log = Vec::new();
     let outcome = run_update(
         UpdateRequest {
@@ -29,13 +46,40 @@ fn updates_current_offhand_staves_fixture() {
     .unwrap_or_else(|error| panic!("native update failed:\n{error:#}\n{}", log.join("\n")));
     assert!(outcome.output_archive.is_file());
     assert!(outcome.report_path.is_file());
-    assert_eq!(outcome.package_count, 6);
+    assert_eq!(outcome.package_count, expected_package_count);
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
     assert_eq!(report["implementation"], "native-rust");
+    assert_eq!(report["version"], 6);
+    assert_eq!(
+        report["fixApis"],
+        serde_json::json!([
+            "zen-dependency-trace-v1",
+            "zen-exact-dependency-extraction-v1",
+            "zen-dependency-preservation-v1"
+        ])
+    );
     assert_eq!(report["identity"]["espBytePreserved"], true);
     assert_eq!(report["unreal"]["targetPathCollisionCount"], 0);
-    assert_eq!(report["unreal"]["bodySetupRepairCount"], 2);
+    assert_eq!(
+        report["verification"]["packageDependencyGraphsPreserved"],
+        true
+    );
+    assert_eq!(report["verification"]["dependencyCompleteExtraction"], true);
+    assert!(
+        report["unreal"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|container| {
+                container["exactExtraction"]["packageCount"] == container["packageCount"]
+                    && container["dependencyPreservation"]["preserved"] == true
+            })
+    );
+    assert_eq!(
+        report["unreal"]["bodySetupRepairCount"],
+        expected_body_setup_repair_count
+    );
     assert_eq!(report["unreal"]["containerNaming"]["warningCount"], 0);
     let repairs = report["unreal"]["containers"]
         .as_array()
@@ -43,7 +87,7 @@ fn updates_current_offhand_staves_fixture() {
         .iter()
         .flat_map(|container| container["bodySetupRepairs"].as_array().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(repairs.len(), 2);
+    assert_eq!(repairs.len(), expected_body_setup_repair_count);
     assert!(
         repairs
             .iter()
@@ -324,10 +368,18 @@ fn updates_current_additive_static_mesh_fixture() {
             .map(PathBuf::from)
             .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
     };
+    let expected_package_count = std::env::var("OBR_TEST_STATIC_MESH_PACKAGE_COUNT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("invalid OBR_TEST_STATIC_MESH_PACKAGE_COUNT")
+        })
+        .unwrap_or(1);
     let mut log = Vec::new();
     let outcome = run_update(
         UpdateRequest {
-            adapter: "native-additive-static-mesh-v1".to_owned(),
+            adapter: "native-static-mesh-v2".to_owned(),
             mod_input: required("OBR_TEST_STATIC_MESH_MOD"),
             game_root: required("OBR_TEST_GAME"),
             output_parent: required("OBR_TEST_OUTPUT"),
@@ -345,8 +397,8 @@ fn updates_current_additive_static_mesh_fixture() {
     });
     assert!(outcome.output_archive.is_file());
     assert!(outcome.report_path.is_file());
-    assert_eq!(outcome.adapter, "native-additive-static-mesh-v1");
-    assert_eq!(outcome.package_count, 1);
+    assert_eq!(outcome.adapter, "native-static-mesh-v2");
+    assert_eq!(outcome.package_count, expected_package_count);
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
     assert_eq!(report["structurallyVerified"], true);
@@ -357,9 +409,12 @@ fn updates_current_additive_static_mesh_fixture() {
         report["verification"]["bodySetupCookedPhysicsNormalized"],
         true
     );
-    let body_repairs = report["containers"][0]["bodySetupRepairs"]
+    let body_repairs = report["containers"]
         .as_array()
-        .unwrap();
+        .unwrap()
+        .iter()
+        .flat_map(|container| container["bodySetupRepairs"].as_array().unwrap())
+        .collect::<Vec<_>>();
     assert!(!body_repairs.is_empty());
     assert!(
         body_repairs

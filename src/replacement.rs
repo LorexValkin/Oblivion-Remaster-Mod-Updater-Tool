@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 pub const ARMOR_REPLACEMENT_ADAPTER: &str = "native-armor-replacement-v1";
 pub const MIXED_ARMOR_REPLACEMENT_ADAPTER: &str = "native-mixed-armor-expansion-v1";
 pub const TEXTURE_REPLACEMENT_ADAPTER: &str = "native-texture-replacement-v1";
-pub const ADDITIVE_STATIC_MESH_ADAPTER: &str = "native-additive-static-mesh-v1";
+pub const ADDITIVE_STATIC_MESH_ADAPTER: &str = "native-static-mesh-v2";
 const MAX_REPLACEMENT_PACKAGES: usize = 4096;
 const ARMOR_PATH_PREFIX: &str = "oblivionremastered/content/art/armor/";
 const ARMOR_FORM_PATH_PREFIX: &str = "oblivionremastered/content/forms/items/armor/";
@@ -99,38 +99,20 @@ pub(crate) fn canonical_additive_static_mesh_path(raw: &str) -> Result<String> {
     if parts.len() < 3
         || !parts[1].eq_ignore_ascii_case("Content")
         || parts.iter().any(|part| *part == "..")
-        || parts[0].eq_ignore_ascii_case("OblivionRemastered")
     {
-        bail!(
-            "additive static-mesh package must use a custom <Project>/Content path without traversal: {raw}"
-        );
+        bail!("StaticMesh candidate must use a <Project>/Content path without traversal: {raw}");
     }
     let path = parts.join("/");
     let leaf = path.rsplit('/').next().unwrap_or_default();
-    if !leaf.to_ascii_lowercase().starts_with("sm_") || !leaf.ends_with(".uasset") {
-        bail!("additive static-mesh package must be an SM_ UAsset: {raw}");
+    if !leaf.to_ascii_lowercase().ends_with(".uasset") {
+        bail!("StaticMesh candidate must be a UAsset: {raw}");
     }
     Ok(path)
 }
 
-pub(crate) fn additive_static_mesh_filter(packages: &[PackageEntry]) -> Result<String> {
-    let first = packages
-        .first()
-        .context("custom StaticMesh container has no packages")?;
-    let canonical = canonical_additive_static_mesh_path(&first.path)?;
-    let project = canonical
-        .split('/')
-        .next()
-        .context("custom StaticMesh package has no project segment")?;
-    if packages.iter().any(|package| {
-        canonical_additive_static_mesh_path(&package.path)
-            .ok()
-            .and_then(|path| path.split('/').next().map(str::to_owned))
-            .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(project))
-    }) {
-        bail!("each custom StaticMesh container must use one <Project>/Content root");
-    }
-    Ok(format!("{project}/Content/"))
+pub(crate) fn static_mesh_package_filter(package: &PackageEntry) -> Result<String> {
+    let canonical = canonical_additive_static_mesh_path(&package.path)?;
+    Ok(canonical)
 }
 fn package_key(path: &str) -> Result<String> {
     Ok(canonical_package_path(path)?.to_ascii_lowercase())
@@ -653,7 +635,7 @@ pub fn inspect_additive_static_mesh_staged(
         .flat_map(|container| container.packages.iter().cloned())
         .collect::<Vec<_>>();
     if packages.is_empty() || packages.len() > MAX_REPLACEMENT_PACKAGES {
-        bail!("additive static-mesh input must contain 1..={MAX_REPLACEMENT_PACKAGES} packages");
+        bail!("StaticMesh input must contain 1..={MAX_REPLACEMENT_PACKAGES} packages");
     }
     packages.sort_by(|left, right| {
         left.path
@@ -664,15 +646,24 @@ pub fn inspect_additive_static_mesh_staged(
         if pair[0].path.eq_ignore_ascii_case(&pair[1].path)
             || pair[0].package_id == pair[1].package_id
         {
-            bail!("additive static-mesh packages must have unique paths and package IDs");
+            bail!("StaticMesh packages must have unique paths and package IDs");
         }
     }
+
     let target_utoc =
         game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     let (_, target_entries) = retoc.package_store_entries(&target_utoc)?;
     let target_by_id = target_entries
         .iter()
         .map(|entry| (entry.package_id, entry))
+        .collect::<HashMap<_, _>>();
+    let target_by_path = target_entries
+        .iter()
+        .filter_map(|entry| {
+            canonical_additive_static_mesh_path(&entry.path)
+                .ok()
+                .map(|path| (path.to_ascii_lowercase(), entry))
+        })
         .collect::<HashMap<_, _>>();
     let source_ids = packages
         .iter()
@@ -690,6 +681,30 @@ pub fn inspect_additive_static_mesh_staged(
             )
         })
         .collect::<HashMap<_, _>>();
+    let mut target_package_imports = HashMap::new();
+
+    // Package identity, not a project or filename convention, decides whether
+    // this is an existing-game replacement or an additive package.
+    for package in &packages {
+        let canonical = canonical_additive_static_mesh_path(&package.path)?;
+        if let Some(target) = target_by_path.get(&canonical.to_ascii_lowercase()) {
+            if target.package_id != package.package_id {
+                bail!(
+                    "current game package ID changed for {}: mod {}, game {}",
+                    package.path,
+                    package.package_id,
+                    target.package_id
+                );
+            }
+            target_package_imports.insert(package.package_id, target.imported_package_ids.clone());
+        } else if let Some(target) = target_by_id.get(&package.package_id) {
+            // Some authoring pipelines keep a custom directory-index path but
+            // intentionally reuse the stock package ID. Runtime identity follows
+            // that ID, so this is an alias replacement rather than an addition.
+            target_package_imports.insert(package.package_id, target.imported_package_ids.clone());
+        }
+    }
+
     for package in containers
         .iter()
         .flat_map(|container| &container.package_store)
@@ -697,10 +712,10 @@ pub fn inspect_additive_static_mesh_staged(
         for dependency in &package.imported_package_ids {
             if source_ids.contains(dependency) {
                 continue;
-            };
+            }
             target_by_id.get(dependency).with_context(|| {
                 format!(
-                    "additive static-mesh package {} has unresolved external dependency {}",
+                    "StaticMesh package {} has unresolved external dependency {}",
                     package.path, dependency
                 )
             })?;
@@ -711,7 +726,7 @@ pub fn inspect_additive_static_mesh_staged(
         packages,
         target_utoc,
         target_dependencies,
-        target_package_imports: HashMap::new(),
+        target_package_imports,
     })
 }
 pub fn probe_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
@@ -881,6 +896,38 @@ fn create_additive_probe_view(game_root: &Path) -> Result<tempfile::TempDir> {
     }
     Ok(view)
 }
+pub(crate) fn extract_static_mesh_packages(
+    retoc: &RetocTool,
+    input: &Path,
+    output: &Path,
+    packages: &[PackageEntry],
+    label: &str,
+) -> Result<()> {
+    fs::create_dir_all(output)?;
+    for package in packages {
+        let filter = static_mesh_package_filter(package)?;
+        let result = retoc.run([
+            OsString::from("to-legacy"),
+            input.as_os_str().to_owned(),
+            output.as_os_str().to_owned(),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            OsString::from("--no-shaders"),
+            OsString::from("--no-script-objects"),
+            OsString::from("--no-parallel"),
+            OsString::from("--filter"),
+            OsString::from(filter),
+        ])?;
+        let package_label = format!("{label} {}", package.path);
+        let (extracted, failed) = RetocTool::extraction_summary(&result, &package_label)?;
+        if failed != 0 || extracted == 0 {
+            bail!(
+                "{package_label} extracted no package payload; extracted {extracted}, failed {failed}"
+            );
+        }
+    }
+    Ok(())
+}
 pub fn probe_additive_static_mesh_input(
     mod_input: &Path,
     game_root: &Path,
@@ -900,21 +947,13 @@ pub fn probe_additive_static_mesh_input(
         for source in [&container.utoc, &container.ucas, &container.pak] {
             copy_probe_file(source, &view.path().join(source.file_name().unwrap()))?;
         }
-        let filter = additive_static_mesh_filter(&container.packages)?;
-        let result = retoc.run([
-            OsString::from("to-legacy"),
-            view.path().as_os_str().to_owned(),
-            legacy.as_os_str().to_owned(),
-            OsString::from("--version"),
-            OsString::from("UE5_3"),
-            OsString::from("--no-shaders"),
-            OsString::from("--no-script-objects"),
-            OsString::from("--no-parallel"),
-            OsString::from("--filter"),
-            OsString::from(filter),
-        ])?;
-        let (extracted, failed) =
-            RetocTool::extraction_summary(&result, "additive static-mesh source extraction")?;
+        extract_static_mesh_packages(
+            &retoc,
+            view.path(),
+            &legacy,
+            &container.packages,
+            "StaticMesh source extraction",
+        )?;
         let extracted_uasset_count = WalkDir::new(&legacy)
             .into_iter()
             .filter_map(Result::ok)
@@ -927,12 +966,9 @@ pub fn probe_additive_static_mesh_input(
                         .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
             })
             .count();
-        if failed != 0
-            || extracted < container.packages.len()
-            || extracted_uasset_count != container.packages.len()
-        {
+        if extracted_uasset_count != container.packages.len() {
             bail!(
-                "additive static-mesh source extraction expected {} assets, extracted {extracted}, failed {failed}",
+                "StaticMesh source extraction expected {} exact assets; found {extracted_uasset_count}",
                 container.packages.len()
             );
         }
@@ -969,7 +1005,12 @@ pub fn probe_additive_static_mesh_input(
     Ok(ReplacementProbeSummary {
         container_count: inspection.containers.len(),
         package_count: inspection.packages.len(),
-        asset_kind: "additive-custom-static-mesh".to_owned(),
+        asset_kind: match inspection.target_package_imports.len() {
+            0 => "additive-static-mesh",
+            count if count == inspection.packages.len() => "existing-static-mesh-replacement",
+            _ => "mixed-additive-and-replacement-static-mesh",
+        }
+        .to_owned(),
         package_paths: inspection
             .packages
             .iter()
@@ -1101,7 +1142,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_only_safe_custom_static_mesh_content_paths() {
+    fn accepts_safe_content_paths_without_naming_rules() {
         assert_eq!(
             canonical_additive_static_mesh_path(
                 "../../../BackpackQuivers/Content/Art/Equipment/Weapons/Ebony/SM_Ebony_Quiver.uasset"
@@ -1109,17 +1150,22 @@ mod tests {
             .unwrap(),
             "BackpackQuivers/Content/Art/Equipment/Weapons/Ebony/SM_Ebony_Quiver.uasset"
         );
-        assert!(
+        assert_eq!(
             canonical_additive_static_mesh_path(
-                "BackpackQuivers/Content/Art/Equipment/Weapons/Ebony/BP_Quiver.uasset"
+                "OddProject/Content/Whatever/AuthorsOwnName.uasset"
             )
-            .is_err()
+            .unwrap(),
+            "OddProject/Content/Whatever/AuthorsOwnName.uasset"
+        );
+        assert_eq!(
+            canonical_additive_static_mesh_path(
+                "../../../OblivionRemastered/Content/Art/Armor/Orcish/SM_Orcish_Helmet.uasset"
+            )
+            .unwrap(),
+            "OblivionRemastered/Content/Art/Armor/Orcish/SM_Orcish_Helmet.uasset"
         );
         assert!(
-            canonical_additive_static_mesh_path(
-                "OblivionRemastered/Content/Art/SM_NotCustom.uasset"
-            )
-            .is_err()
+            canonical_additive_static_mesh_path("OddProject/Content/Whatever/Mesh.umap").is_err()
         );
         assert!(
             canonical_additive_static_mesh_path("BackpackQuivers/Content/../SM_Traversal.uasset")

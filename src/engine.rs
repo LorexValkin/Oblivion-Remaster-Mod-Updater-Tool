@@ -3,16 +3,22 @@ use crate::archive::{
 };
 use crate::container::lint_equal_order_overrides;
 use crate::dependencies::{DependencyReport, check_or_install, game_is_running, scan_dependencies};
+use crate::fixes::{
+    DEPENDENCY_PRESERVATION_API, DEPENDENCY_TRACE_API, DependencyPreservationReport,
+    EXACT_DEPENDENCY_EXTRACTION_API, ExactExtractionReport, extract_packages_with_dependency_view,
+    trace_package_dependencies, verify_dependency_preservation,
+};
 use crate::game::{save_settings, validate_game_install};
 use crate::replacement::{
     ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
-    TEXTURE_REPLACEMENT_ADAPTER, additive_static_mesh_filter, canonical_additive_static_mesh_path,
-    canonical_package_path, inspect_additive_static_mesh_staged, inspect_mixed_armor_staged,
+    TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
+    extract_static_mesh_packages, inspect_additive_static_mesh_staged, inspect_mixed_armor_staged,
     inspect_staged, inspect_texture_staged, stage_input,
 };
-use crate::retoc::{PackageEntry, RetocTool};
+use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
-    package_to_game_path, read_plugin, read_sync_map, read_target_records, sorted_form_ids,
+    Record, SyncMapEntry, container_inventory_form_ids, package_to_game_path, read_plugin,
+    read_sync_map, read_target_records, record_editor_id, sorted_form_ids,
     validate_container_addition,
 };
 use crate::uasset::{
@@ -78,8 +84,22 @@ struct ContainerResult {
     source: ContainerHashes,
     rebuilt: RebuiltHashes,
     body_setup_repairs: Vec<BodySetupRepair>,
+    exact_extraction: ExactExtractionReport,
+    dependency_preservation: DependencyPreservationReport,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncMapResolution {
+    key: String,
+    local_form_id: String,
+    editor_id: Option<String>,
+    declared_object_path: String,
+    rebuilt_package_path: String,
+    rebuilt_inventory_path: String,
+    resolution: String,
+    directory_alias_allowed: bool,
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReplacementContainerResult {
@@ -111,6 +131,7 @@ struct ContainerInput {
     ucas: PathBuf,
     pak: PathBuf,
     packages: Vec<String>,
+    package_store: Vec<PackageStoreEntry>,
 }
 
 pub type ProgressCallback<'a> = dyn FnMut(usize, usize, &str) + Send + 'a;
@@ -607,6 +628,99 @@ fn safe_leaf(path: &Path) -> String {
     result.trim_matches('-').to_owned()
 }
 
+// SyncMap authors do not agree on directory layout, so resolve by exact path first and
+// then by a unique object leaf tied to a real plugin-owned FormID. Multiple distinct
+// FormIDs may intentionally share one Unreal object/package; the FormID is the unique
+// identity at this boundary.
+fn resolve_sync_map_entries(
+    entries: &[SyncMapEntry],
+    owned_records: &[&Record],
+    package_paths: &[String],
+) -> Result<Vec<SyncMapResolution>> {
+    let packages = package_paths
+        .iter()
+        .map(|source| Ok((source, package_to_game_path(source)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut resolutions = Vec::new();
+    let mut resolved_form_ids = HashSet::new();
+    for entry in entries {
+        let local_id = u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
+        if !resolved_form_ids.insert(local_id) {
+            bail!("multiple SyncMap entries reference plugin-owned ESP FormID 0x{local_id:06X}");
+        }
+        let mut matching_records = owned_records
+            .iter()
+            .copied()
+            .filter(|record| record.form_id & 0x00FF_FFFF == local_id);
+        let record = matching_records.next().with_context(|| {
+            format!(
+                "SyncMap key {} has no matching plugin-owned ESP FormID",
+                entry.key
+            )
+        })?;
+        if matching_records.next().is_some() {
+            bail!(
+                "SyncMap key {} is ambiguous across multiple plugin-owned ESP records with local FormID 0x{local_id:06X}",
+                entry.key
+            );
+        }
+        let exact = packages
+            .iter()
+            .filter(|(_, game_path)| game_path.eq_ignore_ascii_case(&entry.package_path))
+            .collect::<Vec<_>>();
+        let (source_path, game_path, resolution, directory_alias_allowed) = match exact.as_slice() {
+            [(source_path, game_path)] => (*source_path, game_path, "exact-package-path", false),
+            [] => {
+                let object_name = entry
+                    .object_path
+                    .rsplit('.')
+                    .next()
+                    .and_then(|value| value.rsplit('/').next())
+                    .filter(|value| !value.is_empty())
+                    .with_context(|| format!("SyncMap key {} has no object name", entry.key))?;
+                let candidates = packages
+                    .iter()
+                    .filter(|(_, game_path)| {
+                        game_path
+                            .rsplit('/')
+                            .next()
+                            .is_some_and(|leaf| leaf.eq_ignore_ascii_case(object_name))
+                    })
+                    .collect::<Vec<_>>();
+                match candidates.as_slice() {
+                    [(source_path, game_path)] => {
+                        (*source_path, game_path, "unique-object-leaf", true)
+                    }
+                    [] => bail!(
+                        "SyncMap object {} has no rebuilt package with the same object leaf",
+                        entry.object_path
+                    ),
+                    _ => bail!(
+                        "SyncMap object {} is ambiguous across {} rebuilt package paths",
+                        entry.object_path,
+                        candidates.len()
+                    ),
+                }
+            }
+            _ => bail!(
+                "SyncMap path {} is ambiguous across {} rebuilt package paths",
+                entry.package_path,
+                exact.len()
+            ),
+        };
+        resolutions.push(SyncMapResolution {
+            key: entry.key.clone(),
+            local_form_id: entry.local_form_id.clone(),
+            editor_id: record_editor_id(record),
+            declared_object_path: entry.object_path.clone(),
+            rebuilt_package_path: game_path.clone(),
+            rebuilt_inventory_path: (*source_path).clone(),
+            resolution: resolution.to_owned(),
+            directory_alias_allowed,
+        });
+    }
+    Ok(resolutions)
+}
 fn portable_archive_path(output_directory: &Path) -> Result<PathBuf> {
     let parent = output_directory
         .parent()
@@ -627,7 +741,9 @@ pub fn run_update(
         ARMOR_REPLACEMENT_ADAPTER => run_armor_replacement_update(request, callback),
         MIXED_ARMOR_REPLACEMENT_ADAPTER => run_mixed_armor_replacement_update(request, callback),
         TEXTURE_REPLACEMENT_ADAPTER => run_texture_replacement_update(request, callback),
-        ADDITIVE_STATIC_MESH_ADAPTER => run_additive_static_mesh_update(request, callback),
+        "native-additive-static-mesh-v1" | ADDITIVE_STATIC_MESH_ADAPTER => {
+            run_additive_static_mesh_update(request, callback)
+        }
         adapter => bail!("preflight selected an unknown or empty update adapter: {adapter}"),
     }
 }
@@ -681,6 +797,7 @@ fn run_additive_update(
     let game_esm = game_data.join("Oblivion.esm");
     let global_utoc = game_paks.join("global.utoc");
     let global_ucas = game_paks.join("global.ucas");
+    let stock_utoc = game_paks.join("OblivionRemastered-Windows.utoc");
     let work = tempfile::Builder::new()
         .prefix("obr-additive-update-")
         .tempdir()?;
@@ -757,12 +874,25 @@ fn run_additive_update(
     {
         bail!("ESP contains records beyond its master/plugin index range");
     }
+    let owned_record_ids = owned_records
+        .iter()
+        .map(|record| record.form_id)
+        .collect::<HashSet<_>>();
     let owned_ids = sorted_form_ids(owned_records.iter().map(|record| record.form_id));
-    let override_ids = overrides
+    let mut target_record_ids = overrides
         .iter()
         .map(|record| record.form_id)
         .collect::<Vec<_>>();
-    let current_records = read_target_records(&game_esm, &override_ids)?;
+    for override_record in &overrides {
+        target_record_ids.extend(
+            container_inventory_form_ids(override_record)?
+                .into_iter()
+                .filter(|form_id| ((form_id >> 24) as u8) < plugin_index),
+        );
+    }
+    target_record_ids.sort_unstable();
+    target_record_ids.dedup();
+    let current_records = read_target_records(&game_esm, &target_record_ids)?;
     let mut override_results = Vec::new();
     for override_record in overrides {
         let current = current_records
@@ -773,11 +903,25 @@ fn run_additive_update(
                     override_record.form_id
                 )
             })?;
-        override_results.push(validate_container_addition(
-            override_record,
-            current,
-            plugin_index,
-        )?);
+        let mut result = validate_container_addition(override_record, current, plugin_index)?;
+        for addition in &mut result.added_inventory_entries {
+            let item_form_id =
+                u32::from_str_radix(addition.item_form_id.trim_start_matches("0x"), 16)?;
+            addition.reference_validated = match addition.reference_scope.as_str() {
+                "plugin-owned" => owned_record_ids.contains(&item_form_id),
+                "current-master" => current_records.contains_key(&item_form_id),
+                _ => false,
+            };
+            if !addition.reference_validated {
+                bail!(
+                    "CONT override {} adds unresolved {} inventory reference {}",
+                    result.form_id,
+                    addition.reference_scope,
+                    addition.item_form_id
+                );
+            }
+        }
+        override_results.push(result);
     }
 
     stage(callback, 3, "Checking that Unreal packages are additive");
@@ -798,7 +942,11 @@ fn run_additive_update(
             bail!("container is missing PAK: {name}");
         }
         retoc.verify(&utoc, &format!("retoc verify source {name}"))?;
-        let (_, packages) = retoc.package_inventory(&utoc)?;
+        let (_, package_store) = retoc.package_store_entries(&utoc)?;
+        let packages = package_store
+            .iter()
+            .map(|package| package.path.clone())
+            .collect::<Vec<_>>();
         original_packages.extend(packages.iter().cloned());
         container_inputs.push(ContainerInput {
             name,
@@ -806,6 +954,7 @@ fn run_additive_update(
             ucas,
             pak,
             packages,
+            package_store,
         });
     }
     let container_precedence_warnings = lint_equal_order_overrides(
@@ -823,13 +972,20 @@ fn run_additive_update(
     }
     original_packages.sort();
     original_packages.dedup();
+    let source_package_store = container_inputs
+        .iter()
+        .flat_map(|container| container.package_store.iter().cloned())
+        .collect::<Vec<_>>();
+    let (_, current_game_store) = retoc.package_store_entries(&stock_utoc)?;
+    let dependency_trace = trace_package_dependencies(&source_package_store, &current_game_store)?;
+    let dependency_view = create_isolated_stock_view(&game.root)?;
     let target_probe = work.path().join("target-probe");
     fs::create_dir_all(&target_probe)?;
     let mut collisions = Vec::new();
     for package in &original_packages {
         let result = retoc.run(args([
             OsString::from("to-legacy"),
-            game_paks.as_os_str().to_owned(),
+            dependency_view.path().as_os_str().to_owned(),
             target_probe.as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
@@ -856,6 +1012,18 @@ fn run_additive_update(
             collisions.join(", ")
         );
     }
+    for container in &container_inputs {
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            let target = dependency_view.path().join(source.file_name().unwrap());
+            if target.exists() {
+                bail!(
+                    "mod container filename collides with the dependency view: {}",
+                    source.display()
+                );
+            }
+            copy_file(source, &target)?;
+        }
+    }
 
     stage(
         callback,
@@ -873,42 +1041,25 @@ fn run_additive_update(
     let mut container_results = Vec::new();
     for container in &container_inputs {
         let root = container_work.join(&container.name);
-        let input = root.join("input");
         let legacy = root.join("legacy");
         let rebuilt = root.join("rebuilt");
-        fs::create_dir_all(&input)?;
         fs::create_dir_all(&legacy)?;
         fs::create_dir_all(&rebuilt)?;
-        for source in [
-            &global_utoc,
-            &global_ucas,
-            &container.utoc,
-            &container.ucas,
-            &container.pak,
-        ] {
-            copy_file(source, &input.join(source.file_name().unwrap()))?;
-        }
-        let to_legacy = retoc.run(args([
-            OsString::from("to-legacy"),
-            input.as_os_str().to_owned(),
-            legacy.as_os_str().to_owned(),
-            OsString::from("--version"),
-            OsString::from("UE5_3"),
-            OsString::from("--no-shaders"),
-            OsString::from("--no-script-objects"),
-            OsString::from("--no-parallel"),
-        ]))?;
-        let (extracted, failed) = RetocTool::extraction_summary(
-            &to_legacy,
-            &format!("retoc to-legacy {}", container.name),
+        let package_entries = container
+            .package_store
+            .iter()
+            .map(|package| PackageEntry {
+                package_id: package.package_id,
+                path: package.path.clone(),
+            })
+            .collect::<Vec<_>>();
+        let exact_extraction = extract_packages_with_dependency_view(
+            &retoc,
+            dependency_view.path(),
+            &legacy,
+            &package_entries,
+            &format!("dependency-complete extraction {}", container.name),
         )?;
-        if failed != 0 || extracted != container.packages.len() {
-            bail!(
-                "retoc to-legacy {} expected {} assets, extracted {extracted}, failed {failed}",
-                container.name,
-                container.packages.len()
-            );
-        }
         let body_setup_repairs = repair_legacy_body_setups(&legacy)?;
         let rebuilt_utoc = rebuilt.join(format!("{}.utoc", container.name));
         let to_zen = retoc.run(args([
@@ -936,6 +1087,9 @@ fn run_additive_update(
             &rebuilt_inventory,
             &format!("package inventory for {}", container.name),
         )?;
+        let (_, rebuilt_store) = retoc.package_store_entries(&rebuilt_utoc)?;
+        let dependency_preservation =
+            verify_dependency_preservation(&container.package_store, &rebuilt_store)?;
         for path in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
             copy_file(path, &candidate_paks.join(path.file_name().unwrap()))?;
         }
@@ -956,6 +1110,8 @@ fn run_additive_update(
                 inventory_preserved: true,
             },
             body_setup_repairs,
+            exact_extraction,
+            dependency_preservation,
         });
     }
 
@@ -984,33 +1140,12 @@ fn run_additive_update(
     if plugin.masters != candidate_plugin.masters {
         bail!("ESP master list changed");
     }
-    let game_package_paths = original_packages
-        .iter()
-        .map(|path| package_to_game_path(path))
-        .collect::<Result<HashSet<_>>>()?;
-    let owned_local_ids = owned_records
-        .iter()
-        .map(|record| record.form_id & 0x00FF_FFFF)
-        .collect::<HashSet<_>>();
     let sync_entries = read_sync_map(&sync_files[0])?;
     if sync_entries.is_empty() {
         bail!("SyncMap contains no [Meshes] entries");
     }
-    for entry in &sync_entries {
-        let local_id = u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
-        if !owned_local_ids.contains(&local_id) {
-            bail!(
-                "SyncMap key {} has no matching plugin-owned ESP FormID",
-                entry.key
-            );
-        }
-        if !game_package_paths.contains(&entry.package_path) {
-            bail!(
-                "SyncMap path {} has no matching rebuilt Unreal package",
-                entry.package_path
-            );
-        }
-    }
+    let sync_map_resolutions =
+        resolve_sync_map_entries(&sync_entries, &owned_records, &original_packages)?;
     let body_setup_repair_count = container_results
         .iter()
         .map(|container| container.body_setup_repairs.len())
@@ -1018,8 +1153,13 @@ fn run_additive_update(
     let report_path = output_directory.join("additive-update-report.json");
     let report = json!({
         "schema": "obr-additive-mod-update-report",
-        "version": 4,
+        "version": 6,
         "implementation": "native-rust",
+        "fixApis": [
+            DEPENDENCY_TRACE_API,
+            EXACT_DEPENDENCY_EXTRACTION_API,
+            DEPENDENCY_PRESERVATION_API,
+        ],
         "generatedAt": chrono::Utc::now().to_rfc3339(),
         "status": "candidate_ready_for_runtime_test",
         "structurallyVerified": true,
@@ -1040,6 +1180,7 @@ fn run_additive_update(
             "esmSha256": sha256_file(&game_esm)?,
             "globalUtocSha256": sha256_file(&global_utoc)?,
             "globalUcasSha256": sha256_file(&global_ucas)?,
+            "stockPackageUtocSha256": sha256_file(&stock_utoc)?,
         },
         "identity": {
             "esmEdited": false,
@@ -1053,13 +1194,15 @@ fn run_additive_update(
             "pluginOwnedFormIds": owned_ids,
             "masterOverrides": override_results,
             "syncMapEntries": sync_entries,
+            "syncMapResolutions": sync_map_resolutions,
         },
         "unreal": {
             "additivePackageCount": original_packages.len(),
             "targetPathCollisionCount": 0,
             "bodySetupRepairCount": body_setup_repair_count,
-            "collisionPolicy": "For recognized /Art/Equipment StaticMesh BodySetup exports, the incompatible derived cooked-physics tail is normalized to the shipping game's accepted empty-cache boundary while the serialized property region (including AggGeom simple-collision source data) and BodySetupGuid are preserved. Until runtime gate E-B proves the shipping game rebuilds a Chaos body from AggGeom, each change remains disclosed as collisionRemoved: true. World assets fail closed.",
+            "collisionPolicy": "For structurally recognized StaticMesh BodySetup exports, the incompatible derived cooked-physics tail is normalized to the shipping game's accepted empty-cache boundary while the serialized property region (including AggGeom simple-collision source data) and BodySetupGuid are preserved. Each change remains disclosed as collisionRemoved: true and requires an in-game collision test.",
             "packagePaths": original_packages,
+            "dependencyTrace": dependency_trace,
             "containers": container_results,
             "containerNaming": {
                 "pSuffixCaseInsensitive": true,
@@ -1078,6 +1221,8 @@ fn run_additive_update(
             "sourceContainersVerified": true,
             "rebuiltContainersVerified": true,
             "packageInventoriesPreserved": true,
+            "packageDependencyGraphsPreserved": true,
+            "dependencyCompleteExtraction": true,
             "espReparsed": true,
             "syncMapLinksResolved": true,
             "runtimeDependenciesReady": dependency_report.ready,
@@ -2302,7 +2447,7 @@ fn run_additive_static_mesh_update(
     stage(
         callback,
         1,
-        "Classifying custom StaticMesh packages and resolving imports",
+        "Classifying StaticMesh packages by identity and export structure",
     );
     stage_input(&mod_input, &staged)?;
     let inspection = inspect_additive_static_mesh_staged(&staged, &game.root, &retoc)?;
@@ -2322,30 +2467,20 @@ fn run_additive_static_mesh_update(
         for source in [&container.utoc, &container.ucas, &container.pak] {
             copy_file(source, &input_view.path().join(source.file_name().unwrap()))?;
         }
-        let filter = additive_static_mesh_filter(&container.packages)?;
         stage(
             callback,
             2,
             &format!(
-                "Extracting guarded custom static meshes from {}",
+                "Extracting structurally proven StaticMeshes from {}",
                 container.name
             ),
         );
-        let run = retoc.run(args([
-            OsString::from("to-legacy"),
-            input_view.path().as_os_str().to_owned(),
-            legacy.as_os_str().to_owned(),
-            OsString::from("--version"),
-            OsString::from("UE5_3"),
-            OsString::from("--no-shaders"),
-            OsString::from("--no-script-objects"),
-            OsString::from("--no-parallel"),
-            OsString::from("--filter"),
-            OsString::from(filter.clone()),
-        ]))?;
-        let (count, failed) = RetocTool::extraction_summary(
-            &run,
-            &format!("custom static-mesh extraction {}", container.name),
+        extract_static_mesh_packages(
+            &retoc,
+            input_view.path(),
+            &legacy,
+            &container.packages,
+            &format!("StaticMesh source extraction {}", container.name),
         )?;
         let extracted_uasset_count = WalkDir::new(&legacy)
             .into_iter()
@@ -2359,12 +2494,9 @@ fn run_additive_static_mesh_update(
                         .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
             })
             .count();
-        if failed != 0
-            || count < container.packages.len()
-            || extracted_uasset_count != container.packages.len()
-        {
+        if extracted_uasset_count != container.packages.len() {
             bail!(
-                "custom static-mesh extraction {} expected {} assets, extracted {count}, failed {failed}",
+                "StaticMesh source extraction {} expected {} exact assets; found {extracted_uasset_count}",
                 container.name,
                 container.packages.len()
             );
@@ -2460,21 +2592,12 @@ fn run_additive_static_mesh_update(
                 &verify_view.path().join(source.file_name().unwrap()),
             )?;
         }
-        let roundtrip = retoc.run(args([
-            OsString::from("to-legacy"),
-            verify_view.path().as_os_str().to_owned(),
-            verify_legacy.as_os_str().to_owned(),
-            OsString::from("--version"),
-            OsString::from("UE5_3"),
-            OsString::from("--no-shaders"),
-            OsString::from("--no-script-objects"),
-            OsString::from("--no-parallel"),
-            OsString::from("--filter"),
-            OsString::from(filter),
-        ]))?;
-        let (verify_count, verify_failed) = RetocTool::extraction_summary(
-            &roundtrip,
-            &format!("custom static-mesh roundtrip {}", container.name),
+        extract_static_mesh_packages(
+            &retoc,
+            verify_view.path(),
+            &verify_legacy,
+            &container.packages,
+            &format!("StaticMesh roundtrip {}", container.name),
         )?;
         let verify_uasset_count = WalkDir::new(&verify_legacy)
             .into_iter()
@@ -2488,12 +2611,9 @@ fn run_additive_static_mesh_update(
                         .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
             })
             .count();
-        if verify_failed != 0
-            || verify_count < container.packages.len()
-            || verify_uasset_count != container.packages.len()
-        {
+        if verify_uasset_count != container.packages.len() {
             bail!(
-                "custom static-mesh roundtrip {} expected {} assets, extracted {verify_count}, failed {verify_failed}",
+                "StaticMesh roundtrip {} expected {} exact assets; found {verify_uasset_count}",
                 container.name,
                 container.packages.len()
             );
@@ -2507,17 +2627,17 @@ fn run_additive_static_mesh_update(
         copy_file(&pak, &candidate_pak)?;
         results.push(json!({"name":container.name,"packages":container.packages,"staticMeshImportRepairs":static_mesh_import_repairs,"bodySetupRepairs":body_setup_repairs,"payloadEquivalence":payload}));
     }
-    let report_path = output_directory.join("custom-static-mesh-update-report.json");
+    let report_path = output_directory.join("static-mesh-update-report.json");
     fs::write(
         &report_path,
         serde_json::to_vec_pretty(
-            &json!({"schema":"obr-custom-static-mesh-update-report","version":1,"adapter":ADDITIVE_STATIC_MESH_ADAPTER,"status":"candidate_ready_for_runtime_test","structurallyVerified":true,"runtimeVerified":false,"sourceSha256":input_hash,"gamePackageInventory":inspection.target_utoc,"containers":results,"verification":{"packagePathsAndIdsPreserved":true,"packageImportsPreserved":true,"bodySetupCookedPhysicsNormalized":true,"roundtripFileSetsPreserved":true,"productionRuntimeGateRequired":true}}),
+            &json!({"schema":"obr-static-mesh-update-report","version":2,"adapter":ADDITIVE_STATIC_MESH_ADAPTER,"status":"candidate_ready_for_runtime_test","structurallyVerified":true,"runtimeVerified":false,"sourceSha256":input_hash,"gamePackageInventory":inspection.target_utoc,"identity":{"existingGamePackageCount":inspection.target_package_imports.len(),"additivePackageCount":inspection.packages.len()-inspection.target_package_imports.len(),"classificationSource":"package-path-id-and-export-structure"},"containers":results,"verification":{"packagePathsAndIdsPreserved":true,"packageImportsPreserved":true,"bodySetupCookedPhysicsNormalized":true,"roundtripFileSetsPreserved":true,"productionRuntimeGateRequired":true}}),
         )?,
     )?;
     stage(
         callback,
         4,
-        "Creating portable custom StaticMesh candidate archive",
+        "Creating portable StaticMesh candidate archive",
     );
     create_zip_from_paths(
         &output_archive,
@@ -2533,7 +2653,7 @@ fn run_additive_static_mesh_update(
     stage(
         callback,
         5,
-        "Custom static-mesh candidate complete; shipping-game test still required",
+        "StaticMesh candidate complete; shipping-game test still required",
     );
     Ok(UpdateOutcome {
         adapter: ADDITIVE_STATIC_MESH_ADAPTER.to_owned(),
@@ -2547,6 +2667,152 @@ fn run_additive_static_mesh_update(
 mod tests {
     use super::*;
 
+    #[test]
+    fn resolves_sync_map_directory_alias_by_unique_object_leaf() {
+        let records = [Record {
+            kind: "ARMO".to_owned(),
+            form_id: 0x0100_0800,
+            flags: 0,
+            subrecords: vec![crate::tes4::Subrecord {
+                kind: "EDID".to_owned(),
+                data: b"ArenaHelmet\0".to_vec(),
+            }],
+        }];
+        let owned = records.iter().collect::<Vec<_>>();
+        let entries = [SyncMapEntry {
+            key: "000800".to_owned(),
+            local_form_id: "0x000800".to_owned(),
+            object_path: "/Game/Forms/items/armor/ArenaHelmet.ArenaHelmet".to_owned(),
+            package_path: "/Game/Forms/items/armor/ArenaHelmet".to_owned(),
+        }];
+        let packages =
+            vec!["../../../OblivionRemastered/Content/Forms/Armor/ArenaHelmet.uasset".to_owned()];
+        let result = resolve_sync_map_entries(&entries, &owned, &packages).unwrap();
+        assert_eq!(result[0].resolution, "unique-object-leaf");
+        assert_eq!(result[0].editor_id.as_deref(), Some("ArenaHelmet"));
+        assert_eq!(
+            result[0].rebuilt_package_path,
+            "/Game/Forms/Armor/ArenaHelmet"
+        );
+        assert!(result[0].directory_alias_allowed);
+    }
+
+    #[test]
+    fn allows_distinct_sync_map_form_ids_to_share_one_rebuilt_package() {
+        let records = [
+            Record {
+                kind: "ARMO".to_owned(),
+                form_id: 0x0100_08F1,
+                flags: 0,
+                subrecords: vec![crate::tes4::Subrecord {
+                    kind: "EDID".to_owned(),
+                    data: b"FinePD\0".to_vec(),
+                }],
+            },
+            Record {
+                kind: "ARMO".to_owned(),
+                form_id: 0x0100_08F2,
+                flags: 0,
+                subrecords: vec![crate::tes4::Subrecord {
+                    kind: "EDID".to_owned(),
+                    data: b"RoughPD\0".to_vec(),
+                }],
+            },
+        ];
+        let owned = records.iter().collect::<Vec<_>>();
+        let entries = [
+            SyncMapEntry {
+                key: "0008F1".to_owned(),
+                local_form_id: "0x0008F1".to_owned(),
+                object_path: "/Game/Forms/items/armor/Offhand_Weapon.Offhand_Weapon".to_owned(),
+                package_path: "/Game/Forms/items/armor/Offhand_Weapon".to_owned(),
+            },
+            SyncMapEntry {
+                key: "0008F2".to_owned(),
+                local_form_id: "0x0008F2".to_owned(),
+                object_path: "/Game/Forms/items/armor/Offhand_Weapon.Offhand_Weapon".to_owned(),
+                package_path: "/Game/Forms/items/armor/Offhand_Weapon".to_owned(),
+            },
+        ];
+        let packages = vec!["../../../Content/Forms/items/armor/Offhand_Weapon.uasset".to_owned()];
+
+        let result = resolve_sync_map_entries(&entries, &owned, &packages).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(
+            result
+                .iter()
+                .all(|entry| entry.rebuilt_package_path == "/Game/Forms/items/armor/Offhand_Weapon")
+        );
+        assert!(
+            result
+                .iter()
+                .all(|entry| entry.resolution == "exact-package-path")
+        );
+        assert!(result.iter().all(|entry| !entry.directory_alias_allowed));
+        assert_eq!(result[0].editor_id.as_deref(), Some("FinePD"));
+        assert_eq!(result[1].editor_id.as_deref(), Some("RoughPD"));
+    }
+
+    #[test]
+    fn refuses_duplicate_sync_map_form_ids_across_different_packages() {
+        let records = [Record {
+            kind: "ARMO".to_owned(),
+            form_id: 0x0100_08F1,
+            flags: 0,
+            subrecords: Vec::new(),
+        }];
+        let owned = records.iter().collect::<Vec<_>>();
+        let entries = [
+            SyncMapEntry {
+                key: "0008F1".to_owned(),
+                local_form_id: "0x0008F1".to_owned(),
+                object_path: "/Game/Forms/items/armor/Offhand_Weapon.Offhand_Weapon".to_owned(),
+                package_path: "/Game/Forms/items/armor/Offhand_Weapon".to_owned(),
+            },
+            SyncMapEntry {
+                key: "010008F1".to_owned(),
+                local_form_id: "0x0008F1".to_owned(),
+                object_path: "/Game/Forms/items/armor/Other_Weapon.Other_Weapon".to_owned(),
+                package_path: "/Game/Forms/items/armor/Other_Weapon".to_owned(),
+            },
+        ];
+        let packages = vec![
+            "../../../Content/Forms/items/armor/Offhand_Weapon.uasset".to_owned(),
+            "../../../Content/Forms/items/armor/Other_Weapon.uasset".to_owned(),
+        ];
+
+        let error = resolve_sync_map_entries(&entries, &owned, &packages).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple SyncMap entries reference plugin-owned ESP FormID 0x0008F1")
+        );
+    }
+
+    #[test]
+    fn refuses_ambiguous_sync_map_object_leaf() {
+        let records = [Record {
+            kind: "ARMO".to_owned(),
+            form_id: 0x0100_0800,
+            flags: 0,
+            subrecords: Vec::new(),
+        }];
+        let owned = records.iter().collect::<Vec<_>>();
+        let entries = [SyncMapEntry {
+            key: "000800".to_owned(),
+            local_form_id: "0x000800".to_owned(),
+            object_path: "/Game/Forms/items/armor/ArenaHelmet.ArenaHelmet".to_owned(),
+            package_path: "/Game/Forms/items/armor/ArenaHelmet".to_owned(),
+        }];
+        let packages = vec![
+            "../../../OblivionRemastered/Content/Forms/Armor/ArenaHelmet.uasset".to_owned(),
+            "../../../OblivionRemastered/Content/Alternate/ArenaHelmet.uasset".to_owned(),
+        ];
+        let error = resolve_sync_map_entries(&entries, &owned, &packages).unwrap_err();
+        assert!(error.to_string().contains("ambiguous across 2"));
+    }
     #[test]
     fn portable_archive_name_preserves_dots_and_timestamp() {
         let directory = Path::new(r"C:\tmp\RAO-1.0-current-candidate-20260713-225545");

@@ -897,9 +897,17 @@ pub fn analyze_with_progress(
                         warning_count
                     )
                 })
+            })
+            .or_else(|| {
+                additive_static_mesh_probe.as_ref().map(|summary| {
+                    format!(
+                        "The input contains {} structurally proven StaticMesh package(s) in {} complete container(s). Package path and ID evidence classified it as {}; names and folder conventions were not used.",
+                        summary.package_count, summary.container_count, summary.asset_kind
+                    )
+                })
             });
         let failure = format!(
-            "No proven replacement adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} Additive static mesh: {}",
+            "No proven content adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} StaticMesh: {}",
             armor_probe_error
                 .as_deref()
                 .unwrap_or("not evaluated as armor."),
@@ -911,7 +919,7 @@ pub fn analyze_with_progress(
                 .unwrap_or("not evaluated as Texture2D."),
             additive_static_mesh_probe_error
                 .as_deref()
-                .unwrap_or("not evaluated as an additive static mesh.")
+                .unwrap_or("not evaluated as a StaticMesh container.")
         );
         checks.push(check(
             "replacement-contract",
@@ -922,7 +930,7 @@ pub fn analyze_with_progress(
                 .unwrap_or("A guarded replacement contract passed."),
             failure,
             Some(
-                "Use report-only for additions, mixed asset classes, material/blueprint dependencies, changed package IDs, scripts, or loose files.",
+                "Unsupported export classes, ambiguous package identities, unresolved dependencies, scripts, and loose files remain report-only until a structural capability is available.",
             ),
         ));
     }
@@ -1003,12 +1011,12 @@ pub fn analyze_with_progress(
     capabilities.push(Capability {
         id: ADDITIVE_STATIC_MESH_ADAPTER.to_owned(),
         available: additive_static_mesh_can_update,
-        evidence_level: "guarded-custom-static-mesh-rebase".to_owned(),
-        description: "Custom Unreal project Content paths containing only SM_ StaticMesh assets are accepted when every imported package resolves within the mod or the current game. The rebuilt containers must preserve the complete package inventory and pass a current-Zen roundtrip. Blueprints, materials, scripts, unresolved dependencies, and mixed package types remain report-only.".to_owned(),
+        evidence_level: "guarded-content-proven-static-mesh-rebase".to_owned(),
+        description: "StaticMesh containers are classified from export structure and package identity rather than project, folder, or filename conventions. Existing-game packages require an exact current path and package ID; additive packages must avoid current identity collisions. Every dependency must resolve, each package is extracted exactly, and the rebuilt inventory and raw exports must survive a current-Zen roundtrip.".to_owned(),
         blockers: if additive_static_mesh_probe.is_some() {
             adapter_blockers.clone()
         } else {
-            vec!["mod-layout-does-not-match-guarded-custom-static-mesh-adapter".to_owned()]
+            vec!["packages-did-not-pass-structural-static-mesh-capability".to_owned()]
         },
     });
     capabilities.push(Capability {

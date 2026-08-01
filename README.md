@@ -37,6 +37,7 @@ To assemble the Windows tester package, run `scripts/Build-Release.ps1`. The gen
 ## Project layout
 
 - `src/` contains the Rust application, preflight checks, conversion adapters, and verification code.
+- `src/fixes.rs` exposes reusable, evidence-bearing fix APIs; `docs/FIX-APIS.md` defines their extension contract.
 - `ui/` contains the Slint desktop interface.
 - `tests/` contains automated coverage and optional local integration fixtures.
 - `docs/RELEASE.md` and `docs/STRESS-TESTING.md` describe the release checks and repeatable report testing.

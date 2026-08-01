@@ -27,22 +27,13 @@ export component SupportCredit inherits Rectangle {
         spacing: 6px;
         alignment: center;
 
-        Rectangle {
+        Image {
             width: 16px;
             height: 16px;
             horizontal-stretch: 0;
             vertical-stretch: 0;
-            border-radius: 4px;
-            background: #ff6433;
-
-            Image {
-                x: 3px;
-                y: 3px;
-                width: 10px;
-                height: 10px;
-                source: @image-url("../assets/kofi.svg");
-                image-fit: contain;
-            }
+            source: @image-url("../assets/kofi.png");
+            image-fit: contain;
         }
 
         Text {

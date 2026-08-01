@@ -1,0 +1,70 @@
+import { Theme } from "../theme.slint";
+
+export component SupportCredit inherits Rectangle {
+    callback clicked();
+
+    width: 126px;
+    height: 20px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 4px;
+    border-width: focus.has-focus ? 1px : 0px;
+    border-color: Theme.focus-ring;
+    background: touch.pressed ? #241713
+        : touch.has-hover ? #1d1614
+        : transparent;
+    forward-focus: focus;
+    accessible-role: button;
+    accessible-label: "Open Lorex_ on Ko-fi";
+    accessible-action-default => { touch.clicked(); }
+
+    animate background { duration: 140ms; }
+    animate border-color { duration: 140ms; }
+
+    HorizontalLayout {
+        padding-left: 3px;
+        padding-right: 3px;
+        spacing: 6px;
+        alignment: center;
+
+        Rectangle {
+            width: 16px;
+            height: 16px;
+            horizontal-stretch: 0;
+            vertical-stretch: 0;
+            border-radius: 4px;
+            background: #ff6433;
+
+            Image {
+                x: 3px;
+                y: 3px;
+                width: 10px;
+                height: 10px;
+                source: @image-url("../assets/kofi.svg");
+                image-fit: contain;
+            }
+        }
+
+        Text {
+            text: "Made by Lorex_";
+            color: touch.has-hover ? #ffad93 : Theme.text-muted;
+            font-size: 10px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                touch.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}

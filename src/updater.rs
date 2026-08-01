@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 slint::include_modules!();
 
+const KOFI_URL: &str = "https://ko-fi.com/lorex_";
+
 #[derive(Clone, Copy)]
 enum Tone {
     Neutral = 0,
@@ -314,6 +316,25 @@ fn configure_initial_state(app: &AppWindow, shared: &SharedState) {
 }
 
 fn register_callbacks(app: &AppWindow, shared: &SharedState) {
+    {
+        let weak = app.as_weak();
+        app.on_open_kofi(move || {
+            if let Err(error) = Command::new("rundll32.exe")
+                .args(["url.dll,FileProtocolHandler", KOFI_URL])
+                .spawn()
+            {
+                if let Some(app) = weak.upgrade() {
+                    set_status(
+                        &app,
+                        "Could not open Ko-fi",
+                        &format!("Default browser error: {error}"),
+                        Tone::Error,
+                    );
+                }
+            }
+        });
+    }
+
     {
         let weak = app.as_weak();
         let shared = Arc::clone(shared);

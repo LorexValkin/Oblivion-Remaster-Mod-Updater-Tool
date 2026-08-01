@@ -11,6 +11,7 @@ import { PathField } from "components/PathField.slint";
 import { PrimaryButton } from "components/PrimaryButton.slint";
 import { DangerButton } from "components/DangerButton.slint";
 import { StatusLine } from "components/StatusLine.slint";
+import { SupportCredit } from "components/SupportCredit.slint";
 
 export component AppWindow inherits Window {
     title: "OBR Mod Updater";
@@ -68,6 +69,7 @@ export component AppWindow inherits Window {
     callback attach-tool-folder();
     callback clear-tools();
     callback copy-log();
+    callback open-kofi();
     callback open-output();
     callback open-report();
     callback update-mod();
@@ -321,7 +323,7 @@ export component AppWindow inherits Window {
                     }
 
                     HorizontalLayout {
-                        height: 18px;
+                        height: 20px;
                         vertical-stretch: 0;
                         spacing: 12px;
 
@@ -333,12 +335,8 @@ export component AppWindow inherits Window {
                             overflow: elide;
                         }
 
-                        Text {
-                            text: "MADE BY LOREX_";
-                            color: Theme.text-muted;
-                            font-size: 10px;
-                            font-weight: 600;
-                            horizontal-alignment: right;
+                        SupportCredit {
+                            clicked => { root.open-kofi(); }
                         }
                     }
                 }
@@ -620,13 +618,6 @@ export component AppWindow inherits Window {
                     font-size: 14px;
                     wrap: word-wrap;
                     vertical-alignment: center;
-                }
-
-                Text {
-                    text: "Made by Lorex_";
-                    color: Theme.text-muted;
-                    font-size: 11px;
-                    horizontal-alignment: right;
                 }
 
                 PrimaryButton {

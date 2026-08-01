@@ -47,6 +47,10 @@ To assemble the Windows tester package, run `scripts/Build-Release.ps1`. The gen
 
 The tool embeds pinned copies of retoc and UAssetGUI for temporary use during supported conversions. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for license details.
 
+## Support the project
+
+If the updater has been useful and you would like to support continued development, you can [support Lorex_ on Ko-fi](https://ko-fi.com/lorex_). Support is entirely optional—using the tool, testing candidates, and sharing useful bug reports already helps the project.
+
 ## License
 
 Original OBR Mod Updater code is source-available under the MIT terms with the Commons Clause License Condition v1.0. See [LICENSE](LICENSE). Third-party components retain their own licenses.

@@ -43,6 +43,8 @@ export component PrimaryButton inherits Rectangle {
     }
 
     focus := FocusScope {
+        x: 0;
+        width: 0; // Keyboard focus only; never intercept the pointer click.
         enabled: root.enabled;
         key-pressed(event) => {
             if event.text == " " || event.text == "\n" {

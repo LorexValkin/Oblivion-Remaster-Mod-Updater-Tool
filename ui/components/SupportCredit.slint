@@ -50,6 +50,8 @@ export component SupportCredit inherits Rectangle {
     }
 
     focus := FocusScope {
+        x: 0;
+        width: 0; // Keyboard focus only; never intercept the pointer click.
         key-pressed(event) => {
             if event.text == " " || event.text == "\n" {
                 touch.clicked();

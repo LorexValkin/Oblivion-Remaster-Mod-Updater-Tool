@@ -2,6 +2,7 @@
 
 ## 0.5.5-beta - 2026-08-01
 
+- Made RAR support explicit in both native archive pickers and added an All Files fallback for Windows shell configurations that hide `.rar` files under the combined archive filter.
 - Added a versioned ESP/ESM/ESL manifest and byte-preservation layer with master graphs, header-flag checks, FormID ownership rules, and bounded compressed-record decoding.
 - Bound the guarded additive lane to one mod root and a non-empty SyncMap, then validate mapped local IDs and `CONT` additions against the selected current `Oblivion.esm` before enabling Update.
 - Added bounded selected-metadata extraction for ZIP, 7Z, and RAR preflight so IoStore payloads are not expanded just to inspect plugins.

@@ -344,7 +344,8 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
             };
             if let Some(path) = rfd::FileDialog::new()
                 .set_title("Choose an Oblivion Remastered mod archive")
-                .add_filter("Mod archives", &["zip", "7z", "rar"])
+                .add_filter("Mod archives (ZIP, 7Z, RAR)", &["zip", "7z", "rar"])
+                .add_filter("All files", &["*"])
                 .pick_file()
             {
                 app.set_mod_path(path.to_string_lossy().into_owned().into());
@@ -404,7 +405,8 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
             };
             if let Some(paths) = rfd::FileDialog::new()
                 .set_title("Attach body compatibility and/or runtime dependency archives")
-                .add_filter("Dependency archives", &["zip", "7z", "rar"])
+                .add_filter("Dependency archives (ZIP, 7Z, RAR)", &["zip", "7z", "rar"])
+                .add_filter("All files", &["*"])
                 .pick_files()
             {
                 let mut shared_state = state(&shared);

@@ -20,6 +20,7 @@ Version 0.5.5 adds the plugin-aware safety foundation needed to handle mods that
 
 ### Safer archives and installation
 
+- Makes RAR support explicit in both archive-picker labels and provides an All Files fallback when a Windows shell hides `.rar` files under the combined filter.
 - Inspects only bounded plugin metadata from ZIP, 7Z, and RAR archives instead of expanding large PAK, UCAS, and UTOC payloads during preflight.
 - Detects archive metadata changes between validation and extraction, enforces per-file and total limits, and publishes completed ZIPs atomically without overwriting an existing output.
 - Stages UE4SS and TesSyncMapInjector changes as one transaction, backs up existing files, verifies hashes, and attempts every rollback path if installation fails.

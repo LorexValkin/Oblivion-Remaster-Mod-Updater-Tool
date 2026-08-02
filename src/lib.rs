@@ -6,6 +6,7 @@ pub mod fixes;
 pub mod game;
 pub mod modlist;
 pub mod offhand_export;
+pub mod plugin;
 pub mod preflight;
 pub mod replacement;
 pub mod retoc;

@@ -77,6 +77,19 @@ foreach ($Copy in $Copies) {
     Copy-Item -LiteralPath $Source -Destination (Join-Path $StageRoot $Copy[1])
 }
 
+$StagedExe = Join-Path $StageRoot "OBR Mod Updater.exe"
+$ExecutableVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($StagedExe)
+$ExpectedExecutableVersion = "^$([regex]::Escape($Version))(?:\.0)?(?:\s|$)"
+foreach ($VersionField in @(
+    [pscustomobject]@{ Label = "FileVersion"; Value = $ExecutableVersion.FileVersion },
+    [pscustomobject]@{ Label = "ProductVersion"; Value = $ExecutableVersion.ProductVersion }
+)) {
+    if ([string]::IsNullOrWhiteSpace($VersionField.Value) -or
+        $VersionField.Value -notmatch $ExpectedExecutableVersion) {
+        throw "Release version gate failed: EXE $($VersionField.Label) '$($VersionField.Value)' does not match Cargo version '$Version'"
+    }
+}
+
 $SensitiveTokens = @(
     [pscustomobject]@{ Label = "build repository path"; Value = $RepoRoot },
     [pscustomobject]@{ Label = "Windows user profile"; Value = $env:USERPROFILE },
@@ -122,6 +135,8 @@ $Manifest = [ordered]@{
     schema = "obr-release-manifest"
     version = 1
     applicationVersion = $Version
+    executableFileVersion = $ExecutableVersion.FileVersion
+    executableProductVersion = $ExecutableVersion.ProductVersion
     generatedAt = [DateTime]::UtcNow.ToString("o")
     target = "windows-x86_64"
     runtimeVerified = $false

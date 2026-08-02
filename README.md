@@ -8,6 +8,8 @@ The project is written in Rust with a Slint desktop interface. It does not use a
 
 - Reads ZIP, 7Z, single-volume RAR, and extracted-folder inputs.
 - Produces a bounded, shareable preflight report before any conversion work begins.
+- Content-hashes every ESP/ESM/ESL and reports masters, header/extension mismatches, record domains, FormID ranges, deleted records, and bundled plugin dependencies without generically rewriting plugins.
+- For the guarded additive lane, binds the ESP, non-empty SyncMap, current `Oblivion.esm`, and IoStore root before enabling Update; archive preflight extracts only bounded metadata, and runtime dependencies are committed transactionally after the candidate ZIP exists.
 - Checks the selected game installation, required tools, input layout, and output location.
 - Supports a small set of guarded Unreal-container update paths.
 - Writes candidates to a separate output folder and verifies their structure after rebuilding.
@@ -38,6 +40,7 @@ To assemble the Windows tester package, run `scripts/Build-Release.ps1`. The gen
 
 - `src/` contains the Rust application, preflight checks, conversion adapters, and verification code.
 - `src/fixes.rs` exposes reusable, evidence-bearing fix APIs; `docs/FIX-APIS.md` defines their extension contract.
+- `src/plugin.rs` implements the plugin manifest and byte-preservation boundary; `docs/PLUGIN-COMPATIBILITY.md` records supported and report-only mixed-mod scenarios.
 - `ui/` contains the Slint desktop interface.
 - `tests/` contains automated coverage and optional local integration fixtures.
 - `docs/RELEASE.md` and `docs/STRESS-TESTING.md` describe the release checks and repeatable report testing.

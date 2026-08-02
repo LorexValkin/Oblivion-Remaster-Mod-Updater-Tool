@@ -1,10 +1,15 @@
 use crate::archive::{
-    MAX_ARCHIVE_DECLARED_BYTES, MAX_ARCHIVE_ENTRIES, rar_entries, sha256_bytes, sha256_file,
+    MAX_ARCHIVE_DECLARED_BYTES, MAX_ARCHIVE_ENTRIES, SELECTED_METADATA_EXTRACTION_API, rar_entries,
+    sha256_bytes, sha256_file,
 };
 use crate::dependencies::{
     DependencyCandidate, DependencyKind, installed_state, scan_dependencies,
 };
-use crate::game::validate_game_install;
+use crate::game::{normalize_install_root, validate_game_install};
+use crate::plugin::{
+    ADDITIVE_CONTRACT_API, AdditiveContractReport, PLUGIN_MANIFEST_API, PluginSetReport,
+    inspect_additive_contract_input, inspect_plugin_input_at_root,
+};
 use crate::replacement::{
     ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
     ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER, probe_additive_static_mesh_input,
@@ -20,7 +25,7 @@ use std::time::Instant;
 use walkdir::WalkDir;
 
 pub const REPORT_SCHEMA: &str = "obr-mod-preflight-report";
-pub const REPORT_VERSION: u32 = 2;
+pub const REPORT_VERSION: u32 = 4;
 pub const MAX_SCAN_ENTRIES: usize = MAX_ARCHIVE_ENTRIES;
 pub const MAX_DECLARED_BYTES: u64 = MAX_ARCHIVE_DECLARED_BYTES;
 
@@ -58,7 +63,10 @@ pub struct ModInventory {
     pub incomplete_container_count: usize,
     pub script_or_loader_file_count: usize,
     pub loose_file_count: usize,
+    pub functional_or_unknown_loose_file_count: usize,
     pub candidate_mod_root_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_mod_root: Option<String>,
     pub sample_files: Vec<String>,
     pub scan_truncated: bool,
 }
@@ -145,6 +153,10 @@ pub struct PreflightReport {
     pub checks: Vec<CheckResult>,
     pub capabilities: Vec<Capability>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_compatibility: Option<PluginSetReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additive_contract: Option<AdditiveContractReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unreal_replacement_probe: Option<ReplacementProbeSummary>,
     pub selected_adapter: Option<String>,
     pub can_update: bool,
@@ -166,6 +178,7 @@ struct InventoryBuilder {
     sync_maps: usize,
     scripts: usize,
     loose: usize,
+    functional_or_unknown_loose: usize,
     samples: Vec<String>,
     containers: BTreeMap<String, BTreeSet<String>>,
     data_roots: BTreeSet<String>,
@@ -233,8 +246,10 @@ impl InventoryBuilder {
         if extension == "ini" && lower.contains("/syncmap/") {
             self.sync_maps += 1;
         }
-        if matches!(extension.as_str(), "dll" | "asi" | "lua")
-            || lower.contains("/obse/")
+        if matches!(
+            extension.as_str(),
+            "dll" | "asi" | "lua" | "exe" | "bat" | "cmd" | "ps1" | "vbs" | "js"
+        ) || lower.contains("/obse/")
             || lower.contains("/ue4ss/")
         {
             self.scripts += 1;
@@ -253,6 +268,22 @@ impl InventoryBuilder {
             || extension == "ini" && lower.contains("/syncmap/"))
         {
             self.loose += 1;
+            let file_name = Path::new(&path)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let documentation = matches!(
+                extension.as_str(),
+                "txt" | "md" | "rtf" | "pdf" | "png" | "jpg" | "jpeg" | "gif" | "webp"
+            ) || matches!(
+                file_name.as_str(),
+                "readme" | "license" | "licence" | "notice" | "changelog"
+            ) || (lower.starts_with("fomod/") || lower.contains("/fomod/"))
+                && extension == "xml";
+            if !documentation {
+                self.functional_or_unknown_loose += 1;
+            }
         }
     }
 
@@ -279,10 +310,25 @@ impl InventoryBuilder {
             })
             .count();
         let incomplete = self.containers.len().saturating_sub(complete);
-        let roots = self.data_roots.intersection(&self.pak_roots).count();
+        let candidate_roots = self
+            .data_roots
+            .intersection(&self.pak_roots)
+            .cloned()
+            .collect::<Vec<_>>();
+        let roots = candidate_roots.len();
+        let candidate_mod_root = (roots == 1).then(|| candidate_roots[0].clone());
         let esp = *self.plugins.get("esp").unwrap_or(&0);
-        let has_plugins = self.plugins.values().sum::<usize>() > 0;
-        let classification = if roots == 1 && esp == 1 && self.sync_maps == 1 && complete > 0 {
+        let plugin_total = self.plugins.values().sum::<usize>();
+        let has_plugins = plugin_total > 0;
+        let classification = if roots == 1
+            && esp == 1
+            && plugin_total == 1
+            && self.sync_maps == 1
+            && complete > 0
+            && incomplete == 0
+            && self.scripts == 0
+            && self.functional_or_unknown_loose == 0
+        {
             "additive-syncmap-iostore"
         } else if self.scripts > 0 && !has_plugins && self.containers.is_empty() {
             "script-or-loader"
@@ -318,7 +364,9 @@ impl InventoryBuilder {
             incomplete_container_count: incomplete,
             script_or_loader_file_count: self.scripts,
             loose_file_count: self.loose,
+            functional_or_unknown_loose_file_count: self.functional_or_unknown_loose,
             candidate_mod_root_count: roots,
+            candidate_mod_root,
             sample_files: self.samples,
             scan_truncated: self.truncated,
         }
@@ -583,12 +631,66 @@ pub fn analyze_with_progress(
             })
             .unwrap_or_else(|| "Mod inventory could not be completed".to_owned()),
     );
-    let additive_shape = inventory.as_ref().is_some_and(|value| {
+    let expected_plugin_count = inventory
+        .as_ref()
+        .map(|value| value.plugin_counts.values().sum::<usize>())
+        .unwrap_or(0);
+    let additive_layout = inventory.as_ref().is_some_and(|value| {
         value.classification == "additive-syncmap-iostore"
             && value.incomplete_container_count == 0
             && value.link_count == 0
             && !value.scan_truncated
     });
+    let candidate_mod_root = inventory
+        .as_ref()
+        .and_then(|value| value.candidate_mod_root.as_deref());
+    let current_esm = request
+        .game_root
+        .as_deref()
+        .map(normalize_install_root)
+        .map(|root| root.join(r"OblivionRemastered\Content\Dev\ObvData\Data\Oblivion.esm"));
+    let (plugin_compatibility, additive_contract) = if expected_plugin_count > 0
+        && inventory
+            .as_ref()
+            .is_some_and(|value| !value.scan_truncated)
+    {
+        progress("Reading plugin headers, masters, FormIDs, and record domains");
+        if additive_layout {
+            match inspect_additive_contract_input(
+                &request.mod_input,
+                candidate_mod_root,
+                current_esm.as_deref(),
+            ) {
+                Ok((plugin_set, contract)) => (Some(plugin_set), Some(contract)),
+                Err(_) => (
+                    Some(PluginSetReport::unavailable(expected_plugin_count)),
+                    None,
+                ),
+            }
+        } else {
+            (
+                Some(
+                    inspect_plugin_input_at_root(&request.mod_input, candidate_mod_root)
+                        .unwrap_or_else(|_| PluginSetReport::unavailable(expected_plugin_count)),
+                ),
+                None,
+            )
+        }
+    } else if expected_plugin_count > 0 {
+        (
+            Some(PluginSetReport::unavailable(expected_plugin_count)),
+            None,
+        )
+    } else {
+        (None, None)
+    };
+    let additive_shape = additive_layout
+        && plugin_compatibility
+            .as_ref()
+            .is_some_and(|value| value.additive_syncmap_v1.compatible)
+        && additive_contract
+            .as_ref()
+            .is_some_and(|value| value.compatible);
     let replacement_shape = inventory.as_ref().is_some_and(|value| {
         value.classification == "unreal-container-only"
             && value.complete_container_triple_count > 0
@@ -598,7 +700,7 @@ pub fn analyze_with_progress(
             && value.loose_file_count == 0
             && value.file_count == value.complete_container_triple_count * 3
     });
-    let requires_adapter = additive_shape || replacement_shape;
+    let requires_adapter = additive_layout || replacement_shape;
     let requires_runtime = additive_shape;
 
     progress("Validating the selected game installation and current metadata");
@@ -865,6 +967,69 @@ pub fn analyze_with_progress(
             Some("Connect an original TesSyncMapInjector archive/folder in Setup."),
         ),
     ];
+    if let Some(plugin_report) = plugin_compatibility.as_ref() {
+        checks.push(check(
+            "plugin-content-analysis",
+            plugin_report.status == "complete"
+                && plugin_report.parsed_plugin_count == plugin_report.plugin_count,
+            additive_layout,
+            format!(
+                "Parsed and fingerprinted {} plugin file(s) without rewriting them.",
+                plugin_report.plugin_count
+            ),
+            "One or more ESP/ESM/ESL files could not be parsed safely.",
+            Some("Repair or replace malformed plugins before attempting an update."),
+        ));
+        checks.push(check(
+            "plugin-structural-safety",
+            plugin_report.blockers.is_empty(),
+            additive_layout,
+            "Plugin record identities, master graph, and full-plugin FormID ranges passed the structural checks.",
+            if plugin_report.blockers.is_empty() {
+                "Plugin structure was inspected.".to_owned()
+            } else {
+                format!(
+                    "Plugin structure has blocker(s): {}",
+                    plugin_report.blockers.join(", ")
+                )
+            },
+            Some("Keep this mod report-only until each structural blocker has a dedicated, verified repair."),
+        ));
+        if additive_layout {
+            checks.push(check(
+                "plugin-additive-syncmap-policy",
+                plugin_report.additive_syncmap_v1.compatible,
+                true,
+                "The plugin matches the one-ESP, one-Oblivion.esm, CONT-only additive policy.",
+                format!(
+                    "The plugin does not match the proven additive policy: {}",
+                    plugin_report.additive_syncmap_v1.blockers.join(", ")
+                ),
+                Some("Unsupported ESP/ESM/ESL and record-change scenarios remain report-only until a versioned plugin adapter exists."),
+            ));
+            checks.push(check(
+                "additive-plugin-syncmap-contract",
+                additive_contract
+                    .as_ref()
+                    .is_some_and(|value| value.compatible),
+                true,
+                "The SyncMap is non-empty, every mapped FormID is plugin-owned, and every CONT override is additive against the current Oblivion.esm.",
+                additive_contract
+                    .as_ref()
+                    .map(|value| {
+                        format!(
+                            "The additive plugin/SyncMap contract is blocked: {}",
+                            value.blockers.join(", ")
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "The additive plugin/SyncMap contract could not be inspected safely."
+                            .to_owned()
+                    }),
+                Some("Use a non-empty SyncMap whose local IDs exist in the ESP, and rebase CONT overrides against the current Oblivion.esm without changing or removing existing content."),
+            ));
+        }
+    }
     if replacement_shape {
         let passed = replacement_probe.is_some();
         let success = armor_probe
@@ -965,11 +1130,48 @@ pub fn analyze_with_progress(
         },
     }];
     capabilities.push(Capability {
+        id: SELECTED_METADATA_EXTRACTION_API.to_owned(),
+        available: inventory
+            .as_ref()
+            .is_some_and(|value| !value.scan_truncated),
+        evidence_level: "validated-bounded-archive-selection".to_owned(),
+        description: "Validates the complete ZIP/7Z/RAR path and size inventory while extracting only bounded ESP/ESM/ESL/INI metadata for plugin preflight; large PAK/UCAS/UTOC payloads are not materialized by this probe.".to_owned(),
+        blockers: inventory
+            .as_ref()
+            .filter(|value| !value.scan_truncated)
+            .map(|_| Vec::new())
+            .unwrap_or_else(|| vec!["inventory-incomplete".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: PLUGIN_MANIFEST_API.to_owned(),
+        available: plugin_compatibility
+            .as_ref()
+            .is_some_and(|value| value.status == "complete"),
+        evidence_level: "content-hashed-structural-report".to_owned(),
+        description: "Reads and fingerprints every ESP/ESM/ESL, reports ordered masters, record domains, FormID ownership, deleted/compressed records, and bundled master edges. This capability does not generically rewrite plugins; unsupported semantics remain report-only.".to_owned(),
+        blockers: plugin_compatibility
+            .as_ref()
+            .map(|value| value.blockers.clone())
+            .unwrap_or_else(|| vec!["no-plugin-files".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: ADDITIVE_CONTRACT_API.to_owned(),
+        available: additive_contract
+            .as_ref()
+            .is_some_and(|value| value.compatible),
+        evidence_level: "current-master-field-aware-validation".to_owned(),
+        description: "Binds the unique candidate root, ESP, SyncMap, and current Oblivion.esm; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT overrides that remove or functionally change current content.".to_owned(),
+        blockers: additive_contract
+            .as_ref()
+            .map(|value| value.blockers.clone())
+            .unwrap_or_else(|| vec!["additive-contract-not-applicable".to_owned()]),
+    });
+    capabilities.push(Capability {
         id: "native-additive-syncmap-v1".to_owned(),
         available: additive_can_update,
         evidence_level: "guarded-structural-adapter".to_owned(),
         description: "Existing fail-closed additive ESP + SyncMap + IoStore rebuild lane. Output remains a runtime-test candidate.".to_owned(),
-        blockers: if additive_shape {
+        blockers: if additive_layout {
             adapter_blockers.clone()
         } else {
             vec!["mod-layout-does-not-match-proven-additive-adapter".to_owned()]
@@ -1073,6 +1275,8 @@ pub fn analyze_with_progress(
         tools,
         checks,
         capabilities,
+        plugin_compatibility,
+        additive_contract,
         unreal_replacement_probe: replacement_probe,
         selected_adapter: if additive_shape {
             Some("native-additive-syncmap-v1".to_owned())
@@ -1111,6 +1315,18 @@ pub fn stable_signature(report: &PreflightReport) -> String {
         "sourceSha256": report.input.source_sha256,
         "classification": inventory.map(|value| &value.classification),
         "manifest": inventory.map(|value| &value.metadata_manifest_sha256),
+        "pluginManifest": report
+            .plugin_compatibility
+            .as_ref()
+            .map(|value| (&value.status, &value.manifest_sha256)),
+        "additivePluginPolicy": report
+            .plugin_compatibility
+            .as_ref()
+            .map(|value| value.additive_syncmap_v1.compatible),
+        "additiveContract": report
+            .additive_contract
+            .as_ref()
+            .map(|value| (&value.status, value.compatible, &value.sync_map_sha256)),
         "gameValid": report.game_valid,
         "toolStatus": report
             .tools
@@ -1200,7 +1416,7 @@ pub fn human_summary(report: &PreflightReport) -> String {
         .filter(|value| value.status == "warning")
         .count();
     format!(
-        "Preflight status: {}\nClassification: {}\nFiles: {}\nDeclared bytes: {}\nChecks: {} failure(s), {} warning(s)\nGuarded update enabled: {}\nRuntime verification: not claimed",
+        "Preflight status: {}\nClassification: {}\nFiles: {}\nDeclared bytes: {}\nPlugin analysis: {}\nChecks: {} failure(s), {} warning(s)\nGuarded update enabled: {}\nRuntime verification: not claimed",
         report.status,
         inventory
             .map(|value| value.classification.as_str())
@@ -1209,6 +1425,14 @@ pub fn human_summary(report: &PreflightReport) -> String {
         inventory
             .map(|value| value.total_declared_bytes)
             .unwrap_or(0),
+        report
+            .plugin_compatibility
+            .as_ref()
+            .map(|value| format!(
+                "{} ({} of {} parsed)",
+                value.status, value.parsed_plugin_count, value.plugin_count
+            ))
+            .unwrap_or_else(|| "not present".to_owned()),
         failures,
         warnings,
         report.can_update,
@@ -1219,13 +1443,96 @@ pub fn human_summary(report: &PreflightReport) -> String {
 mod tests {
     use super::*;
 
+    fn tes4_subrecord(kind: &str, data: &[u8]) -> Vec<u8> {
+        let mut bytes = kind.as_bytes().to_vec();
+        bytes.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    fn valid_plugin_bytes() -> Vec<u8> {
+        let mut header_data = Vec::new();
+        let mut hedr = 0.8_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&1_u32.to_le_bytes());
+        hedr.extend_from_slice(&0x801_u32.to_le_bytes());
+        header_data.extend(tes4_subrecord("HEDR", &hedr));
+        header_data.extend(tes4_subrecord("MAST", b"Oblivion.esm\0"));
+        header_data.extend(tes4_subrecord("DATA", &[0; 8]));
+        let mut bytes = b"TES4".to_vec();
+        bytes.extend_from_slice(&(header_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&header_data);
+        let record_data = tes4_subrecord("EDID", b"Fixture\0");
+        bytes.extend_from_slice(b"STAT");
+        bytes.extend_from_slice(&(record_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0100_0800_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&record_data);
+        bytes
+    }
+
+    fn tes4_record_bytes(kind: &str, form_id: u32, data: &[u8]) -> Vec<u8> {
+        let mut bytes = kind.as_bytes().to_vec();
+        bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&form_id.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    fn invalid_cont_override_plugin_bytes() -> Vec<u8> {
+        let mut header_data = Vec::new();
+        let mut hedr = 0.8_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&2_u32.to_le_bytes());
+        hedr.extend_from_slice(&0x801_u32.to_le_bytes());
+        header_data.extend(tes4_subrecord("HEDR", &hedr));
+        header_data.extend(tes4_subrecord("MAST", b"Oblivion.esm\0"));
+        header_data.extend(tes4_subrecord("DATA", &[0; 8]));
+        let mut bytes = b"TES4".to_vec();
+        bytes.extend_from_slice(&(header_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&header_data);
+        bytes.extend(tes4_record_bytes(
+            "STAT",
+            0x0100_0800,
+            &tes4_subrecord("EDID", b"Fixture\0"),
+        ));
+        let mut container = tes4_subrecord("EDID", b"ChangedContainer\0");
+        let mut inventory = 0x0100_0800_u32.to_le_bytes().to_vec();
+        inventory.extend_from_slice(&1_i32.to_le_bytes());
+        container.extend(tes4_subrecord("CNTO", &inventory));
+        bytes.extend(tes4_record_bytes("CONT", 0x0009_2285, &container));
+        bytes
+    }
+
+    fn current_master_with_container_bytes() -> Vec<u8> {
+        let mut hedr = 0.8_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&1_u32.to_le_bytes());
+        hedr.extend_from_slice(&0x800_u32.to_le_bytes());
+        let header_data = tes4_subrecord("HEDR", &hedr);
+        let mut bytes = tes4_record_bytes("TES4", 0, &header_data);
+        let container = tes4_subrecord("EDID", b"CurrentContainer\0");
+        bytes.extend(tes4_record_bytes("CONT", 0x0009_2285, &container));
+        bytes
+    }
+
     fn additive_fixture(root: &Path) {
         let data = root.join(r"Fixture\Content\Dev\ObvData\Data");
         let paks = root.join(r"Fixture\Content\Paks\~mods");
         fs::create_dir_all(data.join("SyncMap")).unwrap();
         fs::create_dir_all(&paks).unwrap();
-        fs::write(data.join("Fixture.esp"), b"plugin").unwrap();
-        fs::write(data.join(r"SyncMap\Fixture.ini"), b"[Meshes]").unwrap();
+        fs::write(data.join("Fixture.esp"), valid_plugin_bytes()).unwrap();
+        fs::write(
+            data.join(r"SyncMap\Fixture.ini"),
+            b"[Meshes]\n000800=../../../OblivionRemastered/Content/Fixture/SM_Fixture.SM_Fixture\n",
+        )
+        .unwrap();
         for extension in ["pak", "ucas", "utoc"] {
             fs::write(paks.join(format!("AAAA_Fixture_P.{extension}")), extension).unwrap();
         }
@@ -1271,6 +1578,213 @@ mod tests {
         let inventory = scan_directory(&wrapped).unwrap();
         assert_eq!(inventory.classification, "additive-syncmap-iostore");
         assert_eq!(inventory.candidate_mod_root_count, 1);
+    }
+
+    fn assert_extra_payload_is_report_only(relative: &str, payload: &[u8]) {
+        let temp = tempfile::tempdir().unwrap();
+        additive_fixture(temp.path());
+        let extra = temp.path().join(relative);
+        fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        fs::write(extra, payload).unwrap();
+        let report = analyze(&PreflightRequest {
+            mod_input: temp.path().to_path_buf(),
+            game_root: None,
+            output_parent: None,
+            connected_tools: Vec::new(),
+        });
+        assert_eq!(
+            report.inventory.as_ref().unwrap().classification,
+            "mixed-mod"
+        );
+        assert!(!report.can_update);
+        assert_ne!(
+            report.selected_adapter.as_deref(),
+            Some("native-additive-syncmap-v1")
+        );
+    }
+
+    #[test]
+    fn extra_esm_never_selects_the_additive_adapter() {
+        assert_extra_payload_is_report_only(
+            r"Fixture\Content\Dev\ObvData\Data\Extra.esm",
+            &valid_plugin_bytes(),
+        );
+    }
+
+    #[test]
+    fn extra_esl_never_selects_the_additive_adapter() {
+        assert_extra_payload_is_report_only(
+            r"Fixture\Content\Dev\ObvData\Data\Extra.esl",
+            &valid_plugin_bytes(),
+        );
+    }
+
+    #[test]
+    fn loader_never_selects_the_additive_adapter() {
+        assert_extra_payload_is_report_only("loader.dll", b"loader");
+    }
+
+    #[test]
+    fn functional_loose_file_never_selects_the_additive_adapter() {
+        assert_extra_payload_is_report_only(
+            r"Fixture\Content\Dev\ObvData\Data\Extra.ini",
+            b"[Settings]\nEnabled=true\n",
+        );
+    }
+
+    #[test]
+    fn malformed_esp_blocks_shape_correct_additive_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        let game_root = temp.path().join("game");
+        let tools_root = temp.path().join("tools");
+        fs::create_dir_all(&mod_root).unwrap();
+        additive_fixture(&mod_root);
+        fs::write(
+            mod_root.join(r"Fixture\Content\Dev\ObvData\Data\Fixture.esp"),
+            b"not-a-plugin",
+        )
+        .unwrap();
+        game_fixture(&game_root);
+        runtime_tools_fixture(&tools_root);
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: vec![tools_root],
+        });
+        assert!(!report.can_update);
+        assert!(report.checks.iter().any(|check| {
+            check.id == "plugin-content-analysis" && check.status == "fail" && check.blocking
+        }));
+    }
+
+    #[test]
+    fn empty_syncmap_is_report_only_even_when_layout_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        let game_root = temp.path().join("game");
+        let tools_root = temp.path().join("tools");
+        fs::create_dir_all(&mod_root).unwrap();
+        additive_fixture(&mod_root);
+        fs::write(
+            mod_root.join(r"Fixture\Content\Dev\ObvData\Data\SyncMap\Fixture.ini"),
+            b"[Meshes]\n",
+        )
+        .unwrap();
+        game_fixture(&game_root);
+        runtime_tools_fixture(&tools_root);
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: vec![tools_root],
+        });
+        assert!(!report.can_update);
+        assert!(report.checks.iter().any(|check| {
+            check.id == "additive-plugin-syncmap-contract"
+                && check.status == "fail"
+                && check.blocking
+        }));
+    }
+
+    #[test]
+    fn functional_cont_override_change_is_blocked_against_current_master() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        let game_root = temp.path().join("game");
+        let tools_root = temp.path().join("tools");
+        fs::create_dir_all(&mod_root).unwrap();
+        additive_fixture(&mod_root);
+        fs::write(
+            mod_root.join(r"Fixture\Content\Dev\ObvData\Data\Fixture.esp"),
+            invalid_cont_override_plugin_bytes(),
+        )
+        .unwrap();
+        game_fixture(&game_root);
+        fs::write(
+            game_root.join(r"OblivionRemastered\Content\Dev\ObvData\Data\Oblivion.esm"),
+            current_master_with_container_bytes(),
+        )
+        .unwrap();
+        runtime_tools_fixture(&tools_root);
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: vec![tools_root],
+        });
+        assert!(!report.can_update);
+        let contract = report.additive_contract.as_ref().unwrap();
+        assert!(
+            contract
+                .blockers
+                .iter()
+                .any(|blocker| { blocker.contains("functional non-inventory fields") })
+        );
+    }
+
+    #[test]
+    fn plugin_must_belong_to_the_unique_data_and_paks_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        let game_root = temp.path().join("game");
+        let tools_root = temp.path().join("tools");
+        fs::create_dir_all(&mod_root).unwrap();
+        additive_fixture(&mod_root);
+        let original = mod_root.join(r"Fixture\Content\Dev\ObvData\Data\Fixture.esp");
+        let misplaced = mod_root.join(r"Other\Content\Dev\ObvData\Data\Fixture.esp");
+        fs::create_dir_all(misplaced.parent().unwrap()).unwrap();
+        fs::rename(original, misplaced).unwrap();
+        game_fixture(&game_root);
+        runtime_tools_fixture(&tools_root);
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: vec![tools_root],
+        });
+        assert_eq!(
+            report
+                .inventory
+                .as_ref()
+                .unwrap()
+                .candidate_mod_root
+                .as_deref(),
+            Some("Fixture")
+        );
+        assert!(!report.can_update);
+        assert!(report.checks.iter().any(|check| {
+            check.id == "plugin-additive-syncmap-policy" && check.status == "fail" && check.blocking
+        }));
+    }
+
+    #[test]
+    fn plugin_content_changes_the_stable_signature_even_when_size_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let output = temp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        let plugin_path = input.join("Fixture.esp");
+        let original = valid_plugin_bytes();
+        fs::write(&plugin_path, &original).unwrap();
+        let request = PreflightRequest {
+            mod_input: input,
+            game_root: None,
+            output_parent: Some(output),
+            connected_tools: Vec::new(),
+        };
+        let first = analyze(&request);
+        let mut changed = original;
+        let position = changed
+            .windows(b"Fixture".len())
+            .position(|window| window == b"Fixture")
+            .unwrap();
+        changed[position] = b'G';
+        fs::write(&plugin_path, changed).unwrap();
+        let second = analyze(&request);
+        assert_ne!(stable_signature(&first), stable_signature(&second));
     }
 
     #[test]
@@ -1345,6 +1859,63 @@ mod tests {
                 .iter()
                 .filter(|tool| tool.required_for_selected_adapter)
                 .all(|tool| tool.status != "missing")
+        );
+    }
+
+    #[test]
+    fn additive_zip_reads_only_selected_metadata_and_remains_updatable() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let game_root = temp.path().join("game");
+        let tools_root = temp.path().join("tools");
+        let output = temp.path().join("output");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        additive_fixture(&source);
+        game_fixture(&game_root);
+        runtime_tools_fixture(&tools_root);
+        let archive = temp.path().join("additive.zip");
+        crate::archive::create_zip_from_paths(&archive, &source, &[source.join("Fixture")])
+            .unwrap();
+
+        let report = analyze(&PreflightRequest {
+            mod_input: archive,
+            game_root: Some(game_root),
+            output_parent: Some(output),
+            connected_tools: vec![tools_root],
+        });
+        assert!(report.can_update);
+        assert!(report.performance.metadata_only_archive_scan);
+        assert_eq!(
+            report.plugin_compatibility.as_ref().unwrap().scan_mode,
+            "validated-selected-entry-extraction"
+        );
+    }
+
+    #[test]
+    fn additive_preflight_accepts_the_inner_project_game_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        let game_root = temp.path().join("game");
+        let tools_root = temp.path().join("tools");
+        fs::create_dir_all(&mod_root).unwrap();
+        additive_fixture(&mod_root);
+        game_fixture(&game_root);
+        runtime_tools_fixture(&tools_root);
+
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root.join("OblivionRemastered")),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: vec![tools_root],
+        });
+
+        assert!(report.can_update);
+        assert!(
+            report
+                .additive_contract
+                .as_ref()
+                .is_some_and(|contract| contract.current_master_checked && contract.compatible)
         );
     }
 

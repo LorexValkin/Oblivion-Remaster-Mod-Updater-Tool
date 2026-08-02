@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.5-beta - 2026-08-01
+
+- Added a versioned ESP/ESM/ESL manifest and byte-preservation layer with master graphs, header-flag checks, FormID ownership rules, and bounded compressed-record decoding.
+- Bound the guarded additive lane to one mod root and a non-empty SyncMap, then validate mapped local IDs and `CONT` additions against the selected current `Oblivion.esm` before enabling Update.
+- Added bounded selected-metadata extraction for ZIP, 7Z, and RAR preflight so IoStore payloads are not expanded just to inspect plugins.
+- Publish the verified candidate before installing runtime dependencies, and stage dependency changes as one rollback-capable transaction.
+- Kept ESM, ESL/light, multi-plugin, placed-reference, quest/script, and unknown record mutations report-only until dedicated adapters and runtime evidence exist.
+
 ## 0.5.3-beta - 2026-07-15
 
 - Added a guarded, mod-agnostic update lane for custom-project StaticMesh containers.

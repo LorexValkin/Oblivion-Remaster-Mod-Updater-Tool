@@ -2,13 +2,20 @@ use crate::archive::{
     copy_input_tree, copy_tree, create_zip_from_paths, sha256_directory, sha256_file,
 };
 use crate::container::lint_equal_order_overrides;
-use crate::dependencies::{DependencyReport, check_or_install, game_is_running, scan_dependencies};
+use crate::dependencies::{
+    DependencyKind, DependencyReport, RUNTIME_DEPENDENCY_TRANSACTION_API, check_or_install,
+    game_is_running, installed_state, scan_dependencies,
+};
 use crate::fixes::{
     DEPENDENCY_PRESERVATION_API, DEPENDENCY_TRACE_API, DependencyPreservationReport,
     EXACT_DEPENDENCY_EXTRACTION_API, ExactExtractionReport, extract_packages_with_dependency_view,
     trace_package_dependencies, verify_dependency_preservation,
 };
 use crate::game::{save_settings, validate_game_install};
+use crate::plugin::{
+    ADDITIVE_CONTRACT_API, PLUGIN_MANIFEST_API, PLUGIN_PRESERVATION_API, inspect_plugin_set,
+    verify_plugin_set_preserved,
+};
 use crate::replacement::{
     ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
     TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
@@ -812,6 +819,25 @@ fn run_additive_update(
     let mod_root = find_mod_root(&extract_root)?;
     let mod_data = mod_root.join(r"Content\Dev\ObvData\Data");
     let mod_paks = mod_root.join(r"Content\Paks\~mods");
+    // Inventory the complete staged input so a sibling ESP/ESM/ESL cannot be
+    // silently dropped, then evaluate the mutation policy relative to the exact
+    // mod root whose Content directories the engine will consume.
+    let staged_plugin_set = inspect_plugin_set(&extract_root)?;
+    let plugin_set = inspect_plugin_set(&mod_root)?;
+    if staged_plugin_set.plugin_count != plugin_set.plugin_count {
+        bail!(
+            "native additive scope found {} plugin file(s) outside the selected mod root",
+            staged_plugin_set
+                .plugin_count
+                .saturating_sub(plugin_set.plugin_count)
+        );
+    }
+    if !plugin_set.additive_syncmap_v1.compatible {
+        bail!(
+            "native additive plugin policy failed: {}",
+            plugin_set.additive_syncmap_v1.blockers.join(", ")
+        );
+    }
     let esp_files = files_with_extension(&mod_data, "esp")?;
     if esp_files.len() != 1 {
         bail!(
@@ -841,16 +867,8 @@ fn run_additive_update(
         2,
         "Validating runtime tools, ESP, ESM override, and stable FormIDs",
     );
-    let dependency_candidates = scan_dependencies(&request.dependency_inputs, Some(&mod_input));
-    let dependency_report: DependencyReport =
-        check_or_install(&game.root, dependency_candidates, true)?;
-    if !dependency_report.ready {
-        bail!(
-            "SyncMap mod requires UE4SS and TesSyncMapInjector. Place their archives beside the mod or attach them in the app."
-        );
-    }
     let plugin = read_plugin(&esp_files[0])?;
-    if plugin.masters != ["Oblivion.esm"] {
+    if plugin.masters.len() != 1 || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
         bail!(
             "native additive scope supports one exact master, Oblivion.esm; found: {}",
             plugin.masters.join(", ")
@@ -922,6 +940,23 @@ fn run_additive_update(
             }
         }
         override_results.push(result);
+    }
+    let dependency_candidates = scan_dependencies(&request.dependency_inputs, Some(&mod_input));
+    let installed_dependencies = installed_state(&game.root);
+    let ue4ss_available = installed_dependencies.ue4ss.installed
+        || dependency_candidates
+            .iter()
+            .any(|candidate| candidate.kinds.contains(&DependencyKind::UE4SS));
+    let injector_available = installed_dependencies.tes_sync_map_injector.installed
+        || dependency_candidates.iter().any(|candidate| {
+            candidate
+                .kinds
+                .contains(&DependencyKind::TesSyncMapInjector)
+        });
+    if !ue4ss_available || !injector_available {
+        bail!(
+            "SyncMap mod requires UE4SS and TesSyncMapInjector. Place their archives beside the mod or attach them in the app."
+        );
     }
 
     stage(callback, 3, "Checking that Unreal packages are additive");
@@ -1128,6 +1163,7 @@ fn run_additive_update(
     if source_esp_hash != candidate_esp_hash {
         bail!("ESP bytes changed during update");
     }
+    verify_plugin_set_preserved(&mod_root, &candidate_root)?;
     let candidate_plugin = read_plugin(&candidate_esp)?;
     let candidate_owned_ids = sorted_form_ids(
         candidate_plugin
@@ -1146,22 +1182,35 @@ fn run_additive_update(
     }
     let sync_map_resolutions =
         resolve_sync_map_entries(&sync_entries, &owned_records, &original_packages)?;
+    let dependency_plan: DependencyReport =
+        check_or_install(&game.root, dependency_candidates.clone(), false)?;
     let body_setup_repair_count = container_results
         .iter()
         .map(|container| container.body_setup_repairs.len())
         .sum::<usize>();
     let report_path = output_directory.join("additive-update-report.json");
-    let report = json!({
+    let dependency_install_report_path =
+        output_directory.join("runtime-dependency-install-report.json");
+    let mut report = json!({
         "schema": "obr-additive-mod-update-report",
         "version": 6,
         "implementation": "native-rust",
         "fixApis": [
+            PLUGIN_MANIFEST_API,
+            PLUGIN_PRESERVATION_API,
+            ADDITIVE_CONTRACT_API,
+            RUNTIME_DEPENDENCY_TRANSACTION_API,
             DEPENDENCY_TRACE_API,
             EXACT_DEPENDENCY_EXTRACTION_API,
             DEPENDENCY_PRESERVATION_API,
         ],
         "generatedAt": chrono::Utc::now().to_rfc3339(),
-        "status": "candidate_ready_for_runtime_test",
+        "reportSnapshot": "candidate-publication",
+        "status": if dependency_plan.ready {
+            "candidate_ready_for_runtime_test"
+        } else {
+            "candidate_verified_dependency_install_pending"
+        },
         "structurallyVerified": true,
         "runtimeVerified": false,
         "source": {
@@ -1172,6 +1221,7 @@ fn run_additive_update(
             "espSha256": source_esp_hash,
             "syncMap": sync_files[0].file_name().unwrap().to_string_lossy(),
             "syncMapSha256": sha256_file(&sync_files[0])?,
+            "pluginManifestSha256": plugin_set.manifest_sha256.clone(),
         },
         "target": {
             "gameRoot": game.root,
@@ -1196,6 +1246,7 @@ fn run_additive_update(
             "syncMapEntries": sync_entries,
             "syncMapResolutions": sync_map_resolutions,
         },
+        "pluginCompatibility": plugin_set,
         "unreal": {
             "additivePackageCount": original_packages.len(),
             "targetPathCollisionCount": 0,
@@ -1216,6 +1267,8 @@ fn run_additive_update(
         "output": {
             "directory": output_directory,
             "archive": output_archive,
+            "archiveContainsReportSnapshot": "candidate-publication",
+            "postPublicationDependencyReport": dependency_install_report_path,
         },
         "verification": {
             "sourceContainersVerified": true,
@@ -1224,12 +1277,17 @@ fn run_additive_update(
             "packageDependencyGraphsPreserved": true,
             "dependencyCompleteExtraction": true,
             "espReparsed": true,
+            "completePluginSetPreserved": true,
             "syncMapLinksResolved": true,
-            "runtimeDependenciesReady": dependency_report.ready,
+            "runtimeDependenciesReadyAtPublication": dependency_plan.ready,
             "productionRuntimeGateRequired": true,
-            "note": "This candidate is not called repaired until an in-game production run proves the content and behavior."
+            "note": "The portable candidate is published before any dependency installation mutates the game. Final dependency state is recorded separately, and this candidate is not called repaired until an in-game production run proves the content and behavior."
         },
-        "runtimeDependencies": dependency_report,
+        "runtimeDependenciesAtPublication": &dependency_plan,
+        "runtimeDependencyInstall": {
+            "phase": "after-durable-candidate-publication",
+            "transactionPolicy": "all payloads are validated and staged before commit; any commit failure restores every changed destination",
+        },
     });
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
 
@@ -1248,6 +1306,43 @@ fn run_additive_update(
     stage(
         callback,
         7,
+        "Candidate published; installing validated runtime dependencies transactionally",
+    );
+    let dependency_report: DependencyReport =
+        check_or_install(&game.root, dependency_candidates, true).with_context(|| {
+            format!(
+                "runtime dependency install failed; the verified candidate remains at {}",
+                output_archive.display()
+            )
+        })?;
+    if !dependency_report.ready {
+        bail!(
+            "runtime dependencies were not ready after installation; the verified candidate remains at {}",
+            output_archive.display()
+        );
+    }
+    fs::write(
+        &dependency_install_report_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "obr-runtime-dependency-install-report",
+            "version": 1,
+            "generatedAt": chrono::Utc::now().to_rfc3339(),
+            "candidateArchive": output_archive,
+            "candidateReport": report_path,
+            "transactional": true,
+            "result": &dependency_report,
+        }))?,
+    )?;
+    report["generatedAt"] = json!(chrono::Utc::now().to_rfc3339());
+    report["reportSnapshot"] = json!("post-publication-final");
+    report["status"] = json!("candidate_ready_for_runtime_test");
+    report["verification"]["runtimeDependenciesReadyAfterPublication"] =
+        json!(dependency_report.ready);
+    report["runtimeDependenciesAfterPublication"] = serde_json::to_value(&dependency_report)?;
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    stage(
+        callback,
+        8,
         "Structural update complete; shipping-game test still required",
     );
     Ok(UpdateOutcome {

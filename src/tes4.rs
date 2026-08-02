@@ -7,7 +7,12 @@ use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 
-const COMPRESSED_RECORD: u32 = 0x0004_0000;
+pub const COMPRESSED_RECORD: u32 = 0x0004_0000;
+pub const DELETED_RECORD: u32 = 0x0000_0020;
+pub const MASTER_FILE: u32 = 0x0000_0001;
+pub const LIGHT_PLUGIN: u32 = 0x0000_0200;
+const MAX_EXPANDED_RECORD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TOTAL_EXPANDED_PLUGIN_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Subrecord {
@@ -25,6 +30,7 @@ pub struct Record {
 
 #[derive(Clone, Debug)]
 pub struct Plugin {
+    pub header_flags: u32,
     pub masters: Vec<String>,
     pub declared_record_count: u32,
     pub next_object_id: u32,
@@ -78,24 +84,54 @@ fn read_fourcc(reader: &mut impl Read) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn expand_record_data(raw: Vec<u8>, flags: u32) -> Result<Vec<u8>> {
+fn expand_record_data_with_budget(
+    raw: Vec<u8>,
+    flags: u32,
+    remaining_budget: &mut usize,
+) -> Result<Vec<u8>> {
     if flags & COMPRESSED_RECORD == 0 {
+        *remaining_budget = remaining_budget
+            .checked_sub(raw.len())
+            .context("TES4 plugin exceeds the total expanded-data safety limit")?;
         return Ok(raw);
     }
     if raw.len() < 4 {
         bail!("compressed TES4 record payload is truncated");
     }
     let expected = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+    if expected > MAX_EXPANDED_RECORD_BYTES {
+        bail!(
+            "compressed TES4 record declares {expected} expanded bytes; limit is {MAX_EXPANDED_RECORD_BYTES}"
+        );
+    }
+    if expected > *remaining_budget {
+        bail!(
+            "TES4 plugin exceeds the {MAX_TOTAL_EXPANDED_PLUGIN_BYTES} byte total expanded-data safety limit"
+        );
+    }
     let mut decoder = ZlibDecoder::new(&raw[4..]);
     let mut output = Vec::with_capacity(expected);
-    decoder.read_to_end(&mut output)?;
+    decoder
+        .by_ref()
+        .take(expected.saturating_add(1) as u64)
+        .read_to_end(&mut output)?;
+    if output.len() > expected {
+        bail!("compressed TES4 record output exceeds its declared size of {expected} bytes");
+    }
     if output.len() != expected {
         bail!(
             "compressed TES4 record size mismatch: expected {expected}, got {}",
             output.len()
         );
     }
+    *remaining_budget -= output.len();
     Ok(output)
+}
+
+#[cfg(test)]
+fn expand_record_data(raw: Vec<u8>, flags: u32) -> Result<Vec<u8>> {
+    let mut budget = MAX_TOTAL_EXPANDED_PLUGIN_BYTES;
+    expand_record_data_with_budget(raw, flags, &mut budget)
 }
 
 fn read_subrecords(data: &[u8]) -> Result<Vec<Subrecord>> {
@@ -153,19 +189,23 @@ pub fn record_editor_id(record: &Record) -> Option<String> {
     Some(value)
 }
 
-pub fn read_plugin(path: &Path) -> Result<Plugin> {
-    let bytes = fs::read(path).with_context(|| format!("reading plugin {}", path.display()))?;
-    let mut reader = Cursor::new(bytes.as_slice());
+pub fn read_plugin_bytes(bytes: &[u8], source: &str) -> Result<Plugin> {
+    let mut reader = Cursor::new(bytes);
+    let mut expanded_budget = MAX_TOTAL_EXPANDED_PLUGIN_BYTES;
     if read_fourcc(&mut reader)? != "TES4" {
-        bail!("not a TES4 plugin: {}", path.display());
+        bail!("not a TES4 plugin: {source}");
     }
     let header_size = read_u32(&mut reader)? as usize;
     let header_flags = read_u32(&mut reader)?;
     let _header_form_id = read_u32(&mut reader)?;
     let _header_version_control = read_u32(&mut reader)?;
+    if header_size > bytes.len().saturating_sub(reader.position() as usize) {
+        bail!("truncated TES4 header in {source}: size={header_size}");
+    }
     let mut header_raw = vec![0; header_size];
     reader.read_exact(&mut header_raw)?;
-    let header_data = expand_record_data(header_raw, header_flags)?;
+    let header_data =
+        expand_record_data_with_budget(header_raw, header_flags, &mut expanded_budget)?;
     let header_subs = read_subrecords(&header_data)?;
     let masters = header_subs
         .iter()
@@ -185,7 +225,7 @@ pub fn read_plugin(path: &Path) -> Result<Plugin> {
         if kind == "GRUP" {
             let group_size = read_u32(&mut reader)? as u64;
             if group_size < 20 || start + group_size > bytes.len() as u64 {
-                bail!("invalid GRUP at 0x{start:X} in {}", path.display());
+                bail!("invalid GRUP at 0x{start:X} in {source}");
             }
             reader.seek(SeekFrom::Current(12))?;
             continue;
@@ -199,7 +239,7 @@ pub fn read_plugin(path: &Path) -> Result<Plugin> {
         }
         let mut raw = vec![0; data_size];
         reader.read_exact(&mut raw)?;
-        let data = expand_record_data(raw, flags)?;
+        let data = expand_record_data_with_budget(raw, flags, &mut expanded_budget)?;
         records.push(Record {
             kind,
             form_id,
@@ -207,7 +247,14 @@ pub fn read_plugin(path: &Path) -> Result<Plugin> {
             subrecords: read_subrecords(&data)?,
         });
     }
+    if reader.position() as usize != bytes.len() {
+        bail!(
+            "TES4 plugin has {} trailing bytes after the last complete record: {source}",
+            bytes.len() - reader.position() as usize
+        );
+    }
     Ok(Plugin {
+        header_flags,
         masters,
         declared_record_count,
         next_object_id,
@@ -215,11 +262,21 @@ pub fn read_plugin(path: &Path) -> Result<Plugin> {
     })
 }
 
+pub fn read_plugin(path: &Path) -> Result<Plugin> {
+    let bytes = fs::read(path).with_context(|| format!("reading plugin {}", path.display()))?;
+    let source = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("plugin");
+    read_plugin_bytes(&bytes, source).with_context(|| format!("parsing plugin {}", path.display()))
+}
+
 pub fn read_target_records(path: &Path, form_ids: &[u32]) -> Result<HashMap<u32, Record>> {
     let wanted = form_ids.iter().copied().collect::<HashSet<_>>();
     let mut found = HashMap::new();
     let mut reader = File::open(path).with_context(|| format!("opening ESM {}", path.display()))?;
     let length = reader.metadata()?.len();
+    let mut expanded_budget = MAX_TOTAL_EXPANDED_PLUGIN_BYTES;
     while reader.stream_position()? + 20 <= length && found.len() < wanted.len() {
         let start = reader.stream_position()?;
         let kind = read_fourcc(&mut reader)?;
@@ -241,7 +298,7 @@ pub fn read_target_records(path: &Path, form_ids: &[u32]) -> Result<HashMap<u32,
         if wanted.contains(&form_id) {
             let mut raw = vec![0; data_size];
             reader.read_exact(&mut raw)?;
-            let data = expand_record_data(raw, flags)?;
+            let data = expand_record_data_with_budget(raw, flags, &mut expanded_budget)?;
             found.insert(
                 form_id,
                 Record {
@@ -541,9 +598,9 @@ pub fn package_to_game_path(package: &str) -> Result<String> {
     Ok(format!("/{mount}/{}", relative.trim_start_matches('/')))
 }
 
-pub fn read_sync_map(path: &Path) -> Result<Vec<SyncMapEntry>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("reading SyncMap {}", path.display()))?;
+pub fn read_sync_map_bytes(bytes: &[u8], source: &str) -> Result<Vec<SyncMapEntry>> {
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("SyncMap is not valid UTF-8: {source}"))?;
     let section_re = Regex::new(r"^\[(.+)\]$")?;
     let entry_re = Regex::new(r"^([0-9A-Fa-f]{6,8})\s*=\s*(\S.+?)\s*$")?;
     let mut section = String::new();
@@ -577,6 +634,15 @@ pub fn read_sync_map(path: &Path) -> Result<Vec<SyncMapEntry>> {
     Ok(entries)
 }
 
+pub fn read_sync_map(path: &Path) -> Result<Vec<SyncMapEntry>> {
+    let bytes = fs::read(path).with_context(|| format!("reading SyncMap {}", path.display()))?;
+    let source = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("SyncMap.ini");
+    read_sync_map_bytes(&bytes, source)
+}
+
 pub fn sorted_form_ids(records: impl Iterator<Item = u32>) -> Vec<String> {
     let mut values = records.map(|id| format!("0x{id:08X}")).collect::<Vec<_>>();
     values.sort();
@@ -587,6 +653,50 @@ pub fn sorted_form_ids(records: impl Iterator<Item = u32>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+    use std::io::Write;
+
+    fn compressed_record_payload(declared_size: u32, expanded: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(expanded).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut raw = declared_size.to_le_bytes().to_vec();
+        raw.extend_from_slice(&compressed);
+        raw
+    }
+
+    #[test]
+    fn refuses_compressed_record_with_unbounded_declared_size() {
+        let raw = compressed_record_payload(u32::MAX, b"");
+        let error = expand_record_data(raw, COMPRESSED_RECORD).unwrap_err();
+        assert!(error.to_string().contains("expanded bytes; limit"));
+    }
+
+    #[test]
+    fn refuses_compressed_record_that_overproduces_declared_output() {
+        let raw = compressed_record_payload(4, b"12345678");
+        let error = expand_record_data(raw, COMPRESSED_RECORD).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("output exceeds its declared size")
+        );
+    }
+
+    #[test]
+    fn refuses_compressed_record_beyond_remaining_plugin_budget() {
+        let raw = compressed_record_payload(8, b"12345678");
+        let mut remaining = 4;
+        let error =
+            expand_record_data_with_budget(raw, COMPRESSED_RECORD, &mut remaining).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("total expanded-data safety limit")
+        );
+        assert_eq!(remaining, 4);
+    }
 
     fn subrecord(kind: &str, data: impl Into<Vec<u8>>) -> Subrecord {
         Subrecord {

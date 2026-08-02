@@ -17,8 +17,16 @@ $StageName = "OBR-Mod-Updater-v$Version-windows-x64"
 $DistRoot = Join-Path $RepoRoot "dist"
 $StageRoot = Join-Path $DistRoot $StageName
 $ArchivePath = Join-Path $DistRoot "$StageName.zip"
+$StandaloneExePath = Join-Path $DistRoot "$StageName.exe"
+$ChecksumsPath = Join-Path $DistRoot "$StageName-SHA256SUMS.txt"
+$ReleaseBodyPath = Join-Path $DistRoot "$StageName-RELEASE-NOTES.md"
+$ReleaseNotesPath = Join-Path $RepoRoot "docs\NEXUS-$Version-BETA.md"
 $ReleaseTarget = Join-Path $RepoRoot ".tmp\release-target-$Version"
 $ReleaseBin = Join-Path $ReleaseTarget "release"
+
+if (-not (Test-Path -LiteralPath $ReleaseNotesPath -PathType Leaf)) {
+    throw "Version-specific release notes missing: $ReleaseNotesPath"
+}
 
 if (-not $SkipTests) {
     cargo fmt --all -- --check
@@ -55,11 +63,21 @@ if (Test-Path -LiteralPath $StageRoot) {
 if (Test-Path -LiteralPath $ArchivePath) {
     Remove-Item -LiteralPath $ArchivePath -Force
 }
+if (Test-Path -LiteralPath $StandaloneExePath) {
+    Remove-Item -LiteralPath $StandaloneExePath -Force
+}
+if (Test-Path -LiteralPath $ChecksumsPath) {
+    Remove-Item -LiteralPath $ChecksumsPath -Force
+}
+if (Test-Path -LiteralPath $ReleaseBodyPath) {
+    Remove-Item -LiteralPath $ReleaseBodyPath -Force
+}
 New-Item -ItemType Directory -Path $StageRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $StageRoot "Dependencies") -Force | Out-Null
 
 $Copies = @(
     @((Join-Path $ReleaseBin "obr-mod-updater.exe"), "OBR Mod Updater.exe"),
+    @($ReleaseNotesPath, "WHATS-NEW.md"),
     @("packaging\README.txt", "README.txt"),
     @("packaging\Dependencies\PLACE TOOL ARCHIVES HERE.txt", "Dependencies\PLACE TOOL ARCHIVES HERE.txt"),
     @("LICENSE", "LICENSE"),
@@ -147,4 +165,18 @@ $Manifest | ConvertTo-Json -Depth 6 |
     Set-Content -LiteralPath (Join-Path $StageRoot "RELEASE-MANIFEST.json") -Encoding utf8
 
 Compress-Archive -LiteralPath $StageRoot -DestinationPath $ArchivePath -CompressionLevel Optimal
+Copy-Item -LiteralPath $StagedExe -Destination $StandaloneExePath
+$ChecksumRows = @(
+    ("{0}  {1}" -f (Get-FileHash -LiteralPath $StandaloneExePath -Algorithm SHA256).Hash.ToLowerInvariant(), [IO.Path]::GetFileName($StandaloneExePath))
+    ("{0}  {1}" -f (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant(), [IO.Path]::GetFileName($ArchivePath))
+)
+$ChecksumRows | Set-Content -LiteralPath $ChecksumsPath -Encoding ascii
+$ReleaseBody = (Get-Content -LiteralPath $ReleaseNotesPath -Raw).TrimEnd()
+$ReleaseBody += "`r`n`r`n## SHA-256 checksums`r`n`r`n"
+$ReleaseBody += "- EXE: ``$($ChecksumRows[0].Split(' ')[0])```r`n"
+$ReleaseBody += "- ZIP: ``$($ChecksumRows[1].Split(' ')[0])```r`n"
+$ReleaseBody | Set-Content -LiteralPath $ReleaseBodyPath -Encoding utf8
+Write-Output $StandaloneExePath
 Write-Output $ArchivePath
+Write-Output $ChecksumsPath
+Write-Output $ReleaseBodyPath

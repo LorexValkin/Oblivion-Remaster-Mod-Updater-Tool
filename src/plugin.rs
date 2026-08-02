@@ -48,6 +48,7 @@ pub struct PluginArtifact {
     pub masters: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_record_count: Option<u32>,
+    pub parsed_group_count: usize,
     pub parsed_record_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_object_id: Option<String>,
@@ -252,15 +253,18 @@ fn analyze_parsed_plugin(
             structural_blockers.push("plugin-owned-local-form-ids-below-0x800".to_owned());
         }
     }
-    if plugin.declared_record_count as usize != plugin.records.len() {
-        structural_blockers.push("declared-record-count-does-not-match-parsed-records".to_owned());
+    if plugin.declared_record_count as usize != plugin.records.len() + plugin.group_count {
+        structural_blockers
+            .push("declared-record-count-does-not-match-records-and-groups".to_owned());
     }
     if !light_semantics {
         if plugin.next_object_id < MIN_FULL_PLUGIN_LOCAL_ID {
             structural_blockers.push("next-object-id-below-0x800".to_owned());
-        }
-        if max_owned_local_id.is_some_and(|value| plugin.next_object_id <= value) {
-            structural_blockers.push("next-object-id-does-not-follow-owned-form-ids".to_owned());
+        } else if max_owned_local_id.is_some_and(|value| plugin.next_object_id <= value) {
+            warnings.push(
+                "TES4 HEDR nextObjectId does not follow the highest owned FormID; this byte-preserving adapter never allocates FormIDs"
+                    .to_owned(),
+            );
         }
     }
     let mut master_names = HashSet::new();
@@ -293,6 +297,7 @@ fn analyze_parsed_plugin(
         light_plugin_flag: plugin.header_flags & LIGHT_PLUGIN != 0,
         masters: plugin.masters,
         declared_record_count: Some(plugin.declared_record_count),
+        parsed_group_count: plugin.group_count,
         parsed_record_count: plugin.records.len(),
         next_object_id: Some(format!("0x{:06X}", plugin.next_object_id)),
         record_type_counts,
@@ -331,6 +336,7 @@ fn failed_artifact(
         light_plugin_flag: false,
         masters: Vec::new(),
         declared_record_count: None,
+        parsed_group_count: 0,
         parsed_record_count: 0,
         next_object_id: None,
         record_type_counts: BTreeMap::new(),
@@ -1050,6 +1056,51 @@ mod tests {
         plugin_bytes_with_flags(masters, records, next_object_id, 0)
     }
 
+    fn grouped_plugin_bytes(
+        masters: &[&str],
+        groups: &[(&str, &[(&str, u32)])],
+        next_object_id: u32,
+        declared_entry_count: u32,
+    ) -> Vec<u8> {
+        let mut header_data = Vec::new();
+        let mut hedr = 1.0_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&declared_entry_count.to_le_bytes());
+        hedr.extend_from_slice(&next_object_id.to_le_bytes());
+        header_data.extend(subrecord("HEDR", &hedr));
+        for master in masters {
+            let mut name = master.as_bytes().to_vec();
+            name.push(0);
+            header_data.extend(subrecord("MAST", &name));
+            header_data.extend(subrecord("DATA", &[0; 8]));
+        }
+
+        let mut bytes = b"TES4".to_vec();
+        bytes.extend_from_slice(&(header_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&header_data);
+        for (label, records) in groups {
+            let mut group_payload = Vec::new();
+            for (kind, form_id) in *records {
+                let data = subrecord("EDID", b"Fixture\0");
+                group_payload.extend_from_slice(kind.as_bytes());
+                group_payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                group_payload.extend_from_slice(&0_u32.to_le_bytes());
+                group_payload.extend_from_slice(&form_id.to_le_bytes());
+                group_payload.extend_from_slice(&0_u32.to_le_bytes());
+                group_payload.extend_from_slice(&data);
+            }
+            bytes.extend_from_slice(b"GRUP");
+            bytes.extend_from_slice(&(20_u32 + group_payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(label.as_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&group_payload);
+        }
+        bytes
+    }
+
     fn write_plugin(root: &Path, relative: &str, bytes: &[u8]) {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1069,6 +1120,63 @@ mod tests {
         assert_eq!(report.status, "complete");
         assert!(report.additive_syncmap_v1.compatible);
         assert_eq!(report.artifacts[0].plugin_owned_record_count, 1);
+    }
+
+    #[test]
+    fn counts_groups_in_hedr_and_only_warns_for_stale_next_object_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let armor = [
+            ("ARMO", 0x0100_08F1),
+            ("ARMO", 0x0100_08F2),
+            ("ARMO", 0x0100_08F3),
+            ("ARMO", 0x0100_08F4),
+        ];
+        let container = [("CONT", 0x000C_A143)];
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\ParryingDaggers_Standalone.esp",
+            &grouped_plugin_bytes(
+                &["Oblivion.esm"],
+                &[("ARMO", &armor), ("CONT", &container)],
+                0x803,
+                7,
+            ),
+        );
+
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.declared_record_count, Some(7));
+        assert_eq!(artifact.parsed_group_count, 2);
+        assert_eq!(artifact.parsed_record_count, 5);
+        assert!(artifact.structural_blockers.is_empty());
+        assert!(
+            artifact
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("nextObjectId"))
+        );
+        assert!(report.additive_syncmap_v1.compatible);
+    }
+
+    #[test]
+    fn still_blocks_true_hedr_count_mismatch_and_sub_800_allocator() {
+        let temp = tempfile::tempdir().unwrap();
+        let records = [("STAT", 0x0100_0800)];
+        write_plugin(
+            temp.path(),
+            r"Mismatch\Content\Dev\ObvData\Data\Mismatch.esp",
+            &grouped_plugin_bytes(&["Oblivion.esm"], &[("STAT", &records)], 0x7FF, 3),
+        );
+
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let blockers = &report.artifacts[0].structural_blockers;
+        assert!(
+            blockers
+                .contains(&"declared-record-count-does-not-match-records-and-groups".to_owned())
+        );
+        assert!(blockers.contains(&"next-object-id-below-0x800".to_owned()));
+        assert!(report.artifacts[0].warnings.is_empty());
+        assert!(!report.additive_syncmap_v1.compatible);
     }
 
     #[test]

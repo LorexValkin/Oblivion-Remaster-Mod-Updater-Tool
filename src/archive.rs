@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -539,23 +539,34 @@ fn extract_selected_7z(
         bail!("7Z declares {declared_bytes} unpacked bytes; limit is {MAX_ARCHIVE_DECLARED_BYTES}");
     }
     let selected_count = expected.iter().filter(|entry| entry.selected).count();
+    let expected_by_key = expected
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.name.replace('\\', "/").to_ascii_lowercase(), index))
+        .collect::<HashMap<_, _>>();
     drop(reader);
     let mut processed = 0_usize;
     let mut extracted = 0_usize;
+    let mut processed_keys = HashSet::new();
     let mut validation_error = None::<String>;
     sevenz_rust::decompress_file_with_extract_fn(source, destination, |entry, reader, target| {
-        let index = processed;
         processed += 1;
         let relative = Path::new(entry.name());
-        let expected_entry = expected.get(index);
+        let key = entry.name().replace('\\', "/").to_ascii_lowercase();
+        let expected_entry = expected_by_key
+            .get(&key)
+            .and_then(|index| expected.get(*index));
+        let first_callback_for_path = processed_keys.insert(key);
         if validation_error.is_some()
             || expected_entry.is_none()
+            || !first_callback_for_path
             || !is_safe_relative(relative)
             || !expected_entry.is_some_and(|expected| expected.matches(entry))
         {
             if validation_error.is_none() {
                 validation_error = Some(format!(
-                    "7Z entry metadata changed after validation at entry {index}: {}",
+                    "7Z entry metadata changed after validation at callback entry {}: {}",
+                    processed - 1,
                     entry.name()
                 ));
             }
@@ -588,10 +599,14 @@ fn extract_selected_7z(
     if let Some(error) = validation_error {
         bail!(error);
     }
-    if processed != expected.len() || extracted != selected_count {
+    if processed != expected.len()
+        || processed_keys.len() != expected.len()
+        || extracted != selected_count
+    {
         bail!(
-            "7Z entry count changed during extraction: expected {} entries and {selected_count} selected, processed {processed} and extracted {extracted}",
-            expected.len()
+            "7Z entry count changed during extraction: expected {} entries and {selected_count} selected, processed {processed} callbacks for {} unique paths and extracted {extracted}",
+            expected.len(),
+            processed_keys.len()
         );
     }
     Ok(selected_count)
@@ -871,6 +886,73 @@ mod tests {
         entry.size = 4;
         entry.name = "Fixture/Content/Dev/ObvData/Data/Changed.esp".to_owned();
         assert!(!expected.matches(&entry));
+    }
+
+    #[test]
+    fn selected_7z_extraction_matches_callbacks_by_path_not_archive_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let plugin_path = source.join("Fixture/Content/Dev/ObvData/Data/Fixture.esp");
+        let sync_map_path = source.join("Fixture/Content/Dev/ObvData/Data/SyncMap/Fixture.ini");
+        fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(sync_map_path.parent().unwrap()).unwrap();
+        fs::write(&plugin_path, b"TES4 fixture").unwrap();
+        fs::write(&sync_map_path, b"[Meshes]\n000800=/Game/Fixture").unwrap();
+
+        let archive_path = temp.path().join("fixture.7z");
+        let mut writer = sevenz_rust::SevenZWriter::create(&archive_path).unwrap();
+        for name in [
+            "Fixture",
+            "Fixture/Content",
+            "Fixture/Content/Dev",
+            "Fixture/Content/Dev/ObvData",
+            "Fixture/Content/Dev/ObvData/Data",
+            "Fixture/Content/Dev/ObvData/Data/SyncMap",
+        ] {
+            let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+            entry.name = name.to_owned();
+            entry.is_directory = true;
+            writer.push_archive_entry::<&[u8]>(entry, None).unwrap();
+        }
+        writer
+            .push_archive_entry(
+                sevenz_rust::SevenZArchiveEntry::from_path(
+                    &plugin_path,
+                    "Fixture/Content/Dev/ObvData/Data/Fixture.esp".to_owned(),
+                ),
+                Some(File::open(&plugin_path).unwrap()),
+            )
+            .unwrap();
+        writer
+            .push_archive_entry(
+                sevenz_rust::SevenZArchiveEntry::from_path(
+                    &sync_map_path,
+                    "Fixture/Content/Dev/ObvData/Data/SyncMap/Fixture.ini".to_owned(),
+                ),
+                Some(File::open(&sync_map_path).unwrap()),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let output = temp.path().join("selected");
+        assert_eq!(
+            extract_archive_files_with_extensions(
+                &archive_path,
+                &output,
+                &["esp", "ini"],
+                MAX_SELECTED_METADATA_ENTRY_BYTES,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            fs::read(output.join("Fixture/Content/Dev/ObvData/Data/Fixture.esp")).unwrap(),
+            b"TES4 fixture"
+        );
+        assert_eq!(
+            fs::read(output.join("Fixture/Content/Dev/ObvData/Data/SyncMap/Fixture.ini")).unwrap(),
+            b"[Meshes]\n000800=/Game/Fixture"
+        );
     }
 
     #[test]

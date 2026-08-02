@@ -29,6 +29,9 @@ walkdir = "2.5.0"
 winreg = "0.56.0"
 zip = { version = "6.0.0", default-features = false, features = ["deflate"] }
 
+[dev-dependencies]
+sevenz-rust = { version = "0.6.1", default-features = false, features = ["compress"] }
+
 [build-dependencies]
 slint-build = "=1.12.1"
 winresource = { version = "0.1.31", default-features = false }

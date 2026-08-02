@@ -968,6 +968,7 @@ pub fn analyze_with_progress(
         ),
     ];
     if let Some(plugin_report) = plugin_compatibility.as_ref() {
+        let metadata_staging_failed = plugin_report.scan_mode == "unavailable";
         checks.push(check(
             "plugin-content-analysis",
             plugin_report.status == "complete"
@@ -977,8 +978,16 @@ pub fn analyze_with_progress(
                 "Parsed and fingerprinted {} plugin file(s) without rewriting them.",
                 plugin_report.plugin_count
             ),
-            "One or more ESP/ESM/ESL files could not be parsed safely.",
-            Some("Repair or replace malformed plugins before attempting an update."),
+            if metadata_staging_failed {
+                "Plugin metadata could not be staged or analyzed safely; this does not prove the ESP/ESM/ESL itself is malformed."
+            } else {
+                "One or more ESP/ESM/ESL files could not be parsed safely."
+            },
+            Some(if metadata_staging_failed {
+                "Repack the archive or send the report so its archive staging failure can be reproduced."
+            } else {
+                "Repair or replace malformed plugins before attempting an update."
+            }),
         ));
         checks.push(check(
             "plugin-structural-safety",

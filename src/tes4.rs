@@ -34,6 +34,7 @@ pub struct Plugin {
     pub masters: Vec<String>,
     pub declared_record_count: u32,
     pub next_object_id: u32,
+    pub group_count: usize,
     pub records: Vec<Record>,
 }
 
@@ -218,6 +219,7 @@ pub fn read_plugin_bytes(bytes: &[u8], source: &str) -> Result<Plugin> {
         .context("TES4 header has no valid HEDR")?;
     let declared_record_count = u32::from_le_bytes(hedr.data[4..8].try_into().unwrap());
     let next_object_id = u32::from_le_bytes(hedr.data[8..12].try_into().unwrap());
+    let mut group_count = 0_usize;
     let mut records = Vec::new();
     while reader.position() as usize + 20 <= bytes.len() {
         let start = reader.position();
@@ -227,6 +229,7 @@ pub fn read_plugin_bytes(bytes: &[u8], source: &str) -> Result<Plugin> {
             if group_size < 20 || start + group_size > bytes.len() as u64 {
                 bail!("invalid GRUP at 0x{start:X} in {source}");
             }
+            group_count += 1;
             reader.seek(SeekFrom::Current(12))?;
             continue;
         }
@@ -258,6 +261,7 @@ pub fn read_plugin_bytes(bytes: &[u8], source: &str) -> Result<Plugin> {
         masters,
         declared_record_count,
         next_object_id,
+        group_count,
         records,
     })
 }
@@ -571,7 +575,27 @@ pub fn validate_container_addition(
     })
 }
 pub fn package_to_game_path(package: &str) -> Result<String> {
-    let normalized = package.replace('\\', "/");
+    let mut normalized = package.replace('\\', "/");
+    for extension in [".uasset", ".umap"] {
+        if normalized.to_ascii_lowercase().ends_with(extension) {
+            normalized.truncate(normalized.len() - extension.len());
+        }
+    }
+    if normalized.starts_with('/') {
+        let components = normalized[1..].split('/').collect::<Vec<_>>();
+        if normalized.starts_with("//")
+            || components.len() < 2
+            || components.iter().any(|component| {
+                component.is_empty()
+                    || matches!(*component, "." | "..")
+                    || component.contains(':')
+                    || component.chars().any(char::is_control)
+            })
+        {
+            bail!("invalid mounted Unreal package path: {package}");
+        }
+        return Ok(normalized);
+    }
     let lower = normalized.to_ascii_lowercase();
     let marker = "/content/";
     let index = lower
@@ -589,12 +613,7 @@ pub fn package_to_game_path(package: &str) -> Result<String> {
         } else {
             project
         };
-    let mut relative = normalized[index + marker.len()..].to_owned();
-    for extension in [".uasset", ".umap"] {
-        if relative.to_ascii_lowercase().ends_with(extension) {
-            relative.truncate(relative.len() - extension.len());
-        }
-    }
+    let relative = normalized[index + marker.len()..].to_owned();
     Ok(format!("/{mount}/{}", relative.trim_start_matches('/')))
 }
 
@@ -789,5 +808,15 @@ mod tests {
             package_to_game_path("../../../Arena/Content/Art/Armor/Foo.uasset").unwrap(),
             "/Arena/Art/Armor/Foo"
         );
+        assert_eq!(
+            package_to_game_path("/Game/Forms/items/armor/Offhand_Weapon").unwrap(),
+            "/Game/Forms/items/armor/Offhand_Weapon"
+        );
+        assert_eq!(
+            package_to_game_path(r"\Game\Forms\items\armor\Offhand_Weapon.uasset").unwrap(),
+            "/Game/Forms/items/armor/Offhand_Weapon"
+        );
+        assert!(package_to_game_path("/Game/../Engine/Foo").is_err());
+        assert!(package_to_game_path("//Game/Forms/Foo").is_err());
     }
 }

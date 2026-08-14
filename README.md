@@ -2,6 +2,8 @@
 
 A native Windows beta utility for examining Oblivion Remastered mod archives and folders, then creating an updated candidate only when the input matches a supported and verified conversion path.
 
+Part of the **Unblivion Editor tool set**.
+
 The project is written in Rust with a Slint desktop interface. It does not use a browser runtime, install scripts, or modify the game during analysis.
 
 ## What it does

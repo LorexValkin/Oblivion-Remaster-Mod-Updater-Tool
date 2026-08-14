@@ -204,6 +204,29 @@ impl RetocTool {
         }
         Ok((result, entries))
     }
+
+    /// Reads package-store asset rows while allowing a structurally valid
+    /// container such as `global.utoc` to contain only script objects.
+    pub fn package_store_entries_allow_empty(
+        &self,
+        utoc: &Path,
+    ) -> Result<(NativeResult, Vec<PackageStoreEntry>)> {
+        let result = self.run([
+            "list".into(),
+            "--path".into(),
+            "--package".into(),
+            "--store".into(),
+            utoc.as_os_str().to_owned(),
+        ])?;
+        Self::assert_success(&result, &format!("retoc package store {}", utoc.display()))?;
+        let mut entries = parse_package_store_entries(&result.output)?;
+        entries.sort_by(|left, right| {
+            left.path
+                .to_ascii_lowercase()
+                .cmp(&right.path.to_ascii_lowercase())
+        });
+        Ok((result, entries))
+    }
 }
 
 fn parse_package_entries(lines: &[String]) -> Result<Vec<PackageEntry>> {

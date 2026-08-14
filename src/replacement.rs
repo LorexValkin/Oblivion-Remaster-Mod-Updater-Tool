@@ -1,4 +1,6 @@
-use crate::archive::{copy_tree, extract_archive};
+use crate::archive::{MAX_ARCHIVE_ENTRIES, copy_tree, extract_archive};
+use crate::fixes::{DependencyDiagnosticReport, diagnose_package_dependencies};
+use crate::game::normalize_install_root;
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::uasset::{
     TextureAssetDiagnostic, inspect_static_mesh_asset, inspect_texture_asset,
@@ -6,17 +8,22 @@ use crate::uasset::{
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 pub const ARMOR_REPLACEMENT_ADAPTER: &str = "native-armor-replacement-v1";
 pub const MIXED_ARMOR_REPLACEMENT_ADAPTER: &str = "native-mixed-armor-expansion-v1";
 pub const TEXTURE_REPLACEMENT_ADAPTER: &str = "native-texture-replacement-v1";
 pub const ADDITIVE_STATIC_MESH_ADAPTER: &str = "native-static-mesh-v2";
+pub const HETEROGENEOUS_REPLACEMENT_ADAPTER: &str = "native-heterogeneous-static-mesh-texture-v1";
+pub const MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API: &str =
+    "zen-mixed-replacement-package-diagnostic-v1";
 const MAX_REPLACEMENT_PACKAGES: usize = 4096;
+const MAX_MIXED_REPLACEMENT_DIAGNOSTIC_PACKAGES: usize = MAX_ARCHIVE_ENTRIES;
+const MAX_MIXED_REPLACEMENT_DIAGNOSTIC_DEPENDENCY_EDGES: usize = 1_000_000;
 const ARMOR_PATH_PREFIX: &str = "oblivionremastered/content/art/armor/";
 const ARMOR_FORM_PATH_PREFIX: &str = "oblivionremastered/content/forms/items/armor/";
 
@@ -26,6 +33,7 @@ enum ReplacementScope {
     MixedArmor,
     Texture,
     AdditiveStaticMesh,
+    HeterogeneousReplacement,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +75,102 @@ pub struct ReplacementProbeSummary {
     pub texture_assets: Vec<TextureAssetDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HeterogeneousReplacementAssetKind {
+    StaticMesh,
+    Texture2D,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeterogeneousReplacementPackageProbe {
+    pub package_id: u64,
+    pub source_path: String,
+    pub current_path: String,
+    pub asset_kind: HeterogeneousReplacementAssetKind,
+    pub imported_package_ids: Vec<u64>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeterogeneousReplacementProbeSummary {
+    pub adapter: String,
+    pub container_count: usize,
+    pub package_count: usize,
+    pub static_mesh_count: usize,
+    pub texture_count: usize,
+    pub packages: Vec<HeterogeneousReplacementPackageProbe>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProvenHeterogeneousAsset {
+    StaticMesh { imports: Vec<String> },
+    Texture2D(TextureAssetDiagnostic),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MixedReplacementIdentityStatus {
+    ExactReplacement,
+    Additive,
+    PathConflict,
+    PackageIdConflict,
+    PathAndPackageIdConflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixedReplacementContainerDiagnostic {
+    pub name: String,
+    pub relative_utoc: String,
+    pub package_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixedReplacementPackageDiagnostic {
+    pub container: String,
+    pub container_name: String,
+    pub name: String,
+    pub path: String,
+    pub package_id: u64,
+    pub imported_package_ids: Vec<u64>,
+    pub identity_status: MixedReplacementIdentityStatus,
+    pub current_path_match_package_id: Option<u64>,
+    pub current_id_match_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixedReplacementPackageDiagnosticReport {
+    pub api: String,
+    pub status: String,
+    pub mutation_policy: String,
+    pub automatic_update_enabled: bool,
+    pub container_count: usize,
+    pub source_package_count: usize,
+    pub current_game_package_count: usize,
+    pub exact_replacement_count: usize,
+    pub additive_package_count: usize,
+    pub conflict_package_count: usize,
+    pub path_conflict_count: usize,
+    pub package_id_conflict_count: usize,
+    pub containers: Vec<MixedReplacementContainerDiagnostic>,
+    pub packages: Vec<MixedReplacementPackageDiagnostic>,
+    pub dependencies: DependencyDiagnosticReport,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DiagnosticContainer {
+    name: String,
+    relative_utoc: String,
+    package_store: Vec<PackageStoreEntry>,
+}
+
 pub fn stage_input(source: &Path, destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     if source.is_dir() {
@@ -74,6 +178,362 @@ pub fn stage_input(source: &Path, destination: &Path) -> Result<()> {
     } else {
         extract_archive(source, destination)
     }
+}
+
+fn normalized_package_identity_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_start_matches("../")
+        .trim_start_matches("./")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn diagnostic_package_name(path: &str) -> String {
+    path.replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_owned()
+}
+
+fn safe_diagnostic_candidate_root(candidate_root: Option<&str>) -> Result<PathBuf> {
+    let Some(raw) = candidate_root else {
+        return Ok(PathBuf::new());
+    };
+    let path = Path::new(raw);
+    if raw.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+    {
+        bail!("mixed replacement candidate root is not a safe relative path");
+    }
+    Ok(if raw == "." {
+        PathBuf::new()
+    } else {
+        path.to_path_buf()
+    })
+}
+
+#[derive(Default)]
+struct DiagnosticTriple {
+    pak: Option<PathBuf>,
+    ucas: Option<PathBuf>,
+    utoc: Option<PathBuf>,
+}
+
+fn discover_diagnostic_containers(
+    root: &Path,
+    retoc: &RetocTool,
+) -> Result<Vec<DiagnosticContainer>> {
+    if !root.is_dir() {
+        bail!("mixed replacement candidate root is unavailable");
+    }
+    let mut triples = BTreeMap::<String, DiagnosticTriple>::new();
+    let mut file_count = 0_usize;
+    for entry in WalkDir::new(root) {
+        let entry =
+            entry.map_err(|_| anyhow::anyhow!("mixed replacement tree could not be read"))?;
+        if entry.file_type().is_symlink() {
+            bail!("mixed replacement input contains a filesystem link");
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        file_count += 1;
+        if file_count > MAX_ARCHIVE_ENTRIES {
+            bail!("mixed replacement input exceeds the bounded file limit");
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("mixed replacement file escaped its candidate root"))?;
+        let extension = relative
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "pak" | "ucas" | "utoc") {
+            bail!(
+                "mixed replacement input is not Unreal-container-only: {}",
+                relative.to_string_lossy().replace('\\', "/")
+            );
+        }
+        let key = relative
+            .with_extension("")
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase();
+        let triple = triples.entry(key).or_default();
+        let slot = match extension.as_str() {
+            "pak" => &mut triple.pak,
+            "ucas" => &mut triple.ucas,
+            "utoc" => &mut triple.utoc,
+            _ => unreachable!(),
+        };
+        if slot.replace(entry.path().to_path_buf()).is_some() {
+            bail!("mixed replacement input repeats a container member");
+        }
+    }
+    if triples.is_empty() {
+        bail!("mixed replacement input contains no container triples");
+    }
+
+    let mut containers = Vec::with_capacity(triples.len());
+    let mut package_count = 0_usize;
+    for triple in triples.into_values() {
+        let (Some(_pak), Some(_ucas), Some(utoc)) = (triple.pak, triple.ucas, triple.utoc) else {
+            bail!("mixed replacement input contains an incomplete PAK/UCAS/UTOC triple");
+        };
+        let relative_utoc = utoc
+            .strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("mixed replacement UTOC escaped its candidate root"))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let name = utoc
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("mixed replacement container name is not UTF-8")?
+            .to_owned();
+        retoc
+            .verify(&utoc, "retoc verify mixed replacement source")
+            .map_err(|_| {
+                anyhow::anyhow!("mixed replacement container failed structural verification")
+            })?;
+        let (_, mut package_store) = retoc.package_store_entries(&utoc).map_err(|_| {
+            anyhow::anyhow!("mixed replacement container package store could not be read")
+        })?;
+        package_store.sort_by(|left, right| {
+            normalized_package_identity_path(&left.path)
+                .cmp(&normalized_package_identity_path(&right.path))
+                .then(left.package_id.cmp(&right.package_id))
+        });
+        package_count = package_count
+            .checked_add(package_store.len())
+            .context("mixed replacement package count overflow")?;
+        if package_count > MAX_MIXED_REPLACEMENT_DIAGNOSTIC_PACKAGES {
+            bail!(
+                "mixed replacement package inventory exceeds the bounded diagnostic package limit"
+            );
+        }
+        containers.push(DiagnosticContainer {
+            name,
+            relative_utoc,
+            package_store,
+        });
+    }
+    Ok(containers)
+}
+
+fn build_mixed_replacement_diagnostic_report(
+    mut containers: Vec<DiagnosticContainer>,
+    current: Vec<PackageStoreEntry>,
+) -> Result<MixedReplacementPackageDiagnosticReport> {
+    containers.sort_by(|left, right| {
+        left.relative_utoc
+            .to_ascii_lowercase()
+            .cmp(&right.relative_utoc.to_ascii_lowercase())
+    });
+    let source = containers
+        .iter()
+        .flat_map(|container| container.package_store.iter().cloned())
+        .collect::<Vec<_>>();
+    if source.is_empty() || source.len() > MAX_MIXED_REPLACEMENT_DIAGNOSTIC_PACKAGES {
+        bail!("mixed replacement diagnostic source package count is outside its bounded limit");
+    }
+    let dependency_edge_count = source.iter().try_fold(0_usize, |count, package| {
+        count
+            .checked_add(package.imported_package_ids.len())
+            .context("mixed replacement dependency edge count overflow")
+    })?;
+    if dependency_edge_count > MAX_MIXED_REPLACEMENT_DIAGNOSTIC_DEPENDENCY_EDGES {
+        bail!("mixed replacement dependency graph exceeds the bounded edge limit");
+    }
+
+    // This validates unique package IDs and normalized paths in both stores before
+    // any identity result is emitted, and retains every unresolved edge in its report.
+    let dependencies = diagnose_package_dependencies(&source, &current)?;
+    let current_by_id = current
+        .iter()
+        .map(|package| (package.package_id, package))
+        .collect::<HashMap<_, _>>();
+    let current_by_path = current
+        .iter()
+        .map(|package| (normalized_package_identity_path(&package.path), package))
+        .collect::<HashMap<_, _>>();
+
+    let mut packages = Vec::with_capacity(source.len());
+    for container in &containers {
+        for package in &container.package_store {
+            let current_id_match = current_by_id.get(&package.package_id).copied();
+            let current_path_match = current_by_path
+                .get(&normalized_package_identity_path(&package.path))
+                .copied();
+            let identity_status = match (current_id_match, current_path_match) {
+                (Some(by_id), Some(by_path))
+                    if by_id.package_id == by_path.package_id
+                        && normalized_package_identity_path(&by_id.path)
+                            == normalized_package_identity_path(&package.path) =>
+                {
+                    MixedReplacementIdentityStatus::ExactReplacement
+                }
+                (None, None) => MixedReplacementIdentityStatus::Additive,
+                (None, Some(_)) => MixedReplacementIdentityStatus::PathConflict,
+                (Some(_), None) => MixedReplacementIdentityStatus::PackageIdConflict,
+                (Some(_), Some(_)) => MixedReplacementIdentityStatus::PathAndPackageIdConflict,
+            };
+            let mut imported_package_ids = package.imported_package_ids.clone();
+            imported_package_ids.sort_unstable();
+            packages.push(MixedReplacementPackageDiagnostic {
+                container: container.relative_utoc.clone(),
+                container_name: container.name.clone(),
+                name: diagnostic_package_name(&package.path),
+                path: package.path.clone(),
+                package_id: package.package_id,
+                imported_package_ids,
+                identity_status,
+                current_path_match_package_id: current_path_match.map(|target| target.package_id),
+                current_id_match_path: current_id_match.map(|target| target.path.clone()),
+            });
+        }
+    }
+    packages.sort_by(|left, right| {
+        normalized_package_identity_path(&left.path)
+            .cmp(&normalized_package_identity_path(&right.path))
+            .then(left.package_id.cmp(&right.package_id))
+            .then(
+                left.container
+                    .to_ascii_lowercase()
+                    .cmp(&right.container.to_ascii_lowercase()),
+            )
+    });
+
+    let exact_replacement_count = packages
+        .iter()
+        .filter(|package| {
+            package.identity_status == MixedReplacementIdentityStatus::ExactReplacement
+        })
+        .count();
+    let additive_package_count = packages
+        .iter()
+        .filter(|package| package.identity_status == MixedReplacementIdentityStatus::Additive)
+        .count();
+    let path_conflict_count = packages
+        .iter()
+        .filter(|package| {
+            matches!(
+                package.identity_status,
+                MixedReplacementIdentityStatus::PathConflict
+                    | MixedReplacementIdentityStatus::PathAndPackageIdConflict
+            )
+        })
+        .count();
+    let package_id_conflict_count = packages
+        .iter()
+        .filter(|package| {
+            matches!(
+                package.identity_status,
+                MixedReplacementIdentityStatus::PackageIdConflict
+                    | MixedReplacementIdentityStatus::PathAndPackageIdConflict
+            )
+        })
+        .count();
+    let conflict_package_count = packages
+        .iter()
+        .filter(|package| {
+            !matches!(
+                package.identity_status,
+                MixedReplacementIdentityStatus::ExactReplacement
+                    | MixedReplacementIdentityStatus::Additive
+            )
+        })
+        .count();
+    let mut blockers = Vec::new();
+    if additive_package_count > 0 {
+        blockers.push(format!(
+            "additive-source-packages-require-a-separate-contract:found-{additive_package_count}"
+        ));
+    }
+    if conflict_package_count > 0 {
+        blockers.push(format!(
+            "source-package-identity-conflicts-with-current-game:found-{conflict_package_count}"
+        ));
+    }
+    if dependencies.unresolved_edge_count > 0 {
+        blockers.push(format!(
+            "unresolved-source-package-dependencies:found-{}",
+            dependencies.unresolved_edge_count
+        ));
+    }
+    let container_rows = containers
+        .iter()
+        .map(|container| MixedReplacementContainerDiagnostic {
+            name: container.name.clone(),
+            relative_utoc: container.relative_utoc.clone(),
+            package_count: container.package_store.len(),
+        })
+        .collect::<Vec<_>>();
+    Ok(MixedReplacementPackageDiagnosticReport {
+        api: MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API.to_owned(),
+        status: if blockers.is_empty() {
+            "complete-report-only"
+        } else {
+            "blocked"
+        }
+        .to_owned(),
+        mutation_policy: "report-only".to_owned(),
+        automatic_update_enabled: false,
+        container_count: container_rows.len(),
+        source_package_count: packages.len(),
+        current_game_package_count: current.len(),
+        exact_replacement_count,
+        additive_package_count,
+        conflict_package_count,
+        path_conflict_count,
+        package_id_conflict_count,
+        containers: container_rows,
+        packages,
+        dependencies,
+        blockers,
+        warnings: vec![
+            "Current identity and external dependency evidence comes from the connected game's stock main package store; installed-mod and other-container precedence is not claimed."
+                .to_owned(),
+            "Package identity and dependency closure do not prove export-class conversion, shader compatibility, gameplay behavior, or runtime compatibility."
+                .to_owned(),
+            "This diagnostic cannot enable an updater adapter or mutate source, game, or output files."
+                .to_owned(),
+        ],
+    })
+}
+
+/// Stages an Unreal-container-only input and compares its complete package-store
+/// inventory with the current game. This diagnostic is read-only and can never
+/// authorize or perform an update.
+pub fn diagnose_mixed_replacement_input(
+    mod_input: &Path,
+    candidate_root: Option<&str>,
+    current_game_root: &Path,
+) -> Result<MixedReplacementPackageDiagnosticReport> {
+    let candidate_root = safe_diagnostic_candidate_root(candidate_root)?;
+    let work = tempfile::Builder::new()
+        .prefix("obr-mixed-replacement-diagnostic-")
+        .tempdir()?;
+    let staged = work.path().join("input");
+    stage_input(mod_input, &staged)
+        .map_err(|_| anyhow::anyhow!("mixed replacement input could not be staged safely"))?;
+    let retoc = RetocTool::materialize()?;
+    let containers = discover_diagnostic_containers(&staged.join(candidate_root), &retoc)?;
+    let game_root = normalize_install_root(current_game_root);
+    let stock_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    if !stock_utoc.is_file() {
+        bail!("current game stock package store is unavailable");
+    }
+    let (_, current) = retoc
+        .package_store_entries(&stock_utoc)
+        .map_err(|_| anyhow::anyhow!("current game package store could not be read"))?;
+    build_mixed_replacement_diagnostic_report(containers, current)
 }
 
 pub(crate) fn canonical_package_path(raw: &str) -> Result<String> {
@@ -96,10 +556,7 @@ pub(crate) fn canonical_additive_static_mesh_path(raw: &str) -> Result<String> {
         .filter(|part| !part.is_empty() && *part != ".")
         .skip_while(|part| *part == "..")
         .collect::<Vec<_>>();
-    if parts.len() < 3
-        || !parts[1].eq_ignore_ascii_case("Content")
-        || parts.iter().any(|part| *part == "..")
-    {
+    if parts.len() < 3 || !parts[1].eq_ignore_ascii_case("Content") || parts.contains(&"..") {
         bail!("StaticMesh candidate must use a <Project>/Content path without traversal: {raw}");
     }
     let path = parts.join("/");
@@ -110,9 +567,16 @@ pub(crate) fn canonical_additive_static_mesh_path(raw: &str) -> Result<String> {
     Ok(path)
 }
 
-pub(crate) fn static_mesh_package_filter(package: &PackageEntry) -> Result<String> {
-    let canonical = canonical_additive_static_mesh_path(&package.path)?;
-    Ok(canonical)
+pub(crate) fn source_static_mesh_package_filter(source_package: &PackageEntry) -> Result<String> {
+    // Retoc filters are case-sensitive, so source-container extraction must use
+    // the exact spelling recorded by the source package store. Package identity
+    // is validated separately before extraction; a current-game spelling must
+    // never be substituted here.
+    canonical_additive_static_mesh_path(&source_package.path)
+}
+
+pub(crate) fn source_package_store_filter(source_package: &PackageEntry) -> Result<String> {
+    canonical_additive_static_mesh_path(&source_package.path)
 }
 fn package_key(path: &str) -> Result<String> {
     Ok(canonical_package_path(path)?.to_ascii_lowercase())
@@ -211,7 +675,8 @@ fn discover_containers(
         let (_, mut package_store) = retoc.package_store_entries(&utoc)?;
         for package in &mut package_store {
             package.path = match scope {
-                ReplacementScope::AdditiveStaticMesh => {
+                ReplacementScope::AdditiveStaticMesh
+                | ReplacementScope::HeterogeneousReplacement => {
                     canonical_additive_static_mesh_path(&package.path)?
                 }
                 _ => canonical_package_path(&package.path)?,
@@ -239,6 +704,7 @@ fn discover_containers(
                     );
                 }
                 ReplacementScope::AdditiveStaticMesh => {}
+                ReplacementScope::HeterogeneousReplacement => {}
                 _ => {}
             }
         }
@@ -306,7 +772,6 @@ fn inspect_staged_for_scope(
     let target_packages = target_entries
         .iter()
         .cloned()
-        .into_iter()
         .filter_map(|entry| package_key(&entry.path).ok().map(|key| (key, entry)))
         .collect::<HashMap<_, _>>();
     let target_by_id = target_entries
@@ -729,6 +1194,146 @@ pub fn inspect_additive_static_mesh_staged(
         target_package_imports,
     })
 }
+
+fn matching_import_set(imports: &[u64]) -> BTreeSet<u64> {
+    imports.iter().copied().collect()
+}
+
+fn validate_heterogeneous_package_identity(
+    source: &PackageStoreEntry,
+    target_by_path: &PackageStoreEntry,
+    target_by_id: &PackageStoreEntry,
+) -> Result<()> {
+    if target_by_path.package_id != source.package_id
+        || target_by_id.package_id != source.package_id
+        || !target_by_id.path.eq_ignore_ascii_case(&target_by_path.path)
+    {
+        bail!(
+            "heterogeneous package identity is ambiguous for {}: source ID {}, path match ID {}, ID match path {}",
+            source.path,
+            source.package_id,
+            target_by_path.package_id,
+            target_by_id.path
+        );
+    }
+    if matching_import_set(&source.imported_package_ids)
+        != matching_import_set(&target_by_path.imported_package_ids)
+    {
+        bail!(
+            "source/current package import sets differ for heterogeneous replacement {}",
+            source.path
+        );
+    }
+    Ok(())
+}
+
+pub fn inspect_heterogeneous_replacement_staged(
+    root: &Path,
+    game_root: &Path,
+    retoc: &RetocTool,
+) -> Result<ReplacementInspection> {
+    let containers = discover_containers(root, retoc, ReplacementScope::HeterogeneousReplacement)?;
+    let mut packages = containers
+        .iter()
+        .flat_map(|container| container.packages.iter().cloned())
+        .collect::<Vec<_>>();
+    if packages.is_empty() || packages.len() > MAX_REPLACEMENT_PACKAGES {
+        bail!(
+            "heterogeneous replacement input must contain 1..={MAX_REPLACEMENT_PACKAGES} packages"
+        );
+    }
+    packages.sort_by(|left, right| {
+        left.path
+            .to_ascii_lowercase()
+            .cmp(&right.path.to_ascii_lowercase())
+            .then(left.package_id.cmp(&right.package_id))
+    });
+    for pair in packages.windows(2) {
+        if pair[0].path.eq_ignore_ascii_case(&pair[1].path)
+            || pair[0].package_id == pair[1].package_id
+        {
+            bail!("heterogeneous replacement packages must have unique paths and package IDs");
+        }
+    }
+
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    if !target_utoc.is_file() {
+        bail!("current game stock package store is unavailable");
+    }
+    let (_, target_entries) = retoc.package_store_entries(&target_utoc)?;
+    let source_store = containers
+        .iter()
+        .flat_map(|container| container.package_store.iter().cloned())
+        .collect::<Vec<_>>();
+    let dependencies = diagnose_package_dependencies(&source_store, &target_entries)?;
+    if dependencies.unresolved_edge_count != 0 {
+        bail!(
+            "heterogeneous replacement has {} unresolved package dependency edge(s)",
+            dependencies.unresolved_edge_count
+        );
+    }
+
+    let target_by_id = target_entries
+        .iter()
+        .map(|entry| (entry.package_id, entry))
+        .collect::<HashMap<_, _>>();
+    let target_by_path = target_entries
+        .iter()
+        .filter_map(|entry| {
+            canonical_additive_static_mesh_path(&entry.path)
+                .ok()
+                .map(|path| (path.to_ascii_lowercase(), entry))
+        })
+        .collect::<HashMap<_, _>>();
+    let source_by_id = source_store
+        .iter()
+        .map(|entry| (entry.package_id, entry))
+        .collect::<HashMap<_, _>>();
+    let mut target_package_imports = HashMap::new();
+    for package in &packages {
+        let canonical = canonical_additive_static_mesh_path(&package.path)?;
+        let by_path = target_by_path
+            .get(&canonical.to_ascii_lowercase())
+            .with_context(|| {
+                format!(
+                    "heterogeneous package is not an existing-game replacement: {}",
+                    package.path
+                )
+            })?;
+        let by_id = target_by_id.get(&package.package_id).with_context(|| {
+            format!(
+                "current game package ID is missing for heterogeneous replacement {}",
+                package.path
+            )
+        })?;
+        let source = source_by_id
+            .get(&package.package_id)
+            .context("heterogeneous source package store lost an inspected package")?;
+        validate_heterogeneous_package_identity(source, by_path, by_id)?;
+        target_package_imports.insert(package.package_id, by_path.imported_package_ids.clone());
+    }
+
+    let target_dependencies = target_entries
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.package_id,
+                PackageEntry {
+                    package_id: entry.package_id,
+                    path: entry.path,
+                },
+            )
+        })
+        .collect();
+    Ok(ReplacementInspection {
+        containers,
+        packages,
+        target_utoc,
+        target_dependencies,
+        target_package_imports,
+    })
+}
 pub fn probe_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
     let work = tempfile::Builder::new()
         .prefix("obr-armor-replacement-probe-")
@@ -813,15 +1418,17 @@ fn find_extracted_asset(root: &Path, package_path: &str) -> Result<PathBuf> {
     Ok(matches[0].clone())
 }
 
-fn extract_texture_package(
+fn extract_current_texture_package(
     retoc: &RetocTool,
     input: &Path,
     output: &Path,
-    package: &PackageEntry,
+    target_package: &PackageEntry,
     label: &str,
 ) -> Result<PathBuf> {
     fs::create_dir_all(output)?;
-    let filter = canonical_package_path(&package.path)?
+    // The target package comes directly from the current package store. Keep
+    // that store's exact spelling for the case-sensitive Retoc filter.
+    let filter = canonical_package_path(&target_package.path)?
         .trim_end_matches(".uasset")
         .to_owned();
     let result = retoc.run([
@@ -840,7 +1447,63 @@ fn extract_texture_package(
     if failed != 0 || extracted != 1 {
         bail!("{label} expected one Texture2D asset; extracted {extracted}, failed {failed}");
     }
-    find_extracted_asset(output, &package.path)
+    find_extracted_asset(output, &target_package.path)
+}
+
+pub(crate) fn validate_texture_replacement_pair(
+    mut source: TextureAssetDiagnostic,
+    current: &TextureAssetDiagnostic,
+    package_path: &str,
+) -> Result<TextureAssetDiagnostic> {
+    if !source.class_name.eq_ignore_ascii_case("Texture2D")
+        || !current.class_name.eq_ignore_ascii_case("Texture2D")
+    {
+        bail!("Texture2D class proof failed for {package_path}");
+    }
+    if !source
+        .object_name
+        .eq_ignore_ascii_case(&current.object_name)
+    {
+        bail!(
+            "Texture2D object identity changed for {package_path}: source {}, current {}",
+            source.object_name,
+            current.object_name
+        );
+    }
+    if !source
+        .pixel_format
+        .eq_ignore_ascii_case(&current.pixel_format)
+    {
+        source.warnings.push(format!(
+            "Pixel format differs from the current target (source {}, current {}); the structurally valid authored source format and payload are preserved without transcoding, and runtime testing is required",
+            source.pixel_format,
+            current.pixel_format
+        ));
+    }
+    if source.use_separate_bulk_data_files != current.use_separate_bulk_data_files {
+        source.warnings.push(format!(
+            "Bulk streaming layout differs from the current target (source separate={}, current separate={}); source sidecars are preserved and runtime testing is required",
+            source.use_separate_bulk_data_files, current.use_separate_bulk_data_files
+        ));
+    }
+    Ok(source)
+}
+
+pub(crate) fn classify_heterogeneous_asset(asset: &Path) -> Result<ProvenHeterogeneousAsset> {
+    let texture = inspect_texture_asset(asset);
+    let static_mesh = inspect_static_mesh_asset(asset);
+    match (texture, static_mesh) {
+        (Ok(texture), Err(_)) => Ok(ProvenHeterogeneousAsset::Texture2D(texture)),
+        (Err(_), Ok(imports)) => Ok(ProvenHeterogeneousAsset::StaticMesh { imports }),
+        (Ok(_), Ok(_)) => bail!(
+            "asset matched both Texture2D and StaticMesh structural contracts: {}",
+            asset.display()
+        ),
+        (Err(texture_error), Err(static_mesh_error)) => bail!(
+            "asset matched neither supported structural contract: {}; Texture2D: {texture_error:#}; StaticMesh: {static_mesh_error:#}",
+            asset.display()
+        ),
+    }
 }
 
 fn find_extracted_additive_static_mesh(root: &Path, package_path: &str) -> Result<PathBuf> {
@@ -896,16 +1559,16 @@ fn create_additive_probe_view(game_root: &Path) -> Result<tempfile::TempDir> {
     }
     Ok(view)
 }
-pub(crate) fn extract_static_mesh_packages(
+pub(crate) fn extract_source_static_mesh_packages(
     retoc: &RetocTool,
     input: &Path,
     output: &Path,
-    packages: &[PackageEntry],
+    source_packages: &[PackageEntry],
     label: &str,
 ) -> Result<()> {
     fs::create_dir_all(output)?;
-    for package in packages {
-        let filter = static_mesh_package_filter(package)?;
+    for source_package in source_packages {
+        let filter = source_static_mesh_package_filter(source_package)?;
         let result = retoc.run([
             OsString::from("to-legacy"),
             input.as_os_str().to_owned(),
@@ -918,7 +1581,7 @@ pub(crate) fn extract_static_mesh_packages(
             OsString::from("--filter"),
             OsString::from(filter),
         ])?;
-        let package_label = format!("{label} {}", package.path);
+        let package_label = format!("{label} {}", source_package.path);
         let (extracted, failed) = RetocTool::extraction_summary(&result, &package_label)?;
         if failed != 0 || extracted == 0 {
             bail!(
@@ -927,6 +1590,72 @@ pub(crate) fn extract_static_mesh_packages(
         }
     }
     Ok(())
+}
+
+pub(crate) fn extract_source_packages_exact(
+    retoc: &RetocTool,
+    input: &Path,
+    output: &Path,
+    source_packages: &[PackageEntry],
+    label: &str,
+) -> Result<()> {
+    fs::create_dir_all(output)?;
+    for source_package in source_packages {
+        let before = extracted_uasset_paths(output)?;
+        let filter = source_package_store_filter(source_package)?;
+        let package_label = format!("{label} {}", source_package.path);
+        let result = retoc.run([
+            OsString::from("to-legacy"),
+            input.as_os_str().to_owned(),
+            output.as_os_str().to_owned(),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            OsString::from("--no-shaders"),
+            OsString::from("--no-script-objects"),
+            OsString::from("--no-parallel"),
+            OsString::from("--filter"),
+            OsString::from(filter),
+        ])?;
+        let (extracted, failed) = RetocTool::extraction_summary(&result, &package_label)?;
+        if failed != 0 || extracted == 0 {
+            bail!(
+                "{package_label} extracted no exact package payload; extracted {extracted}, failed {failed}"
+            );
+        }
+        let after = extracted_uasset_paths(output)?;
+        let added = after.difference(&before).cloned().collect::<Vec<_>>();
+        let expected =
+            canonical_additive_static_mesh_path(&source_package.path)?.to_ascii_lowercase();
+        if added != [expected.clone()] {
+            bail!(
+                "{package_label} changed an unexpected UAsset set; expected only {expected}, found {}",
+                added.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn extracted_uasset_paths(root: &Path) -> Result<BTreeSet<String>> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("uasset"))
+        })
+        .map(|entry| {
+            let relative = entry.path().strip_prefix(root)?;
+            Ok(
+                canonical_additive_static_mesh_path(&relative.to_string_lossy())?
+                    .to_ascii_lowercase(),
+            )
+        })
+        .collect()
 }
 pub fn probe_additive_static_mesh_input(
     mod_input: &Path,
@@ -947,7 +1676,7 @@ pub fn probe_additive_static_mesh_input(
         for source in [&container.utoc, &container.ucas, &container.pak] {
             copy_probe_file(source, &view.path().join(source.file_name().unwrap()))?;
         }
-        extract_static_mesh_packages(
+        extract_source_static_mesh_packages(
             &retoc,
             view.path(),
             &legacy,
@@ -1019,6 +1748,135 @@ pub fn probe_additive_static_mesh_input(
         texture_assets: Vec::new(),
     })
 }
+
+pub fn probe_heterogeneous_replacement_input(
+    mod_input: &Path,
+    game_root: &Path,
+) -> Result<HeterogeneousReplacementProbeSummary> {
+    let work = tempfile::Builder::new()
+        .prefix("obr-heterogeneous-replacement-probe-")
+        .tempdir()?;
+    let staged = work.path().join("source");
+    stage_input(mod_input, &staged)?;
+    let retoc = RetocTool::materialize()?;
+    let inspection = inspect_heterogeneous_replacement_staged(&staged, game_root, &retoc)?;
+    let current_packages_by_id = inspection.target_dependencies.clone();
+    let mut rows = Vec::with_capacity(inspection.packages.len());
+    let mut static_mesh_count = 0_usize;
+    let mut texture_count = 0_usize;
+
+    for container in &inspection.containers {
+        let root = work.path().join("containers").join(&container.name);
+        let legacy = root.join("legacy");
+        let source_view = create_additive_probe_view(game_root)?;
+        let current_view = create_additive_probe_view(game_root)?;
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            copy_probe_file(
+                source,
+                &source_view.path().join(source.file_name().unwrap()),
+            )?;
+        }
+        extract_source_packages_exact(
+            &retoc,
+            source_view.path(),
+            &legacy,
+            &container.packages,
+            "heterogeneous source extraction",
+        )?;
+
+        for package in &container.packages {
+            let asset = find_extracted_additive_static_mesh(&legacy, &package.path)?;
+            let (asset_kind, warnings) = match classify_heterogeneous_asset(&asset)? {
+                ProvenHeterogeneousAsset::StaticMesh { imports } => {
+                    if imports
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+                    {
+                        repair_static_mesh_imports(
+                            &asset,
+                            &inspection.target_dependencies,
+                            &root
+                                .join("import-repairs")
+                                .join(package.package_id.to_string()),
+                        )?;
+                        let repaired = inspect_static_mesh_asset(&asset)?;
+                        if repaired
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+                        {
+                            bail!("{} retained unresolved imports after repair", package.path);
+                        }
+                    }
+                    static_mesh_count += 1;
+                    (HeterogeneousReplacementAssetKind::StaticMesh, Vec::new())
+                }
+                ProvenHeterogeneousAsset::Texture2D(mut source) => {
+                    source.asset = canonical_additive_static_mesh_path(&package.path)?;
+                    let current_package = current_packages_by_id
+                        .get(&package.package_id)
+                        .context("heterogeneous current package inventory lost an identity")?;
+                    let current_root = root.join("current").join(package.package_id.to_string());
+                    let current_asset = extract_current_texture_package(
+                        &retoc,
+                        current_view.path(),
+                        &current_root,
+                        current_package,
+                        "heterogeneous current Texture2D extraction",
+                    )?;
+                    let current = inspect_texture_asset(&current_asset)?;
+                    let validated =
+                        validate_texture_replacement_pair(source, &current, &package.path)?;
+                    texture_count += 1;
+                    (
+                        HeterogeneousReplacementAssetKind::Texture2D,
+                        validated.warnings,
+                    )
+                }
+            };
+            let source_store = container
+                .package_store
+                .iter()
+                .find(|entry| entry.package_id == package.package_id)
+                .context("heterogeneous source package store lost a classified package")?;
+            let current_path = current_packages_by_id
+                .get(&package.package_id)
+                .context("heterogeneous current package inventory lost a classified package")?
+                .path
+                .clone();
+            let mut imported_package_ids = source_store.imported_package_ids.clone();
+            imported_package_ids.sort_unstable();
+            rows.push(HeterogeneousReplacementPackageProbe {
+                package_id: package.package_id,
+                source_path: package.path.clone(),
+                current_path,
+                asset_kind,
+                imported_package_ids,
+                warnings,
+            });
+        }
+        repair_legacy_body_setups(&legacy)?;
+    }
+    if static_mesh_count == 0 || texture_count == 0 {
+        bail!(
+            "heterogeneous replacement adapter requires at least one structurally proven StaticMesh and one Texture2D package"
+        );
+    }
+    rows.sort_by(|left, right| {
+        left.source_path
+            .to_ascii_lowercase()
+            .cmp(&right.source_path.to_ascii_lowercase())
+            .then(left.package_id.cmp(&right.package_id))
+    });
+    Ok(HeterogeneousReplacementProbeSummary {
+        adapter: HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned(),
+        container_count: inspection.containers.len(),
+        package_count: rows.len(),
+        static_mesh_count,
+        texture_count,
+        packages: rows,
+    })
+}
+
 pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
     let work = tempfile::Builder::new()
         .prefix("obr-texture-replacement-probe-")
@@ -1027,6 +1885,11 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
     stage_input(mod_input, &staged)?;
     let retoc = RetocTool::materialize()?;
     let inspection = inspect_texture_staged(&staged, game_root, &retoc)?;
+    let (_, current_packages) = retoc.package_entries(&inspection.target_utoc)?;
+    let current_packages_by_id = current_packages
+        .into_iter()
+        .map(|package| (package.package_id, package))
+        .collect::<HashMap<_, _>>();
     let game_paks = game_root.join(r"OblivionRemastered\Content\Paks");
     let global_utoc = game_paks.join("global.utoc");
     let global_ucas = game_paks.join("global.ucas");
@@ -1078,11 +1941,19 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
                 .path()
                 .join("current")
                 .join(package.package_id.to_string());
-            let current_asset = extract_texture_package(
+            let current_package = current_packages_by_id
+                .get(&package.package_id)
+                .with_context(|| {
+                    format!(
+                        "current Texture2D package inventory is missing {}",
+                        package.path
+                    )
+                })?;
+            let current_asset = extract_current_texture_package(
                 &retoc,
                 &game_paks,
                 &current_root,
-                package,
+                current_package,
                 "current Texture2D extraction",
             )?;
             let current = inspect_texture_asset(&current_asset).map_err(|_| {
@@ -1140,6 +2011,303 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn store(package_id: u64, path: &str, imported_package_ids: &[u64]) -> PackageStoreEntry {
+        PackageStoreEntry {
+            package_id,
+            path: path.to_owned(),
+            imported_package_ids: imported_package_ids.to_vec(),
+        }
+    }
+
+    fn diagnostic_container(
+        name: &str,
+        relative_utoc: &str,
+        package_store: Vec<PackageStoreEntry>,
+    ) -> DiagnosticContainer {
+        DiagnosticContainer {
+            name: name.to_owned(),
+            relative_utoc: relative_utoc.to_owned(),
+            package_store,
+        }
+    }
+
+    fn texture_diagnostic(
+        object_name: &str,
+        pixel_format: &str,
+        separate_bulk: bool,
+    ) -> TextureAssetDiagnostic {
+        TextureAssetDiagnostic {
+            asset: "Fixture.uasset".to_owned(),
+            object_name: object_name.to_owned(),
+            class_name: "Texture2D".to_owned(),
+            pixel_format: pixel_format.to_owned(),
+            use_separate_bulk_data_files: separate_bulk,
+            data_resource_count: 1,
+            declared_raw_resource_bytes: 16,
+            export_serial_bytes: 16,
+            uasset_bytes: 16,
+            uexp_bytes: Some(16),
+            ubulk_bytes: None,
+            packed_texture_kind: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mixed_replacement_diagnostic_reports_exact_identity_and_resolved_dependencies() {
+        let source_a = store(
+            10,
+            "../../../OblivionRemastered/Content/Weapons/A.uasset",
+            &[20],
+        );
+        let source_b = store(
+            20,
+            "../../../OblivionRemastered/Content/Materials/B.uasset",
+            &[30],
+        );
+        let current = vec![
+            source_a.clone(),
+            source_b.clone(),
+            store(
+                30,
+                "../../../OblivionRemastered/Content/Materials/C.uasset",
+                &[],
+            ),
+        ];
+        let report = build_mixed_replacement_diagnostic_report(
+            vec![diagnostic_container(
+                "Fixture_P",
+                "Content/Paks/~mods/Fixture_P.utoc",
+                vec![source_b, source_a],
+            )],
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(report.api, MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API);
+        assert_eq!(report.status, "complete-report-only");
+        assert_eq!(report.mutation_policy, "report-only");
+        assert!(!report.automatic_update_enabled);
+        assert_eq!(report.container_count, 1);
+        assert_eq!(report.source_package_count, 2);
+        assert_eq!(report.exact_replacement_count, 2);
+        assert_eq!(report.additive_package_count, 0);
+        assert_eq!(report.conflict_package_count, 0);
+        assert_eq!(report.dependencies.resolved_edge_count, 2);
+        assert_eq!(report.dependencies.bundled_edge_count, 1);
+        assert_eq!(report.dependencies.current_game_edge_count, 1);
+        assert_eq!(report.dependencies.unresolved_edge_count, 0);
+        assert!(report.blockers.is_empty());
+        assert!(report.packages.iter().all(|package| {
+            package.identity_status == MixedReplacementIdentityStatus::ExactReplacement
+                && package.container == "Content/Paks/~mods/Fixture_P.utoc"
+                && !package.name.is_empty()
+        }));
+    }
+
+    #[test]
+    fn mixed_replacement_diagnostic_retains_additive_conflict_and_unresolved_rows() {
+        let source = vec![
+            store(
+                10,
+                "../../../OblivionRemastered/Content/Custom/Additive.uasset",
+                &[999],
+            ),
+            store(
+                20,
+                "../../../OblivionRemastered/Content/Stock/PathConflict.uasset",
+                &[],
+            ),
+            store(
+                30,
+                "../../../OblivionRemastered/Content/Custom/IdConflict.uasset",
+                &[],
+            ),
+            store(
+                40,
+                "../../../OblivionRemastered/Content/Stock/BothConflict.uasset",
+                &[],
+            ),
+        ];
+        let current = vec![
+            store(
+                21,
+                "../../../OblivionRemastered/Content/Stock/PathConflict.uasset",
+                &[],
+            ),
+            store(
+                30,
+                "../../../OblivionRemastered/Content/Stock/IdConflict.uasset",
+                &[],
+            ),
+            store(
+                40,
+                "../../../OblivionRemastered/Content/Stock/OtherById.uasset",
+                &[],
+            ),
+            store(
+                41,
+                "../../../OblivionRemastered/Content/Stock/BothConflict.uasset",
+                &[],
+            ),
+        ];
+        let report = build_mixed_replacement_diagnostic_report(
+            vec![diagnostic_container(
+                "Mixed_P",
+                "Content/Paks/~mods/Mixed_P.utoc",
+                source,
+            )],
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(report.status, "blocked");
+        assert_eq!(report.exact_replacement_count, 0);
+        assert_eq!(report.additive_package_count, 1);
+        assert_eq!(report.conflict_package_count, 3);
+        assert_eq!(report.path_conflict_count, 2);
+        assert_eq!(report.package_id_conflict_count, 2);
+        assert_eq!(report.dependencies.unresolved_edge_count, 1);
+        assert_eq!(
+            report.dependencies.unresolved_edges[0].missing_dependency_package_id,
+            999
+        );
+        assert_eq!(report.blockers.len(), 3);
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 10
+                && package.identity_status == MixedReplacementIdentityStatus::Additive
+        }));
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 20
+                && package.identity_status == MixedReplacementIdentityStatus::PathConflict
+                && package.current_path_match_package_id == Some(21)
+        }));
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 30
+                && package.identity_status == MixedReplacementIdentityStatus::PackageIdConflict
+                && package.current_id_match_path.as_deref()
+                    == Some("../../../OblivionRemastered/Content/Stock/IdConflict.uasset")
+        }));
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 40
+                && package.identity_status
+                    == MixedReplacementIdentityStatus::PathAndPackageIdConflict
+        }));
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["dependencies"]["unresolvedEdges"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn static_mesh_source_and_current_filters_preserve_their_own_path_casing() {
+        let source = PackageEntry {
+            package_id: 10_014_019_090_142_912_733,
+            path: "../../../OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/Elven/T_shield.uasset"
+                .to_owned(),
+        };
+        let current = PackageEntry {
+            package_id: 10_014_019_090_142_912_733,
+            path: "../../../OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/elven/T_shield.uasset"
+                .to_owned(),
+        };
+        assert_eq!(
+            source_static_mesh_package_filter(&source).unwrap(),
+            "OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/Elven/T_shield.uasset"
+        );
+        assert_eq!(
+            source_static_mesh_package_filter(&current).unwrap(),
+            "OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/elven/T_shield.uasset"
+        );
+
+        let aliased_source = PackageEntry {
+            package_id: current.package_id,
+            path: "../../../OblivionRemastered/Content/Custom/Aliased/T_shield.uasset".to_owned(),
+        };
+        assert_eq!(
+            source_static_mesh_package_filter(&aliased_source).unwrap(),
+            "OblivionRemastered/Content/Custom/Aliased/T_shield.uasset"
+        );
+
+        let additive = PackageEntry {
+            package_id: 42,
+            path: "../../../OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/Elven/T_custom.uasset"
+                .to_owned(),
+        };
+        assert_eq!(
+            source_static_mesh_package_filter(&additive).unwrap(),
+            "OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/Elven/T_custom.uasset"
+        );
+    }
+
+    #[test]
+    fn heterogeneous_identity_accepts_case_only_path_differences_and_matching_import_sets() {
+        let source = store(
+            42,
+            "../../../OblivionRemastered/Content/Art/Meshes/Armor/Elven/SM_Shield.uasset",
+            &[9, 7, 9],
+        );
+        let current = store(
+            42,
+            "../../../OblivionRemastered/Content/Art/Meshes/Armor/elven/SM_Shield.uasset",
+            &[7, 9],
+        );
+
+        validate_heterogeneous_package_identity(&source, &current, &current).unwrap();
+        assert_eq!(
+            HETEROGENEOUS_REPLACEMENT_ADAPTER,
+            "native-heterogeneous-static-mesh-texture-v1"
+        );
+    }
+
+    #[test]
+    fn heterogeneous_identity_rejects_ambiguous_ids_and_changed_import_sets() {
+        let source = store(42, "OblivionRemastered/Content/Test/Asset.uasset", &[7]);
+        let wrong_path_identity = store(43, "OblivionRemastered/Content/Test/Asset.uasset", &[7]);
+        let by_id = store(42, "OblivionRemastered/Content/Test/Other.uasset", &[7]);
+        assert!(
+            validate_heterogeneous_package_identity(&source, &wrong_path_identity, &by_id)
+                .unwrap_err()
+                .to_string()
+                .contains("identity is ambiguous")
+        );
+
+        let changed_imports = store(42, &source.path, &[8]);
+        assert!(
+            validate_heterogeneous_package_identity(&source, &changed_imports, &changed_imports)
+                .unwrap_err()
+                .to_string()
+                .contains("import sets differ")
+        );
+    }
+
+    #[test]
+    fn heterogeneous_texture_pair_checks_identity_format_and_bulk_layout() {
+        let source = texture_diagnostic("T_Shield", "PF_BC7", true);
+        let current = texture_diagnostic("t_shield", "pf_bc7", false);
+        let validated =
+            validate_texture_replacement_pair(source, &current, "T_Shield.uasset").unwrap();
+        assert_eq!(validated.warnings.len(), 1);
+
+        let wrong_format = texture_diagnostic("T_Shield", "PF_DXT1", true);
+        let validated = validate_texture_replacement_pair(
+            texture_diagnostic("T_Shield", "PF_BC7", true),
+            &wrong_format,
+            "T_Shield.uasset",
+        )
+        .unwrap();
+        assert!(
+            validated
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Pixel format differs"))
+        );
+    }
 
     #[test]
     fn accepts_safe_content_paths_without_naming_rules() {

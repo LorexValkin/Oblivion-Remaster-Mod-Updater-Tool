@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0 - 2026-08-14
+
+- Upgrade preflight reports to schema v8 with bounded per-package diagnostics for heterogeneous replacement containers, including exact replacements, additions, path/ID conflicts, and complete dependency-edge results.
+- Add `native-heterogeneous-static-mesh-texture-v1` for containers composed entirely of structurally proven existing-game StaticMesh and Texture2D replacements. It requires exact current paths and IDs, matching import sets, complete dependency closure, exact source-case extraction, and verified inventory, class, imports, and payload preservation after rebuilding.
+- Add deterministic layered IoStore dependency resolution across the selected mod, connected dependencies, active installed mods, game/DLC containers, and stock main data. Ambiguity and unresolved dependencies continue to fail closed.
+- Add source-agnostic logical install plans and `logical-install-publication-v1` for choice-free canonical wrappers and conservative manual Data/Paks layouts. Publication preserves every physical source path and pass-through hash, reruns preflight, reopens the candidate ZIP, and verifies source immutability. FOMOD choices and conditional installers remain report-only.
+- Reject unsafe package-store paths and ambiguous dependency identities, prevent recursive logical replanning, and use exact current-game package-path casing for replacement extraction.
+- Stop safely when the selected input is the connected game's active `~mods` directory; conversions require the original archive or complete extracted mod root.
+- Recognize path-bound MagicLoader configuration sidecars and add bounded, report-only multi-master worldspace and mixed-IoStore dependency diagnostics without weakening conversion gates.
+- Add an **Install to game** action beside **Open output**. It appears only after a candidate is successfully published, immediately offers a Yes/No confirmation, refuses to install while the game is running, verifies copied files, and backs up replaced destinations beside the output.
+- Tested end to end with the Zireael 1.0 weapon replacement on Oblivion Remastered Steam build `19115871`: conversion completed, the candidate loaded through UNBSE, and the weapon was spawned for in-game validation.
+
 ## 0.5.5-beta - 2026-08-01
 
 - Fixed selective 7Z metadata extraction for solid archives whose streamed-file callback order differs from their directory-first metadata order.

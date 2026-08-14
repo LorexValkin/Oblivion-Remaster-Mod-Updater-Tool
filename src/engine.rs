@@ -12,15 +12,24 @@ use crate::fixes::{
     trace_package_dependencies, verify_dependency_preservation,
 };
 use crate::game::{save_settings, validate_game_install};
+use crate::install_plan::{
+    InstallPlan, build_logical_update_context, logical_install_adapter_id,
+    nested_logical_install_adapter, reconstruct_logical_update_candidate,
+    resolve_staged_install_view, supports_logical_install_publication, verify_install_trees_match,
+};
 use crate::plugin::{
     ADDITIVE_CONTRACT_API, PLUGIN_MANIFEST_API, PLUGIN_PRESERVATION_API, inspect_plugin_set,
     verify_plugin_set_preserved,
 };
+use crate::preflight::{PreflightRequest, analyze};
 use crate::replacement::{
-    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
-    TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
-    extract_static_mesh_packages, inspect_additive_static_mesh_staged, inspect_mixed_armor_staged,
-    inspect_staged, inspect_texture_staged, stage_input,
+    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, HETEROGENEOUS_REPLACEMENT_ADAPTER,
+    MIXED_ARMOR_REPLACEMENT_ADAPTER, ProvenHeterogeneousAsset, TEXTURE_REPLACEMENT_ADAPTER,
+    canonical_additive_static_mesh_path, canonical_package_path, classify_heterogeneous_asset,
+    extract_source_packages_exact, extract_source_static_mesh_packages,
+    inspect_additive_static_mesh_staged, inspect_heterogeneous_replacement_staged,
+    inspect_mixed_armor_staged, inspect_staged, inspect_texture_staged, stage_input,
+    validate_texture_replacement_pair,
 };
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
@@ -463,6 +472,7 @@ fn body_profile_candidates(
     Ok(candidates)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_skeletal_compatibility_profile(
     dependency_inputs: &[PathBuf],
     game_root: &Path,
@@ -742,12 +752,26 @@ pub fn run_update(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
 ) -> Result<UpdateOutcome> {
+    if let Some(nested_adapter) = nested_logical_install_adapter(&request.adapter) {
+        let nested_adapter = nested_adapter.to_owned();
+        return run_logical_install_update(request, &nested_adapter, callback);
+    }
+    run_direct_update(request, callback)
+}
+
+fn run_direct_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
     // The adapter comes from preflight. Refuse unknown names instead of guessing which conversion is close enough.
     match request.adapter.as_str() {
         "native-additive-syncmap-v1" => run_additive_update(request, callback),
         ARMOR_REPLACEMENT_ADAPTER => run_armor_replacement_update(request, callback),
         MIXED_ARMOR_REPLACEMENT_ADAPTER => run_mixed_armor_replacement_update(request, callback),
         TEXTURE_REPLACEMENT_ADAPTER => run_texture_replacement_update(request, callback),
+        HETEROGENEOUS_REPLACEMENT_ADAPTER => {
+            run_heterogeneous_replacement_update(request, callback)
+        }
         "native-additive-static-mesh-v1" | ADDITIVE_STATIC_MESH_ADAPTER => {
             run_additive_static_mesh_update(request, callback)
         }
@@ -755,10 +779,445 @@ pub fn run_update(
     }
 }
 
+fn nested_adapter_owns_logical_destinations(
+    plan: &InstallPlan,
+    nested_adapter: &str,
+) -> Result<BTreeSet<PathBuf>> {
+    if !matches!(
+        nested_adapter,
+        "native-additive-syncmap-v1"
+            | ARMOR_REPLACEMENT_ADAPTER
+            | MIXED_ARMOR_REPLACEMENT_ADAPTER
+            | TEXTURE_REPLACEMENT_ADAPTER
+            | ADDITIVE_STATIC_MESH_ADAPTER
+            | HETEROGENEOUS_REPLACEMENT_ADAPTER
+    ) {
+        bail!("logical publication received an unsupported nested adapter: {nested_adapter}");
+    }
+    let owned = plan
+        .mappings
+        .iter()
+        .filter(|mapping| {
+            let path = mapping
+                .logical_destination
+                .to_string_lossy()
+                .replace('\\', "/")
+                .to_ascii_lowercase();
+            let extension = mapping
+                .logical_destination
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            path.starts_with("content/paks/~mods/")
+                && matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "pak" | "ucas" | "utoc"
+                )
+        })
+        .map(|mapping| mapping.logical_destination.clone())
+        .collect::<BTreeSet<_>>();
+    if owned.is_empty() {
+        bail!("nested adapter has no mapped IoStore payload in the logical install plan");
+    }
+    Ok(owned)
+}
+
+fn nested_logical_candidate_root(
+    nested_adapter: &str,
+    logical_source_root: &Path,
+    outcome: &UpdateOutcome,
+) -> Result<PathBuf> {
+    let candidate = if nested_adapter == "native-additive-syncmap-v1" {
+        outcome.output_directory.join(
+            logical_source_root
+                .file_name()
+                .context("logical source root has no directory name")?,
+        )
+    } else {
+        outcome.output_directory.clone()
+    };
+    if !candidate.is_dir() {
+        bail!(
+            "nested adapter did not produce its expected logical candidate root: {}",
+            candidate.display()
+        );
+    }
+    Ok(candidate)
+}
+
+fn hash_selected_source(path: &Path) -> Result<String> {
+    if path.is_file() {
+        sha256_file(path)
+    } else {
+        sha256_directory(path)
+    }
+}
+
+fn rollback_new_publication(moves: &[(&Path, &Path)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (published, staged) in moves {
+        if published.exists()
+            && let Err(error) = fs::rename(published, staged)
+        {
+            errors.push(format!(
+                "moving {} back to temporary staging: {error}",
+                published.display()
+            ));
+        }
+    }
+    errors
+}
+
+fn run_logical_install_update(
+    mut request: UpdateRequest,
+    nested_adapter: &str,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let outer_adapter = logical_install_adapter_id(nested_adapter)?;
+    let game = validate_game_install(&request.game_root, "logical install publication");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    request.game_root = game.root;
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let output_parent = fs::canonicalize(&request.output_parent).with_context(|| {
+        format!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        )
+    })?;
+    if !output_parent.is_dir() {
+        bail!(
+            "output parent is not a directory: {}",
+            output_parent.display()
+        );
+    }
+    if mod_input.is_dir() && output_parent.starts_with(&mod_input) {
+        bail!("logical publication output cannot be inside the immutable source directory");
+    }
+    let original_source_sha256 = hash_selected_source(&mod_input)?;
+    let output_directory = output_parent.join(format!(
+        "{}-current-candidate-{}",
+        safe_leaf(&mod_input),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    let output_name = output_directory
+        .file_name()
+        .context("logical candidate has no directory name")?
+        .to_string_lossy();
+    let report_path =
+        output_parent.join(format!("{output_name}-logical-install-update-report.json"));
+    if output_directory.exists() || output_archive.exists() || report_path.exists() {
+        bail!(
+            "timestamped logical publication output already exists; wait one second and try again"
+        );
+    }
+
+    callback(1, 13, "Snapshotting the complete physical archive layout");
+    let work = tempfile::Builder::new()
+        .prefix(".obr-logical-publication-")
+        .tempdir_in(&output_parent)?;
+    let physical_root = work.path().join("physical-source");
+    stage_input(&mod_input, &physical_root)?;
+    let resolved = resolve_staged_install_view(&physical_root)?;
+    if !supports_logical_install_publication(&resolved.plan) {
+        bail!("logical publication supports only choice-free canonical or manual-structural plans");
+    }
+    let owned = nested_adapter_owns_logical_destinations(&resolved.plan, nested_adapter)?;
+    let context = build_logical_update_context(
+        &physical_root,
+        &resolved,
+        original_source_sha256.clone(),
+        nested_adapter,
+        &owned,
+    )?;
+
+    callback(
+        2,
+        13,
+        "Running the proven adapter against the immutable logical view",
+    );
+    let nested_output_parent = work.path().join("nested-output");
+    fs::create_dir_all(&nested_output_parent)?;
+    let nested_request = UpdateRequest {
+        adapter: nested_adapter.to_owned(),
+        mod_input: resolved.view.root().to_path_buf(),
+        game_root: request.game_root.clone(),
+        output_parent: nested_output_parent,
+        dependency_inputs: request.dependency_inputs.clone(),
+        installed_collision_exclusions: request.installed_collision_exclusions.clone(),
+        persist_settings: false,
+    };
+    let mut nested_progress = |step: usize, total: usize, message: &str| {
+        let total = total.max(1);
+        let nested_step = 2 + step.min(total).saturating_mul(5) / total;
+        callback(nested_step, 13, message)
+    };
+    let (nested_outcome, deferred_runtime_dependencies) =
+        if nested_adapter == "native-additive-syncmap-v1" {
+            run_additive_update_with_dependency_policy(nested_request, &mut nested_progress, false)?
+        } else {
+            (
+                run_direct_update(nested_request, &mut nested_progress)?,
+                Vec::new(),
+            )
+        };
+    if nested_outcome.adapter != nested_adapter {
+        bail!(
+            "nested adapter identity changed from {nested_adapter} to {}",
+            nested_outcome.adapter
+        );
+    }
+    let nested_report_sha256 = sha256_file(&nested_outcome.report_path)?;
+    let logical_candidate_root =
+        nested_logical_candidate_root(nested_adapter, resolved.view.root(), &nested_outcome)?;
+    let excluded_logical_paths = nested_outcome
+        .report_path
+        .strip_prefix(&logical_candidate_root)
+        .ok()
+        .map(Path::to_path_buf)
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    callback(
+        8,
+        13,
+        "Reconstructing the original physical layout from approved mappings",
+    );
+    let staged_candidate = work.path().join("physical-candidate");
+    let publication = reconstruct_logical_update_candidate(
+        &context,
+        &physical_root,
+        &logical_candidate_root,
+        &excluded_logical_paths,
+        &staged_candidate,
+    )?;
+
+    callback(
+        9,
+        13,
+        "Running fresh preflight against the reconstructed candidate",
+    );
+    let fresh_preflight = analyze(&PreflightRequest {
+        mod_input: staged_candidate.clone(),
+        game_root: Some(request.game_root.clone()),
+        output_parent: Some(output_parent.clone()),
+        connected_tools: request.dependency_inputs.clone(),
+    });
+    if !fresh_preflight.can_update
+        || fresh_preflight.selected_adapter.as_deref() != Some(outer_adapter.as_str())
+        || fresh_preflight.install_plan.as_ref() != Some(&context.install_plan)
+        || !fresh_preflight.disposition.blocker_ids.is_empty()
+    {
+        bail!(
+            "fresh preflight did not reproduce the approved logical publication plan: status={}, adapter={:?}, blockers={}",
+            fresh_preflight.status,
+            fresh_preflight.selected_adapter,
+            fresh_preflight.disposition.blocker_ids.join(", ")
+        );
+    }
+    if hash_selected_source(&mod_input)? != original_source_sha256 {
+        bail!("selected source changed before logical candidate publication");
+    }
+
+    callback(
+        10,
+        13,
+        "Creating and reopening the portable candidate before publication",
+    );
+    let staged_archive = work.path().join("verified-physical-candidate.zip");
+    create_zip_from_paths(
+        &staged_archive,
+        &staged_candidate,
+        std::slice::from_ref(&staged_candidate),
+    )?;
+    let archive_verification_root = work.path().join("archive-verification");
+    stage_input(&staged_archive, &archive_verification_root)?;
+    let archive_inventory_sha256 =
+        verify_install_trees_match(&staged_candidate, &archive_verification_root)?;
+    let archive_sha256 = sha256_file(&staged_archive)?;
+    if hash_selected_source(&mod_input)? != original_source_sha256 {
+        bail!("selected source changed during logical candidate publication");
+    }
+
+    let dependency_plan = if deferred_runtime_dependencies.is_empty() {
+        None
+    } else {
+        Some(check_or_install(
+            &request.game_root,
+            deferred_runtime_dependencies.clone(),
+            false,
+        )?)
+    };
+    let mut report = json!({
+        "schema": "obr-logical-install-update-report",
+        "version": 1,
+        "implementation": "native-rust",
+        "adapter": outer_adapter,
+        "nestedAdapter": nested_adapter,
+        "generatedAt": chrono::Utc::now().to_rfc3339(),
+        "status": if dependency_plan.is_some() {
+            "candidate-publication-runtime-dependencies-pending"
+        } else {
+            "candidate_ready_for_runtime_test"
+        },
+        "structurallyVerified": true,
+        "runtimeVerified": false,
+        "source": {
+            "inputType": if mod_input.is_file() { "archive" } else { "directory" },
+            "inputPath": mod_input,
+            "inputSha256": original_source_sha256,
+        },
+        "logicalUpdateContext": context,
+        "nestedAdapterResult": {
+            "reportSha256": nested_report_sha256,
+            "packageCount": nested_outcome.package_count,
+            "runtimeDependencyInstallationDeferred": dependency_plan.is_some(),
+        },
+        "freshPreflight": {
+            "schema": fresh_preflight.schema,
+            "version": fresh_preflight.version,
+            "status": fresh_preflight.status,
+            "selectedAdapter": fresh_preflight.selected_adapter,
+            "disposition": fresh_preflight.disposition,
+        },
+        "output": {
+            "directory": output_directory,
+            "archive": output_archive,
+            "archiveSha256": archive_sha256,
+            "archiveInventorySha256": archive_inventory_sha256,
+            "reportOutsideCandidateInventory": report_path,
+        },
+        "verification": publication,
+        "runtimeDependenciesAtPublication": dependency_plan,
+        "sourceImmutableBeforePublication": true,
+        "productionRuntimeGateRequired": true,
+    });
+    let staged_report = work.path().join("logical-install-update-report.json");
+    fs::write(&staged_report, serde_json::to_vec_pretty(&report)?)?;
+
+    if request.persist_settings {
+        save_settings(&request.game_root, &output_parent)?;
+        request.persist_settings = false;
+    }
+    callback(
+        11,
+        13,
+        "Publishing the verified directory, archive, and report without clobbering",
+    );
+    fs::rename(&staged_candidate, &output_directory).with_context(|| {
+        format!(
+            "publishing verified physical candidate {}",
+            output_directory.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(&staged_archive, &output_archive) {
+        let rollback = rollback_new_publication(&[(&output_directory, &staged_candidate)]);
+        bail!(
+            "publishing verified candidate archive failed: {error}; rollback errors: {}",
+            rollback.join("; ")
+        );
+    }
+    if let Err(error) = fs::rename(&staged_report, &report_path) {
+        let rollback = rollback_new_publication(&[
+            (&output_archive, &staged_archive),
+            (&output_directory, &staged_candidate),
+        ]);
+        bail!(
+            "publishing logical update report failed: {error}; rollback errors: {}",
+            rollback.join("; ")
+        );
+    }
+    if sha256_file(&output_archive)? != archive_sha256
+        || hash_selected_source(&mod_input)? != original_source_sha256
+    {
+        let rollback = rollback_new_publication(&[
+            (&report_path, &staged_report),
+            (&output_archive, &staged_archive),
+            (&output_directory, &staged_candidate),
+        ]);
+        bail!(
+            "published output or selected source changed across the atomic move; rollback errors: {}",
+            rollback.join("; ")
+        );
+    }
+
+    if !deferred_runtime_dependencies.is_empty() {
+        callback(
+            12,
+            13,
+            "Candidate published; installing validated runtime dependencies transactionally",
+        );
+        let dependency_report = check_or_install(
+            &request.game_root,
+            deferred_runtime_dependencies,
+            true,
+        )
+        .with_context(|| {
+            format!(
+                "runtime dependency install failed; the verified mapped candidate remains at {}",
+                output_archive.display()
+            )
+        })?;
+        if !dependency_report.ready {
+            bail!(
+                "runtime dependencies were not ready after installation; the verified mapped candidate remains at {}",
+                output_archive.display()
+            );
+        }
+        report["generatedAt"] = json!(chrono::Utc::now().to_rfc3339());
+        report["status"] = json!("candidate_ready_for_runtime_test");
+        report["runtimeDependenciesAfterPublication"] = serde_json::to_value(&dependency_report)?;
+        report["sourceImmutableAfterPublication"] =
+            json!(hash_selected_source(&mod_input)? == original_source_sha256);
+        fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+        if hash_selected_source(&mod_input)? != original_source_sha256 {
+            bail!(
+                "selected source changed after runtime dependency installation; the verified mapped candidate remains at {}",
+                output_archive.display()
+            );
+        }
+    } else {
+        report["sourceImmutableAfterPublication"] = json!(true);
+        fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    }
+
+    callback(
+        13,
+        13,
+        "Mapped candidate complete; shipping-game test still required",
+    );
+    Ok(UpdateOutcome {
+        adapter: outer_adapter,
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: nested_outcome.package_count,
+    })
+}
+
 fn run_additive_update(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
 ) -> Result<UpdateOutcome> {
+    let (outcome, deferred_dependencies) =
+        run_additive_update_with_dependency_policy(request, callback, true)?;
+    if !deferred_dependencies.is_empty() {
+        bail!("direct additive update unexpectedly deferred runtime dependencies");
+    }
+    Ok(outcome)
+}
+
+fn run_additive_update_with_dependency_policy(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+    install_runtime_dependencies: bool,
+) -> Result<(UpdateOutcome, Vec<crate::dependencies::DependencyCandidate>)> {
     let mod_input = fs::canonicalize(&request.mod_input)
         .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
     let input_type = if mod_input.is_file() {
@@ -816,7 +1275,9 @@ fn run_additive_update(
 
     stage(callback, 1, "Inspecting mod input and target game");
     copy_input_tree(&mod_input, &extract_root)?;
-    let mod_root = find_mod_root(&extract_root)?;
+    let mod_root = find_mod_root(&extract_root).context(
+        "the native additive adapter requires one canonical complete logical mod root; physical wrappers must enter through the guarded logical-install publication adapter",
+    )?;
     let mod_data = mod_root.join(r"Content\Dev\ObvData\Data");
     let mod_paks = mod_root.join(r"Content\Paks\~mods");
     // Inventory the complete staged input so a sibling ESP/ESM/ESL cannot be
@@ -1303,6 +1764,23 @@ fn run_additive_update(
             output_archive.display()
         );
     }
+    if !install_runtime_dependencies {
+        stage(
+            callback,
+            7,
+            "Nested additive candidate complete; runtime dependencies deferred until outer publication",
+        );
+        return Ok((
+            UpdateOutcome {
+                adapter: "native-additive-syncmap-v1".to_owned(),
+                output_directory,
+                output_archive,
+                report_path,
+                package_count: original_packages.len(),
+            },
+            dependency_candidates,
+        ));
+    }
     stage(
         callback,
         7,
@@ -1345,13 +1823,16 @@ fn run_additive_update(
         8,
         "Structural update complete; shipping-game test still required",
     );
-    Ok(UpdateOutcome {
-        adapter: "native-additive-syncmap-v1".to_owned(),
-        output_directory,
-        output_archive,
-        report_path,
-        package_count: original_packages.len(),
-    })
+    Ok((
+        UpdateOutcome {
+            adapter: "native-additive-syncmap-v1".to_owned(),
+            output_directory,
+            output_archive,
+            report_path,
+            package_count: original_packages.len(),
+        },
+        Vec::new(),
+    ))
 }
 
 fn canonical_entries(entries: &[PackageEntry]) -> Result<Vec<PackageEntry>> {
@@ -2117,6 +2598,11 @@ fn run_texture_replacement_update(
     );
     stage_input(&mod_input, &staged)?;
     let inspection = inspect_texture_staged(&staged, &game.root, &retoc)?;
+    let (_, current_packages) = retoc.package_entries(&inspection.target_utoc)?;
+    let current_packages_by_id = current_packages
+        .into_iter()
+        .map(|package| (package.package_id, package))
+        .collect::<HashMap<_, _>>();
     ensure_no_installed_replacement_collisions(
         &game_paks,
         &inspection.packages,
@@ -2216,7 +2702,16 @@ fn run_texture_replacement_update(
             source.asset = canonical_package_path(&package.path)?;
 
             let donor_root = current_stock.join(package.package_id.to_string());
-            let donor_asset = extract_current_package(&retoc, stock_input, &donor_root, package)?;
+            let current_package = current_packages_by_id
+                .get(&package.package_id)
+                .with_context(|| {
+                    format!(
+                        "current Texture2D package inventory is missing {}",
+                        package.path
+                    )
+                })?;
+            let donor_asset =
+                extract_current_package(&retoc, stock_input, &donor_root, current_package)?;
             let donor = inspect_texture_asset(&donor_asset)?;
             if !source.class_name.eq_ignore_ascii_case("Texture2D")
                 || !donor.class_name.eq_ignore_ascii_case("Texture2D")
@@ -2497,6 +2992,407 @@ fn find_additive_static_mesh_asset(root: &Path, package_path: &str) -> Result<Pa
     Ok(matches[0].clone())
 }
 
+fn run_heterogeneous_replacement_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let input_type = if mod_input.is_file() {
+        "archive"
+    } else {
+        "directory"
+    };
+    let input_hash = if mod_input.is_file() {
+        sha256_file(&mod_input)?
+    } else {
+        sha256_directory(&mod_input)?
+    };
+    let game = validate_game_install(&request.game_root, "native UI");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    if !request.output_parent.is_dir() {
+        bail!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        );
+    }
+    let output_directory = request.output_parent.join(format!(
+        "{}-current-candidate-{}",
+        safe_leaf(&mod_input),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    if output_directory.exists() || output_archive.exists() {
+        bail!("timestamped output already exists; wait one second and try again");
+    }
+    if request.persist_settings {
+        save_settings(&game.root, &request.output_parent)?;
+    }
+
+    let game_paks = game.root.join(r"OblivionRemastered\Content\Paks");
+    let work = tempfile::Builder::new()
+        .prefix("obr-heterogeneous-replacement-update-")
+        .tempdir()?;
+    let staged = work.path().join("source");
+    let retoc = RetocTool::materialize()?;
+    stage(
+        callback,
+        1,
+        "Validating heterogeneous package identities, imports, and dependency closure",
+    );
+    stage_input(&mod_input, &staged)?;
+    let inspection = inspect_heterogeneous_replacement_staged(&staged, &game.root, &retoc)?;
+    ensure_no_installed_replacement_collisions(
+        &game_paks,
+        &inspection.packages,
+        &retoc,
+        &request.installed_collision_exclusions,
+    )?;
+    let stock_view = if request.installed_collision_exclusions.is_empty() {
+        None
+    } else {
+        Some(create_isolated_stock_view(&game.root)?)
+    };
+    let stock_input = stock_view
+        .as_ref()
+        .map(|view| view.path())
+        .unwrap_or(game_paks.as_path());
+    let current_packages_by_id = inspection.target_dependencies.clone();
+
+    fs::create_dir_all(&output_directory)?;
+    copy_tree(&staged, &output_directory)?;
+    let mut container_results = Vec::new();
+    let mut static_mesh_count = 0_usize;
+    let mut texture_count = 0_usize;
+    let mut metadata_rebased_count = 0_usize;
+
+    for container in &inspection.containers {
+        let root = work.path().join("containers").join(&container.name);
+        let legacy = root.join("legacy");
+        let current_stock = root.join("current-stock");
+        let rebuilt = root.join("rebuilt");
+        let verify_legacy = root.join("verify-legacy");
+        let json_work = root.join("payload-verification");
+        for directory in [
+            &legacy,
+            &current_stock,
+            &rebuilt,
+            &verify_legacy,
+            &json_work,
+        ] {
+            fs::create_dir_all(directory)?;
+        }
+
+        let source_view = create_isolated_stock_view(&game.root)?;
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            copy_file(
+                source,
+                &source_view.path().join(source.file_name().unwrap()),
+            )?;
+        }
+        stage(
+            callback,
+            2,
+            &format!(
+                "Extracting each source package with exact package-store spelling from {}",
+                container.name
+            ),
+        );
+        extract_source_packages_exact(
+            &retoc,
+            source_view.path(),
+            &legacy,
+            &container.packages,
+            &format!("heterogeneous source extraction {}", container.name),
+        )?;
+
+        let mut classifications = HashMap::<u64, &'static str>::new();
+        let mut texture_assets = Vec::new();
+        let mut static_mesh_import_repairs = Vec::new();
+        stage(
+            callback,
+            3,
+            &format!(
+                "Proving StaticMesh and Texture2D contracts for {}",
+                container.name
+            ),
+        );
+        for package in &container.packages {
+            let source_asset = find_additive_static_mesh_asset(&legacy, &package.path)?;
+            match classify_heterogeneous_asset(&source_asset)? {
+                ProvenHeterogeneousAsset::StaticMesh { imports } => {
+                    classifications.insert(package.package_id, "static-mesh");
+                    static_mesh_count += 1;
+                    if imports
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+                    {
+                        static_mesh_import_repairs.push(repair_static_mesh_imports(
+                            &source_asset,
+                            &inspection.target_dependencies,
+                            &root
+                                .join("import-repairs")
+                                .join(package.package_id.to_string()),
+                        )?);
+                        let repaired = inspect_static_mesh_asset(&source_asset)?;
+                        if repaired
+                            .iter()
+                            .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+                        {
+                            bail!("{} retained unresolved imports after repair", package.path);
+                        }
+                    }
+                }
+                ProvenHeterogeneousAsset::Texture2D(mut source) => {
+                    classifications.insert(package.package_id, "texture2d");
+                    texture_count += 1;
+                    source.asset = canonical_additive_static_mesh_path(&package.path)?;
+                    let current_package = current_packages_by_id
+                        .get(&package.package_id)
+                        .context("heterogeneous current package inventory lost an identity")?;
+                    let donor_root = current_stock.join(package.package_id.to_string());
+                    let donor_asset =
+                        extract_current_package(&retoc, stock_input, &donor_root, current_package)?;
+                    let donor = inspect_texture_asset(&donor_asset)?;
+                    texture_assets.push(validate_texture_replacement_pair(
+                        source,
+                        &donor,
+                        &package.path,
+                    )?);
+                }
+            }
+        }
+        texture_assets.sort_by_key(|asset| asset.asset.to_ascii_lowercase());
+        let body_setup_repairs = repair_legacy_body_setups(&legacy)?;
+
+        stage(
+            callback,
+            4,
+            &format!(
+                "Rebuilding {} once against current Zen metadata",
+                container.name
+            ),
+        );
+        let rebuilt_utoc = rebuilt.join(format!("{}.utoc", container.name));
+        let to_zen = retoc.run(args([
+            OsString::from("to-zen"),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            legacy.as_os_str().to_owned(),
+            rebuilt_utoc.as_os_str().to_owned(),
+        ]))?;
+        RetocTool::assert_success(&to_zen, &format!("retoc to-zen {}", container.name))?;
+        let rebuilt_ucas = rebuilt_utoc.with_extension("ucas");
+        let rebuilt_pak = rebuilt_utoc.with_extension("pak");
+        for output in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
+            if !output.is_file() {
+                bail!(
+                    "rebuilt heterogeneous container output missing: {}",
+                    output.display()
+                );
+            }
+        }
+        retoc.verify(
+            &rebuilt_utoc,
+            &format!("retoc verify rebuilt {}", container.name),
+        )?;
+        let (_, rebuilt_packages) = retoc.package_entries(&rebuilt_utoc)?;
+        ensure_same_package_entries(
+            &container.packages,
+            &rebuilt_packages,
+            &format!("heterogeneous package inventory for {}", container.name),
+        )?;
+        let (_, rebuilt_store) = retoc.package_store_entries(&rebuilt_utoc)?;
+        for source in &container.package_store {
+            let rebuilt_entry = rebuilt_store
+                .iter()
+                .find(|entry| entry.package_id == source.package_id)
+                .with_context(|| {
+                    format!("rebuilt package store is missing {}", source.package_id)
+                })?;
+            if BTreeSet::from_iter(source.imported_package_ids.iter().copied())
+                != BTreeSet::from_iter(rebuilt_entry.imported_package_ids.iter().copied())
+            {
+                bail!("rebuilt package imports changed for {}", source.path);
+            }
+        }
+
+        let roundtrip_view = create_isolated_stock_view(&game.root)?;
+        for source in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
+            copy_file(
+                source,
+                &roundtrip_view.path().join(source.file_name().unwrap()),
+            )?;
+        }
+        extract_source_packages_exact(
+            &retoc,
+            roundtrip_view.path(),
+            &verify_legacy,
+            &rebuilt_packages,
+            &format!("heterogeneous roundtrip {}", container.name),
+        )?;
+        for package in &rebuilt_packages {
+            let asset = find_additive_static_mesh_asset(&verify_legacy, &package.path)?;
+            let actual = match classify_heterogeneous_asset(&asset)? {
+                ProvenHeterogeneousAsset::StaticMesh { .. } => "static-mesh",
+                ProvenHeterogeneousAsset::Texture2D(_) => "texture2d",
+            };
+            let expected = classifications
+                .get(&package.package_id)
+                .context("roundtrip package classification has no source identity")?;
+            if actual != *expected {
+                bail!(
+                    "roundtrip asset class changed for {}: expected {}, found {}",
+                    package.path,
+                    expected,
+                    actual
+                );
+            }
+        }
+        let payload_equivalence = verify_rebased_payloads(&legacy, &verify_legacy, &json_work)?;
+        metadata_rebased_count += payload_equivalence
+            .assets
+            .iter()
+            .filter(|asset| asset.metadata_rebased)
+            .count();
+
+        let candidate_utoc = output_directory.join(&container.relative_utoc);
+        let candidate_ucas = candidate_utoc.with_extension("ucas");
+        let candidate_pak = candidate_utoc.with_extension("pak");
+        copy_file(&rebuilt_utoc, &candidate_utoc)?;
+        copy_file(&rebuilt_ucas, &candidate_ucas)?;
+        copy_file(&rebuilt_pak, &candidate_pak)?;
+        let mut package_kinds = container
+            .packages
+            .iter()
+            .map(|package| {
+                json!({
+                    "packageId": package.package_id,
+                    "path": package.path,
+                    "assetKind": classifications.get(&package.package_id),
+                })
+            })
+            .collect::<Vec<_>>();
+        package_kinds.sort_by_key(|row| {
+            row["path"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        });
+        container_results.push(json!({
+            "name": container.name,
+            "packageCount": container.packages.len(),
+            "packages": package_kinds,
+            "source": {
+                "utocSha256": sha256_file(&container.utoc)?,
+                "ucasSha256": sha256_file(&container.ucas)?,
+                "pakSha256": sha256_file(&container.pak)?,
+            },
+            "rebuilt": {
+                "utocSha256": sha256_file(&candidate_utoc)?,
+                "ucasSha256": sha256_file(&candidate_ucas)?,
+                "pakSha256": sha256_file(&candidate_pak)?,
+                "retocVerified": true,
+                "inventoryPreserved": true,
+                "importsPreserved": true,
+            },
+            "staticMeshImportRepairs": static_mesh_import_repairs,
+            "bodySetupRepairs": body_setup_repairs,
+            "textureAssets": texture_assets,
+            "payloadEquivalence": payload_equivalence,
+        }));
+    }
+    if static_mesh_count == 0 || texture_count == 0 {
+        bail!(
+            "heterogeneous replacement adapter requires at least one structurally proven StaticMesh and one Texture2D package"
+        );
+    }
+
+    let report_path = output_directory.join("heterogeneous-replacement-update-report.json");
+    let report = json!({
+        "schema": "obr-heterogeneous-replacement-update-report",
+        "version": 1,
+        "implementation": "native-rust",
+        "adapter": HETEROGENEOUS_REPLACEMENT_ADAPTER,
+        "generatedAt": chrono::Utc::now().to_rfc3339(),
+        "status": "candidate_ready_for_runtime_test",
+        "structurallyVerified": true,
+        "runtimeVerified": false,
+        "source": {
+            "inputType": input_type,
+            "inputPath": mod_input,
+            "inputSha256": input_hash,
+        },
+        "target": {
+            "gameRoot": game.root,
+            "gamePackageInventory": inspection.target_utoc,
+            "gamePackageInventorySha256": sha256_file(&inspection.target_utoc)?,
+        },
+        "identity": {
+            "packageCount": inspection.packages.len(),
+            "staticMeshCount": static_mesh_count,
+            "texture2DCount": texture_count,
+            "currentGamePathsAndPackageIdsMatched": true,
+            "sourceAndCurrentImportSetsMatched": true,
+            "dependencyClosureComplete": true,
+            "metadataRebasedAssetCount": metadata_rebased_count,
+        },
+        "unreal": {
+            "containerCount": inspection.containers.len(),
+            "containers": container_results,
+        },
+        "output": {
+            "directory": output_directory,
+            "archive": output_archive,
+        },
+        "verification": {
+            "sourceExactCaseExtraction": true,
+            "sourceContainersVerified": true,
+            "rebuiltContainersVerified": true,
+            "packagePathsAndIdsPreserved": true,
+            "packageImportsPreserved": true,
+            "roundtripClassesPreserved": true,
+            "roundtripFileSetsPreserved": true,
+            "payloadsPreservedOutsideAllowedLinkageMetadata": true,
+            "productionRuntimeGateRequired": true,
+        }
+    });
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    stage(
+        callback,
+        6,
+        "Creating portable heterogeneous replacement candidate archive",
+    );
+    create_zip_from_paths(
+        &output_archive,
+        &output_directory,
+        std::slice::from_ref(&output_directory),
+    )?;
+    if !output_archive.is_file() {
+        bail!(
+            "output archive was not created: {}",
+            output_archive.display()
+        );
+    }
+    stage(
+        callback,
+        7,
+        "Heterogeneous candidate complete; shipping-game test still required",
+    );
+    Ok(UpdateOutcome {
+        adapter: HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned(),
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: inspection.packages.len(),
+    })
+}
+
 fn run_additive_static_mesh_update(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
@@ -2570,7 +3466,7 @@ fn run_additive_static_mesh_update(
                 container.name
             ),
         );
-        extract_static_mesh_packages(
+        extract_source_static_mesh_packages(
             &retoc,
             input_view.path(),
             &legacy,
@@ -2687,7 +3583,7 @@ fn run_additive_static_mesh_update(
                 &verify_view.path().join(source.file_name().unwrap()),
             )?;
         }
-        extract_static_mesh_packages(
+        extract_source_static_mesh_packages(
             &retoc,
             verify_view.path(),
             &verify_legacy,
@@ -2915,5 +3811,37 @@ mod tests {
             portable_archive_path(directory).unwrap(),
             PathBuf::from(r"C:\tmp\RAO-1.0-current-candidate-20260713-225545.zip")
         );
+    }
+
+    #[test]
+    fn logical_publication_boundary_grants_only_mapped_iostore_payload_ownership() {
+        let plan = crate::install_plan::InstallPlan {
+            api: crate::install_plan::INSTALL_PLAN_API,
+            evidence: crate::install_plan::LayoutEvidence::Canonical,
+            mappings: vec![
+                crate::install_plan::InstallMapping {
+                    physical_source: PathBuf::from("Wrapper/Data/Fixture.esp"),
+                    logical_destination: PathBuf::from("Content/Dev/ObvData/Data/Fixture.esp"),
+                    priority: 0,
+                    scope: crate::install_plan::MappingScope::Required,
+                },
+                crate::install_plan::InstallMapping {
+                    physical_source: PathBuf::from("Wrapper/Paks/Fixture.utoc"),
+                    logical_destination: PathBuf::from("Content/Paks/~mods/Fixture.utoc"),
+                    priority: 0,
+                    scope: crate::install_plan::MappingScope::Required,
+                },
+            ],
+            choice_groups: Vec::new(),
+            unmapped_sources: vec![PathBuf::from("docs/readme.txt")],
+        };
+
+        let owned =
+            nested_adapter_owns_logical_destinations(&plan, "native-additive-syncmap-v1").unwrap();
+        assert_eq!(
+            owned,
+            BTreeSet::from([PathBuf::from("Content/Paks/~mods/Fixture.utoc")])
+        );
+        assert!(nested_adapter_owns_logical_destinations(&plan, "unknown-adapter").is_err());
     }
 }

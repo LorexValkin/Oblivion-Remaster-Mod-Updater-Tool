@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -20,6 +20,7 @@ const MAX_PLUGIN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SELECTED_METADATA_BYTES: u64 = 512 * 1024 * 1024;
 const PLUGIN_METADATA_EXTENSIONS: &[&str] = &["esp", "esm", "esl", "ini"];
 pub const ADDITIVE_CONTRACT_API: &str = "tes4-syncmap-additive-contract-v1";
+pub const WORLDSPACE_MASTER_PROBE_API: &str = "tes4-worldspace-master-resolution-probe-v1";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +67,17 @@ pub struct PluginArtifact {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMirrorEvidence {
+    pub file_name: String,
+    pub canonical_relative_path: String,
+    pub mirror_relative_path: String,
+    pub sync_map_relative_path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginPolicyEvaluation {
@@ -82,9 +94,14 @@ pub struct PluginSetReport {
     pub scan_mode: String,
     pub status: String,
     pub manifest_sha256: String,
+    /// Number of physical ESP/ESM/ESL files retained in `artifacts`.
     pub plugin_count: usize,
+    /// Number of plugins used for dependency and mutation-policy analysis after
+    /// collapsing only recognized byte-identical SyncMap mirrors.
+    pub logical_plugin_count: usize,
     pub parsed_plugin_count: usize,
     pub artifacts: Vec<PluginArtifact>,
+    pub plugin_mirrors: Vec<PluginMirrorEvidence>,
     pub dependency_edges: Vec<MasterDependency>,
     pub unresolved_external_masters: Vec<String>,
     pub blockers: Vec<String>,
@@ -109,6 +126,45 @@ pub struct AdditiveContractReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledMasterProbe {
+    pub declared_name: String,
+    pub master_index: usize,
+    pub found: bool,
+    pub parsed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_file_name: Option<String>,
+    pub own_master_count: usize,
+    pub indexed_record_count: usize,
+    pub matching_override_record_count: usize,
+    pub unmappable_record_count: usize,
+    pub unmappable_target_collision_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldspaceMasterProbeReport {
+    pub api: String,
+    pub status: String,
+    pub resolution_complete: bool,
+    pub semantic_compatibility_claimed: bool,
+    pub mutation_policy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_path: Option<String>,
+    pub declared_master_count: usize,
+    pub found_master_count: usize,
+    pub parsed_master_count: usize,
+    pub master_override_count: usize,
+    pub resolved_master_override_count: usize,
+    pub unresolved_master_override_count: usize,
+    pub type_mismatch_override_count: usize,
+    pub deleted_master_override_count: usize,
+    pub masters: Vec<InstalledMasterProbe>,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 impl PluginSetReport {
     pub fn unavailable(expected_plugins: usize) -> Self {
         Self {
@@ -117,8 +173,10 @@ impl PluginSetReport {
             status: "failed".to_owned(),
             manifest_sha256: String::new(),
             plugin_count: expected_plugins,
+            logical_plugin_count: expected_plugins,
             parsed_plugin_count: 0,
             artifacts: Vec::new(),
+            plugin_mirrors: Vec::new(),
             dependency_edges: Vec::new(),
             unresolved_external_masters: Vec::new(),
             blockers: vec!["plugin-input-could-not-be-staged-safely".to_owned()],
@@ -152,6 +210,15 @@ fn direct_game_data_plugin(path: &str) -> bool {
 }
 
 fn direct_sync_map_ini(path: &str) -> bool {
+    let normalized = path.trim_start_matches('/').to_ascii_lowercase();
+    let marker = "content/dev/obvdata/data/syncmap/";
+    let Some(tail) = normalized.strip_prefix(marker) else {
+        return false;
+    };
+    !tail.is_empty() && !tail.contains('/')
+}
+
+fn direct_sync_map_plugin(path: &str) -> bool {
     let normalized = path.trim_start_matches('/').to_ascii_lowercase();
     let marker = "content/dev/obvdata/data/syncmap/";
     let Some(tail) = normalized.strip_prefix(marker) else {
@@ -486,22 +553,118 @@ fn bounded_tree_paths(root: &Path, predicate: impl Fn(&Path) -> bool) -> Result<
     Ok(paths)
 }
 
+fn files_are_byte_identical(left: &Path, right: &Path, expected_bytes: u64) -> Result<bool> {
+    if expected_bytes > MAX_PLUGIN_BYTES {
+        bail!("plugin mirror exceeds the bounded content-analysis limit");
+    }
+    let mut left = fs::File::open(left).context("opening canonical plugin mirror candidate")?;
+    let mut right = fs::File::open(right).context("opening SyncMap plugin mirror candidate")?;
+    if left.metadata()?.len() != expected_bytes || right.metadata()?.len() != expected_bytes {
+        return Ok(false);
+    }
+
+    let mut left_buffer = [0_u8; 64 * 1024];
+    let mut right_buffer = [0_u8; 64 * 1024];
+    let mut remaining = expected_bytes;
+    while remaining > 0 {
+        let chunk = remaining.min(left_buffer.len() as u64) as usize;
+        left.read_exact(&mut left_buffer[..chunk])?;
+        right.read_exact(&mut right_buffer[..chunk])?;
+        if left_buffer[..chunk] != right_buffer[..chunk] {
+            return Ok(false);
+        }
+        remaining -= chunk as u64;
+    }
+    let mut trailing = [0_u8; 1];
+    Ok(left.read(&mut trailing)? == 0 && right.read(&mut trailing)? == 0)
+}
+
+fn recognize_plugin_mirror(
+    artifacts: &[PluginArtifact],
+    artifact_paths: &[PathBuf],
+    indexes: &[usize],
+    direct_sync_map_inis: &[(String, String)],
+) -> Result<Option<(usize, PluginMirrorEvidence)>> {
+    if indexes.len() != 2 {
+        return Ok(None);
+    }
+    let canonical = indexes
+        .iter()
+        .copied()
+        .filter(|index| {
+            artifacts[*index].kind == "esp"
+                && direct_game_data_plugin(&artifacts[*index].relative_path)
+        })
+        .collect::<Vec<_>>();
+    let mirror = indexes
+        .iter()
+        .copied()
+        .filter(|index| {
+            artifacts[*index].kind == "esp"
+                && direct_sync_map_plugin(&artifacts[*index].relative_path)
+        })
+        .collect::<Vec<_>>();
+    let ([canonical], [mirror]) = (canonical.as_slice(), mirror.as_slice()) else {
+        return Ok(None);
+    };
+    let canonical = *canonical;
+    let mirror = *mirror;
+    let canonical_artifact = &artifacts[canonical];
+    let mirror_artifact = &artifacts[mirror];
+    if !canonical_artifact
+        .file_name
+        .eq_ignore_ascii_case(&mirror_artifact.file_name)
+        || canonical_artifact.bytes != mirror_artifact.bytes
+        || canonical_artifact.sha256 != mirror_artifact.sha256
+    {
+        return Ok(None);
+    }
+
+    let plugin_stem = Path::new(&canonical_artifact.file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("plugin mirror filename has no Unicode stem")?;
+    let matching_inis = direct_sync_map_inis
+        .iter()
+        .filter(|(stem, _)| stem.eq_ignore_ascii_case(plugin_stem))
+        .collect::<Vec<_>>();
+    let [(_, sync_map_relative_path)] = matching_inis.as_slice() else {
+        return Ok(None);
+    };
+    if !files_are_byte_identical(
+        &artifact_paths[canonical],
+        &artifact_paths[mirror],
+        canonical_artifact.bytes,
+    )? {
+        return Ok(None);
+    }
+
+    Ok(Some((
+        canonical,
+        PluginMirrorEvidence {
+            file_name: canonical_artifact.file_name.clone(),
+            canonical_relative_path: canonical_artifact.relative_path.clone(),
+            mirror_relative_path: mirror_artifact.relative_path.clone(),
+            sync_map_relative_path: sync_map_relative_path.clone(),
+            bytes: canonical_artifact.bytes,
+            sha256: canonical_artifact.sha256.clone(),
+        },
+    )))
+}
+
 pub fn inspect_plugin_set(root: &Path) -> Result<PluginSetReport> {
-    let mut paths = Vec::<PathBuf>::new();
-    paths.extend(bounded_tree_paths(root, |path| {
-        plugin_kind(path).is_some()
-    })?);
+    let paths = bounded_tree_paths(root, |path| plugin_kind(path).is_some())?;
 
     let mut artifacts = Vec::new();
-    for path in paths {
+    for path in &paths {
         let relative_path = normalize_relative(path.strip_prefix(root)?);
         let file_name = path
             .file_name()
             .and_then(|value| value.to_str())
             .context("plugin path has no Unicode filename")?
             .to_owned();
-        let kind = plugin_kind(&path).context("plugin extension disappeared")?;
-        let payload = bounded_plugin_payload(&path, &relative_path)?;
+        let kind = plugin_kind(path).context("plugin extension disappeared")?;
+        let payload = bounded_plugin_payload(path, &relative_path)?;
         let bytes = payload.len() as u64;
         let sha256 = sha256_bytes(&payload);
         let artifact = match read_plugin_bytes(&payload, &relative_path) {
@@ -515,12 +678,61 @@ pub fn inspect_plugin_set(root: &Path) -> Result<PluginSetReport> {
 
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
-    let mut file_names = BTreeMap::<String, Vec<usize>>::new();
+    let mut physical_file_names = BTreeMap::<String, Vec<usize>>::new();
     for (index, artifact) in artifacts.iter().enumerate() {
-        file_names
+        physical_file_names
             .entry(artifact.file_name.to_ascii_lowercase())
             .or_default()
             .push(index);
+    }
+
+    let direct_sync_map_inis = bounded_tree_paths(root, |path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("ini"))
+            && direct_sync_map_ini(&normalize_relative(path.strip_prefix(root).unwrap_or(path)))
+    })?
+    .into_iter()
+    .map(|path| {
+        let relative_path = normalize_relative(path.strip_prefix(root).unwrap_or(&path));
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("SyncMap INI path has no Unicode stem")?
+            .to_owned();
+        Ok((stem, relative_path))
+    })
+    .collect::<Result<Vec<_>>>()?;
+
+    let mut logical_indexes = Vec::new();
+    let mut plugin_mirrors = Vec::new();
+    for indexes in physical_file_names.values() {
+        if indexes.len() == 1 {
+            logical_indexes.push(indexes[0]);
+        } else if let Some((canonical, mirror)) =
+            recognize_plugin_mirror(&artifacts, &paths, indexes, &direct_sync_map_inis)?
+        {
+            logical_indexes.push(canonical);
+            plugin_mirrors.push(mirror);
+        } else {
+            blockers.push("case-insensitive-plugin-filename-collision".to_owned());
+            logical_indexes.extend(indexes.iter().copied());
+        }
+    }
+    logical_indexes.sort_unstable();
+    plugin_mirrors.sort_by(|left, right| {
+        left.canonical_relative_path
+            .to_ascii_lowercase()
+            .cmp(&right.canonical_relative_path.to_ascii_lowercase())
+    });
+
+    let mut file_names = BTreeMap::<String, Vec<usize>>::new();
+    for index in &logical_indexes {
+        let artifact = &artifacts[*index];
+        file_names
+            .entry(artifact.file_name.to_ascii_lowercase())
+            .or_default()
+            .push(*index);
         blockers.extend(
             artifact
                 .structural_blockers
@@ -534,14 +746,12 @@ pub fn inspect_plugin_set(root: &Path) -> Result<PluginSetReport> {
                 .map(|warning| format!("{}: {warning}", artifact.file_name)),
         );
     }
-    if file_names.values().any(|indexes| indexes.len() > 1) {
-        blockers.push("case-insensitive-plugin-filename-collision".to_owned());
-    }
 
     let mut dependency_edges = Vec::new();
     let mut unresolved_external_masters = BTreeSet::new();
     let mut adjacency = BTreeMap::<String, BTreeSet<String>>::new();
-    for artifact in &artifacts {
+    for index in &logical_indexes {
+        let artifact = &artifacts[*index];
         let plugin_key = artifact.file_name.to_ascii_lowercase();
         adjacency.entry(plugin_key.clone()).or_default();
         for (master_index, master) in artifact.masters.iter().enumerate() {
@@ -617,7 +827,11 @@ pub fn inspect_plugin_set(root: &Path) -> Result<PluginSetReport> {
     } else {
         "partial"
     };
-    let additive_syncmap_v1 = evaluate_additive_policy(&artifacts, &blockers);
+    let logical_artifacts = logical_indexes
+        .iter()
+        .map(|index| artifacts[*index].clone())
+        .collect::<Vec<_>>();
+    let additive_syncmap_v1 = evaluate_additive_policy(&logical_artifacts, &blockers);
 
     Ok(PluginSetReport {
         api: PLUGIN_MANIFEST_API.to_owned(),
@@ -625,8 +839,10 @@ pub fn inspect_plugin_set(root: &Path) -> Result<PluginSetReport> {
         status: status.to_owned(),
         manifest_sha256: sha256_bytes(manifest_rows.join("\n").as_bytes()),
         plugin_count: artifacts.len(),
+        logical_plugin_count: logical_artifacts.len(),
         parsed_plugin_count,
         artifacts,
+        plugin_mirrors,
         dependency_edges,
         unresolved_external_masters: unresolved_external_masters.into_iter().collect(),
         blockers,
@@ -770,6 +986,611 @@ pub fn inspect_plugin_input_at_root(
 
 pub fn inspect_plugin_input(input: &Path) -> Result<PluginSetReport> {
     inspect_plugin_input_at_root(input, None)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CanonicalFormId {
+    origin: String,
+    local_id: u32,
+}
+
+#[derive(Clone, Debug)]
+struct IndexedMasterRecord {
+    kind: String,
+    provider: String,
+}
+
+#[derive(Clone, Debug)]
+struct InstalledMasterIndex {
+    masters: Vec<String>,
+    record_count: usize,
+    matching_records: BTreeMap<CanonicalFormId, IndexedMasterRecord>,
+    unmappable_record_count: usize,
+    unmappable_target_collisions: Vec<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct DataEntryCandidate {
+    file_name: String,
+    path: PathBuf,
+    regular_file: bool,
+    symlink: bool,
+}
+
+fn canonical_form_id(owner: &str, masters: &[String], form_id: u32) -> Result<CanonicalFormId> {
+    if masters.len() > u8::MAX as usize {
+        bail!("master count exceeds the full-plugin FormID index space");
+    }
+    let source_index = (form_id >> 24) as usize;
+    let origin = if source_index < masters.len() {
+        &masters[source_index]
+    } else if source_index == masters.len() {
+        owner
+    } else {
+        bail!(
+            "record 0x{form_id:08X} uses source index {source_index} beyond full-plugin index {}",
+            masters.len()
+        );
+    };
+    Ok(CanonicalFormId {
+        origin: origin.to_ascii_lowercase(),
+        local_id: form_id & 0x00ff_ffff,
+    })
+}
+
+fn header_u32(bytes: &[u8], offset: usize, label: &str) -> Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .with_context(|| format!("truncated {label}"))?;
+    Ok(u32::from_le_bytes(value.try_into().unwrap()))
+}
+
+fn index_installed_master(
+    path: &Path,
+    declared_name: &str,
+    wanted: &BTreeSet<CanonicalFormId>,
+) -> Result<InstalledMasterIndex> {
+    let mut source = fs::File::open(path)
+        .with_context(|| format!("opening installed master {declared_name}"))?;
+    let original_length = source
+        .metadata()
+        .with_context(|| format!("reading installed master metadata for {declared_name}"))?
+        .len();
+    if original_length < 20 {
+        bail!("installed master is shorter than a TES4 record header");
+    }
+
+    let mut header = [0_u8; 20];
+    source
+        .read_exact(&mut header)
+        .with_context(|| format!("reading TES4 header from installed master {declared_name}"))?;
+    if &header[..4] != b"TES4" {
+        bail!("installed master does not begin with a TES4 header");
+    }
+    let header_size = header_u32(&header, 4, "TES4 header size")? as u64;
+    let header_end = 20_u64
+        .checked_add(header_size)
+        .context("TES4 header size overflow")?;
+    if header_end > original_length {
+        bail!("installed master has a truncated TES4 header");
+    }
+    if header_end > MAX_PLUGIN_BYTES {
+        bail!("installed master TES4 header exceeds the bounded metadata limit");
+    }
+    let mut header_bytes = Vec::with_capacity(header_end as usize);
+    header_bytes.extend_from_slice(&header);
+    let mut header_payload = vec![0_u8; header_size as usize];
+    source
+        .read_exact(&mut header_payload)
+        .with_context(|| format!("reading TES4 metadata from installed master {declared_name}"))?;
+    header_bytes.extend_from_slice(&header_payload);
+    let parsed_header = read_plugin_bytes(&header_bytes, declared_name)
+        .with_context(|| format!("parsing TES4 metadata from installed master {declared_name}"))?;
+    if parsed_header.header_flags & LIGHT_PLUGIN != 0 {
+        bail!("light-plugin FormID semantics are not supported by this probe");
+    }
+    if parsed_header.masters.len() > u8::MAX as usize {
+        bail!("master count exceeds the full-plugin FormID index space");
+    }
+    let mut master_names = HashSet::new();
+    if parsed_header
+        .masters
+        .iter()
+        .any(|master| !master_names.insert(master.to_ascii_lowercase()))
+    {
+        bail!("installed master declares duplicate case-insensitive master names");
+    }
+
+    let mut group_count = 0_usize;
+    let mut record_count = 0_usize;
+    let mut matching_records = BTreeMap::new();
+    let wanted_local_ids = wanted
+        .iter()
+        .map(|identity| identity.local_id)
+        .collect::<BTreeSet<_>>();
+    let mut unmappable_record_count = 0_usize;
+    let mut unmappable_target_collisions = Vec::new();
+    let mut group_ends = Vec::<u64>::new();
+    loop {
+        let start = source.stream_position()?;
+        while group_ends.last().is_some_and(|end| *end == start) {
+            group_ends.pop();
+        }
+        if group_ends.last().is_some_and(|end| start > *end) {
+            bail!("installed master record stream crossed a GRUP boundary");
+        }
+        if start == original_length {
+            break;
+        }
+        let enclosing_end = group_ends.last().copied().unwrap_or(original_length);
+        if start.checked_add(20).is_none_or(|end| end > enclosing_end) {
+            bail!("installed master has trailing bytes inside a GRUP");
+        }
+        let mut record_header = [0_u8; 20];
+        source.read_exact(&mut record_header).with_context(|| {
+            format!("reading record header from installed master {declared_name}")
+        })?;
+        let kind = String::from_utf8_lossy(&record_header[..4]).into_owned();
+        if kind == "GRUP" {
+            let group_size = header_u32(&record_header, 4, "GRUP size")? as u64;
+            let group_end = start
+                .checked_add(group_size)
+                .context("GRUP size overflow")?;
+            if group_size < 20 || group_end > enclosing_end {
+                bail!("installed master contains an invalid GRUP at 0x{start:X}");
+            }
+            group_count += 1;
+            group_ends.push(group_end);
+            continue;
+        }
+
+        let data_size = header_u32(&record_header, 4, "record data size")? as u64;
+        let form_id = header_u32(&record_header, 12, "record FormID")?;
+        let record_end = source
+            .stream_position()?
+            .checked_add(data_size)
+            .context("record data size overflow")?;
+        if record_end > enclosing_end {
+            bail!("installed master contains a truncated {kind} record 0x{form_id:08X}");
+        }
+        record_count += 1;
+        if (form_id >> 24) as usize > parsed_header.masters.len() {
+            unmappable_record_count += 1;
+            if wanted_local_ids.contains(&(form_id & 0x00ff_ffff)) {
+                unmappable_target_collisions.push(form_id);
+            }
+        } else {
+            let identity = canonical_form_id(declared_name, &parsed_header.masters, form_id)?;
+            if wanted.contains(&identity) {
+                if data_size > MAX_PLUGIN_BYTES {
+                    bail!(
+                        "target {kind} record 0x{form_id:08X} exceeds the bounded record-parse limit"
+                    );
+                }
+                let mut raw = vec![0_u8; data_size as usize];
+                source.read_exact(&mut raw).with_context(|| {
+                    format!(
+                        "reading target {kind} record 0x{form_id:08X} from installed master {declared_name}"
+                    )
+                })?;
+                let mut fragment = Vec::with_capacity(
+                    header_bytes
+                        .len()
+                        .checked_add(record_header.len())
+                        .and_then(|size| size.checked_add(raw.len()))
+                        .context("target record parse buffer size overflow")?,
+                );
+                fragment.extend_from_slice(&header_bytes);
+                fragment.extend_from_slice(&record_header);
+                fragment.extend_from_slice(&raw);
+                let parsed_record = read_plugin_bytes(&fragment, declared_name)
+                    .with_context(|| {
+                        format!(
+                            "parsing target {kind} record 0x{form_id:08X} from installed master {declared_name}"
+                        )
+                    })?
+                    .records
+                    .into_iter()
+                    .next()
+                    .context("target record parser returned no record")?;
+                if parsed_record.kind != kind || parsed_record.form_id != form_id {
+                    bail!("target record parser returned a different record identity");
+                }
+                if matching_records
+                    .insert(
+                        identity,
+                        IndexedMasterRecord {
+                            kind,
+                            provider: declared_name.to_owned(),
+                        },
+                    )
+                    .is_some()
+                {
+                    bail!("installed master contains a duplicate target FormID 0x{form_id:08X}");
+                }
+            }
+        }
+        source.seek(SeekFrom::Start(record_end))?;
+    }
+    if source.stream_position()? != original_length {
+        bail!("installed master has trailing bytes after its last complete record");
+    }
+    if parsed_header.declared_record_count as usize != record_count + group_count {
+        bail!(
+            "installed master HEDR count {} does not match {} records plus {} groups",
+            parsed_header.declared_record_count,
+            record_count,
+            group_count
+        );
+    }
+    if source.metadata()?.len() != original_length {
+        bail!("installed master changed while it was being indexed");
+    }
+    Ok(InstalledMasterIndex {
+        masters: parsed_header.masters,
+        record_count,
+        matching_records,
+        unmappable_record_count,
+        unmappable_target_collisions,
+    })
+}
+
+fn case_insensitive_data_entries(
+    game_data_dir: &Path,
+) -> Result<BTreeMap<String, Vec<DataEntryCandidate>>> {
+    if !game_data_dir.is_dir() {
+        bail!("game Data directory is unavailable");
+    }
+    let mut entries = BTreeMap::<String, Vec<DataEntryCandidate>>::new();
+    for (index, entry) in fs::read_dir(game_data_dir)
+        .context("reading game Data directory")?
+        .enumerate()
+    {
+        if index >= MAX_ARCHIVE_ENTRIES {
+            bail!("game Data directory exceeds the bounded entry limit");
+        }
+        let entry = entry.context("reading a game Data directory entry")?;
+        let file_name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("game Data directory contains a non-Unicode name"))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading Data entry type for {file_name}"))?;
+        entries
+            .entry(file_name.to_ascii_lowercase())
+            .or_default()
+            .push(DataEntryCandidate {
+                file_name,
+                path: entry.path(),
+                regular_file: file_type.is_file(),
+                symlink: file_type.is_symlink(),
+            });
+    }
+    Ok(entries)
+}
+
+fn finish_worldspace_master_probe(
+    mut report: WorldspaceMasterProbeReport,
+) -> WorldspaceMasterProbeReport {
+    report.blockers.sort();
+    report.blockers.dedup();
+    report.warnings.sort();
+    report.warnings.dedup();
+    report.resolution_complete = report.blockers.is_empty()
+        && report.resolved_master_override_count == report.master_override_count;
+    report.status = if report.resolution_complete {
+        "complete-report-only"
+    } else {
+        "blocked"
+    }
+    .to_owned();
+    report
+}
+
+fn worldspace_master_probe_from_staged(
+    root: &Path,
+    plugin_set: &PluginSetReport,
+    game_data_dir: &Path,
+) -> WorldspaceMasterProbeReport {
+    let mut report = WorldspaceMasterProbeReport {
+        api: WORLDSPACE_MASTER_PROBE_API.to_owned(),
+        status: "blocked".to_owned(),
+        resolution_complete: false,
+        semantic_compatibility_claimed: false,
+        mutation_policy: "report-only".to_owned(),
+        plugin_path: None,
+        declared_master_count: 0,
+        found_master_count: 0,
+        parsed_master_count: 0,
+        master_override_count: 0,
+        resolved_master_override_count: 0,
+        unresolved_master_override_count: 0,
+        type_mismatch_override_count: 0,
+        deleted_master_override_count: 0,
+        masters: Vec::new(),
+        blockers: Vec::new(),
+        warnings: vec![
+            "This probe proves only installed-master identity and record-type resolution; it does not prove record semantics, load-order safety, or runtime compatibility."
+                .to_owned(),
+        ],
+    };
+
+    let paths = match bounded_tree_paths(root, |path| plugin_kind(path).is_some()) {
+        Ok(paths) => paths,
+        Err(_) => {
+            report.blockers.push("plugin-inventory-failed".to_owned());
+            return finish_worldspace_master_probe(report);
+        }
+    };
+    if paths.len() != 1 {
+        report.blockers.push(format!(
+            "requires-exactly-one-staged-plugin:found-{}",
+            paths.len()
+        ));
+        return finish_worldspace_master_probe(report);
+    }
+    let path = &paths[0];
+    let relative = normalize_relative(path.strip_prefix(root).unwrap_or(path));
+    report.plugin_path = Some(relative.clone());
+    let kind = plugin_kind(path).unwrap_or_default();
+    if kind != "esp" {
+        report
+            .blockers
+            .push("requires-one-full-esp-not-esm-or-esl".to_owned());
+    }
+    if !direct_game_data_plugin(&relative) {
+        report
+            .blockers
+            .push("esp-is-not-directly-under-content-dev-obvdata-data".to_owned());
+    }
+    report.blockers.extend(
+        plugin_set
+            .blockers
+            .iter()
+            .map(|blocker| format!("plugin-manifest:{blocker}")),
+    );
+    report.warnings.extend(plugin_set.warnings.iter().cloned());
+
+    let payload = match bounded_plugin_payload(path, &relative) {
+        Ok(payload) => payload,
+        Err(_) => {
+            report.blockers.push("staged-plugin-read-failed".to_owned());
+            return finish_worldspace_master_probe(report);
+        }
+    };
+    let plugin = match read_plugin_bytes(&payload, &relative) {
+        Ok(plugin) => plugin,
+        Err(_) => {
+            report
+                .blockers
+                .push("staged-plugin-parse-failed".to_owned());
+            return finish_worldspace_master_probe(report);
+        }
+    };
+    if plugin.header_flags & MASTER_FILE != 0 {
+        report
+            .blockers
+            .push("esp-header-declares-master-file".to_owned());
+    }
+    if plugin.header_flags & LIGHT_PLUGIN != 0 {
+        report
+            .blockers
+            .push("esp-header-declares-light-plugin".to_owned());
+    }
+    if !plugin
+        .records
+        .iter()
+        .any(|record| record_domain(&record.kind) == "worldspace-and-placement")
+    {
+        report
+            .blockers
+            .push("plugin-has-no-worldspace-or-placement-records".to_owned());
+    }
+    report.declared_master_count = plugin.masters.len();
+    if plugin.masters.is_empty() {
+        report
+            .blockers
+            .push("plugin-declares-no-masters".to_owned());
+    }
+    if plugin.masters.len() > u8::MAX as usize {
+        report
+            .blockers
+            .push("master-count-exceeds-full-plugin-index-space".to_owned());
+        return finish_worldspace_master_probe(report);
+    }
+    let mut declared_names = HashSet::new();
+    if plugin
+        .masters
+        .iter()
+        .any(|master| !declared_names.insert(master.to_ascii_lowercase()))
+    {
+        report
+            .blockers
+            .push("plugin-declares-duplicate-case-insensitive-master-names".to_owned());
+        return finish_worldspace_master_probe(report);
+    }
+
+    let mut overrides = Vec::new();
+    let mut wanted = BTreeSet::new();
+    for record in &plugin.records {
+        let source_index = (record.form_id >> 24) as usize;
+        if source_index < plugin.masters.len() {
+            let identity = match canonical_form_id("staged-plugin", &plugin.masters, record.form_id)
+            {
+                Ok(identity) => identity,
+                Err(_) => {
+                    report.blockers.push(format!(
+                        "staged-plugin-form-id-remap-failed:0x{:08X}",
+                        record.form_id
+                    ));
+                    continue;
+                }
+            };
+            wanted.insert(identity.clone());
+            overrides.push((record.form_id, record.kind.clone(), identity));
+            if record.flags & DELETED_RECORD != 0 {
+                report.deleted_master_override_count += 1;
+            }
+        } else if source_index > plugin.masters.len() {
+            report.blockers.push(format!(
+                "staged-plugin-record-index-out-of-range:0x{:08X}",
+                record.form_id
+            ));
+        }
+    }
+    report.master_override_count = overrides.len();
+    if report.deleted_master_override_count > 0 {
+        report.blockers.push(format!(
+            "deleted-master-overrides-require-dedicated-semantic-validation:found-{}",
+            report.deleted_master_override_count
+        ));
+    }
+
+    let data_entries = match case_insensitive_data_entries(game_data_dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            report
+                .blockers
+                .push("game-data-inventory-failed".to_owned());
+            return finish_worldspace_master_probe(report);
+        }
+    };
+    let mut indexes = Vec::<Option<InstalledMasterIndex>>::new();
+    for (master_index, declared_name) in plugin.masters.iter().enumerate() {
+        let mut master_report = InstalledMasterProbe {
+            declared_name: declared_name.clone(),
+            master_index,
+            found: false,
+            parsed: false,
+            installed_file_name: None,
+            own_master_count: 0,
+            indexed_record_count: 0,
+            matching_override_record_count: 0,
+            unmappable_record_count: 0,
+            unmappable_target_collision_count: 0,
+        };
+        let candidates = data_entries
+            .get(&declared_name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            report
+                .blockers
+                .push(format!("declared-master-missing:{declared_name}"));
+            report.masters.push(master_report);
+            indexes.push(None);
+            continue;
+        }
+        if candidates.len() != 1 {
+            report.blockers.push(format!(
+                "declared-master-case-insensitive-match-is-ambiguous:{declared_name}:found-{}",
+                candidates.len()
+            ));
+            report.masters.push(master_report);
+            indexes.push(None);
+            continue;
+        }
+        let candidate = &candidates[0];
+        master_report.installed_file_name = Some(candidate.file_name.clone());
+        if !candidate.regular_file || candidate.symlink {
+            report.blockers.push(format!(
+                "declared-master-is-not-a-direct-regular-file:{declared_name}"
+            ));
+            report.masters.push(master_report);
+            indexes.push(None);
+            continue;
+        }
+        master_report.found = true;
+        report.found_master_count += 1;
+        match index_installed_master(&candidate.path, declared_name, &wanted) {
+            Ok(index) => {
+                master_report.parsed = true;
+                master_report.own_master_count = index.masters.len();
+                master_report.indexed_record_count = index.record_count;
+                master_report.matching_override_record_count = index.matching_records.len();
+                master_report.unmappable_record_count = index.unmappable_record_count;
+                master_report.unmappable_target_collision_count =
+                    index.unmappable_target_collisions.len();
+                if index.unmappable_record_count > 0 {
+                    report.warnings.push(format!(
+                        "{declared_name}: skipped {} record(s) whose source index cannot be mapped by that master's own master list",
+                        index.unmappable_record_count
+                    ));
+                }
+                for form_id in &index.unmappable_target_collisions {
+                    report.blockers.push(format!(
+                        "installed-master-unmappable-record-collides-with-target-local-id:{declared_name}:0x{form_id:08X}"
+                    ));
+                }
+                for dependency in &index.masters {
+                    match plugin
+                        .masters
+                        .iter()
+                        .position(|master| master.eq_ignore_ascii_case(dependency))
+                    {
+                        Some(dependency_index) if dependency_index < master_index => {}
+                        Some(dependency_index) => report.blockers.push(format!(
+                            "installed-master-dependency-is-not-earlier-in-esp-declared-order:{declared_name}:{dependency}:index-{dependency_index}"
+                        )),
+                        None => report.blockers.push(format!(
+                            "installed-master-dependency-is-absent-from-esp-declared-master-list:{declared_name}:{dependency}"
+                        )),
+                    }
+                }
+                report.parsed_master_count += 1;
+                indexes.push(Some(index));
+            }
+            Err(_) => {
+                report
+                    .blockers
+                    .push(format!("declared-master-parse-failed:{declared_name}"));
+                indexes.push(None);
+            }
+        }
+        report.masters.push(master_report);
+    }
+
+    let mut effective_records = BTreeMap::<CanonicalFormId, IndexedMasterRecord>::new();
+    for index in indexes.iter().flatten() {
+        for (identity, record) in &index.matching_records {
+            effective_records.insert(identity.clone(), record.clone());
+        }
+    }
+    for (form_id, expected_kind, identity) in overrides {
+        match effective_records.get(&identity) {
+            Some(record) if record.kind == expected_kind => {
+                report.resolved_master_override_count += 1;
+            }
+            Some(record) => {
+                report.type_mismatch_override_count += 1;
+                report.blockers.push(format!(
+                    "master-override-type-mismatch:0x{form_id:08X}:expected-{expected_kind}:found-{}:provider-{}",
+                    record.kind, record.provider
+                ));
+            }
+            None => {
+                report.unresolved_master_override_count += 1;
+                report.blockers.push(format!(
+                    "master-override-target-unresolved:0x{form_id:08X}:{expected_kind}:origin-{}",
+                    identity.origin
+                ));
+            }
+        }
+    }
+    finish_worldspace_master_probe(report)
+}
+
+pub fn inspect_worldspace_master_probe_input(
+    input: &Path,
+    candidate_root: Option<&str>,
+    game_data_dir: &Path,
+) -> Result<(PluginSetReport, WorldspaceMasterProbeReport)> {
+    let (_staged, root, scan_mode) = inspect_staged_plugin_input(input, candidate_root)?;
+    let mut plugin_set = inspect_plugin_set(&root)?;
+    plugin_set.scan_mode = scan_mode.to_owned();
+    let probe = worldspace_master_probe_from_staged(&root, &plugin_set, game_data_dir);
+    Ok((plugin_set, probe))
 }
 
 fn additive_contract_from_staged(
@@ -1056,6 +1877,40 @@ mod tests {
         plugin_bytes_with_flags(masters, records, next_object_id, 0)
     }
 
+    fn plugin_bytes_with_record_flags(
+        masters: &[&str],
+        records: &[(&str, u32, u32)],
+        next_object_id: u32,
+    ) -> Vec<u8> {
+        let mut header_data = Vec::new();
+        let mut hedr = 1.0_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        hedr.extend_from_slice(&next_object_id.to_le_bytes());
+        header_data.extend(subrecord("HEDR", &hedr));
+        for master in masters {
+            let mut name = master.as_bytes().to_vec();
+            name.push(0);
+            header_data.extend(subrecord("MAST", &name));
+            header_data.extend(subrecord("DATA", &[0; 8]));
+        }
+        let mut bytes = b"TES4".to_vec();
+        bytes.extend_from_slice(&(header_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&header_data);
+        for (kind, form_id, flags) in records {
+            let data = subrecord("EDID", b"Fixture\0");
+            bytes.extend_from_slice(kind.as_bytes());
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&flags.to_le_bytes());
+            bytes.extend_from_slice(&form_id.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+            bytes.extend_from_slice(&data);
+        }
+        bytes
+    }
+
     fn grouped_plugin_bytes(
         masters: &[&str],
         groups: &[(&str, &[(&str, u32)])],
@@ -1107,6 +1962,23 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn assert_unrecognized_duplicate(root: &Path, expected_logical_count: usize) {
+        let report = inspect_plugin_set(root).unwrap();
+        assert_eq!(report.logical_plugin_count, expected_logical_count);
+        assert!(report.plugin_mirrors.is_empty());
+        assert!(
+            report
+                .blockers
+                .contains(&"case-insensitive-plugin-filename-collision".to_owned())
+        );
+        assert!(
+            report
+                .additive_syncmap_v1
+                .blockers
+                .contains(&"case-insensitive-plugin-filename-collision".to_owned())
+        );
+    }
+
     #[test]
     fn accepts_only_the_proven_single_esp_shape_for_mutation() {
         let temp = tempfile::tempdir().unwrap();
@@ -1120,6 +1992,207 @@ mod tests {
         assert_eq!(report.status, "complete");
         assert!(report.additive_syncmap_v1.compatible);
         assert_eq!(report.artifacts[0].plugin_owned_record_count, 1);
+    }
+
+    #[test]
+    fn collapses_exact_path_bound_syncmap_esp_mirror_for_dependency_and_policy_analysis() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = plugin_bytes(
+            &["Oblivion.esm"],
+            &[("CELL", 0x0000_1234), ("WEAP", 0x0100_0800)],
+            0x801,
+        );
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Muramasa.esp",
+            &payload,
+        );
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Muramasa.esp",
+            &payload,
+        );
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Muramasa.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Muramasa.Muramasa",
+        );
+
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        assert_eq!(report.status, "complete");
+        assert_eq!(report.plugin_count, 2);
+        assert_eq!(report.logical_plugin_count, 1);
+        assert_eq!(report.parsed_plugin_count, 2);
+        assert_eq!(report.artifacts.len(), 2);
+        assert_eq!(report.plugin_mirrors.len(), 1);
+        assert_eq!(
+            report.plugin_mirrors[0].canonical_relative_path,
+            "Content/Dev/ObvData/Data/Muramasa.esp"
+        );
+        assert_eq!(
+            report.plugin_mirrors[0].mirror_relative_path,
+            "Content/Dev/ObvData/Data/SyncMap/Muramasa.esp"
+        );
+        assert_eq!(
+            report.plugin_mirrors[0].sync_map_relative_path,
+            "Content/Dev/ObvData/Data/SyncMap/Muramasa.ini"
+        );
+        assert_eq!(report.dependency_edges.len(), 1);
+        assert!(
+            !report
+                .blockers
+                .contains(&"case-insensitive-plugin-filename-collision".to_owned())
+        );
+        assert!(
+            report
+                .additive_syncmap_v1
+                .blockers
+                .contains(&"master-overrides-outside-cont-are-unsupported".to_owned())
+        );
+        assert!(
+            !report
+                .additive_syncmap_v1
+                .blockers
+                .contains(&"requires-exactly-one-plugin".to_owned())
+        );
+        assert!(
+            !report
+                .additive_syncmap_v1
+                .blockers
+                .contains(&"case-insensitive-plugin-filename-collision".to_owned())
+        );
+    }
+
+    #[test]
+    fn exact_syncmap_esp_mirror_can_enter_the_single_logical_plugin_policy_lane() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = plugin_bytes(&["Oblivion.esm"], &[("STAT", 0x0100_0800)], 0x801);
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &payload,
+        );
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.esp",
+            &payload,
+        );
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Fixture.Fixture",
+        );
+
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        assert_eq!(report.plugin_count, 2);
+        assert_eq!(report.logical_plugin_count, 1);
+        assert!(report.additive_syncmap_v1.compatible);
+    }
+
+    #[test]
+    fn leaves_every_non_exact_plugin_duplicate_as_a_collision() {
+        let original = plugin_bytes(&["Oblivion.esm"], &[("STAT", 0x0100_0800)], 0x801);
+        let changed = plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801);
+
+        let different_bytes = tempfile::tempdir().unwrap();
+        write_plugin(
+            different_bytes.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &original,
+        );
+        write_plugin(
+            different_bytes.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.esp",
+            &changed,
+        );
+        write_plugin(
+            different_bytes.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Fixture.Fixture",
+        );
+        assert_unrecognized_duplicate(different_bytes.path(), 2);
+
+        let missing_ini = tempfile::tempdir().unwrap();
+        write_plugin(
+            missing_ini.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &original,
+        );
+        write_plugin(
+            missing_ini.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.esp",
+            &original,
+        );
+        assert_unrecognized_duplicate(missing_ini.path(), 2);
+
+        let wrong_path = tempfile::tempdir().unwrap();
+        write_plugin(
+            wrong_path.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &original,
+        );
+        write_plugin(
+            wrong_path.path(),
+            r"Content\Dev\ObvData\Data\Other\Fixture.esp",
+            &original,
+        );
+        write_plugin(
+            wrong_path.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Fixture.Fixture",
+        );
+        assert_unrecognized_duplicate(wrong_path.path(), 2);
+
+        let wrong_root = tempfile::tempdir().unwrap();
+        write_plugin(
+            wrong_root.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &original,
+        );
+        write_plugin(
+            wrong_root.path(),
+            r"Other\Content\Dev\ObvData\Data\SyncMap\Fixture.esp",
+            &original,
+        );
+        write_plugin(
+            wrong_root.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Fixture.Fixture",
+        );
+        assert_unrecognized_duplicate(wrong_root.path(), 2);
+
+        let extra_copy = tempfile::tempdir().unwrap();
+        for relative in [
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.esp",
+            r"Other\Fixture.esp",
+        ] {
+            write_plugin(extra_copy.path(), relative, &original);
+        }
+        write_plugin(
+            extra_copy.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Fixture.Fixture",
+        );
+        assert_unrecognized_duplicate(extra_copy.path(), 3);
+
+        let esm_pair = tempfile::tempdir().unwrap();
+        write_plugin(
+            esm_pair.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esm",
+            &original,
+        );
+        write_plugin(
+            esm_pair.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.esm",
+            &original,
+        );
+        write_plugin(
+            esm_pair.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Fixture.Fixture",
+        );
+        assert_unrecognized_duplicate(esm_pair.path(), 2);
     }
 
     #[test]
@@ -1189,6 +2262,12 @@ mod tests {
         ));
         assert!(direct_sync_map_ini(
             "Content/Dev/ObvData/Data/SyncMap/Fixture.ini"
+        ));
+        assert!(direct_sync_map_plugin(
+            "Content/Dev/ObvData/Data/SyncMap/Fixture.esp"
+        ));
+        assert!(!direct_sync_map_plugin(
+            "Other/Content/Dev/ObvData/Data/SyncMap/Fixture.esp"
         ));
         assert!(!direct_sync_map_ini("Other/SyncMap/Fixture.ini"));
         assert!(!direct_sync_map_ini(
@@ -1318,5 +2397,157 @@ mod tests {
         );
         assert_eq!(selected_bytes, 4);
         assert!(!destination.join("second.ini").exists());
+    }
+
+    #[test]
+    fn worldspace_probe_resolves_multi_master_form_ids_in_load_order() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let base_records = [("CELL", 0x0000_1234)];
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\WorldFixture.esp",
+            &plugin_bytes(
+                &["base.esm", "PATCH.ESP"],
+                &[
+                    ("CELL", 0x0000_1234),
+                    ("WRLD", 0x0100_2000),
+                    ("REFR", 0x0200_0800),
+                ],
+                0x801,
+            ),
+        );
+        write_plugin(
+            data.path(),
+            "BASE.ESM",
+            &grouped_plugin_bytes(&[], &[("CELL", &base_records)], 0x1235, 2),
+        );
+        write_plugin(
+            data.path(),
+            "patch.esp",
+            &plugin_bytes(
+                &["Base.esm"],
+                &[("CELL", 0x0000_1234), ("WRLD", 0x0100_2000)],
+                0x2001,
+            ),
+        );
+
+        let (_plugins, probe) =
+            inspect_worldspace_master_probe_input(staged.path(), None, data.path()).unwrap();
+        assert_eq!(probe.api, WORLDSPACE_MASTER_PROBE_API);
+        assert_eq!(probe.status, "complete-report-only");
+        assert!(probe.resolution_complete);
+        assert!(!probe.semantic_compatibility_claimed);
+        assert_eq!(probe.mutation_policy, "report-only");
+        assert_eq!(probe.declared_master_count, 2);
+        assert_eq!(probe.found_master_count, 2);
+        assert_eq!(probe.parsed_master_count, 2);
+        assert_eq!(probe.master_override_count, 2);
+        assert_eq!(probe.resolved_master_override_count, 2);
+        assert_eq!(probe.unresolved_master_override_count, 0);
+        assert_eq!(probe.type_mismatch_override_count, 0);
+        assert_eq!(probe.deleted_master_override_count, 0);
+        assert!(probe.blockers.is_empty());
+    }
+
+    #[test]
+    fn worldspace_probe_uses_latest_master_override_and_blocks_type_mismatch() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\WorldFixture.esp",
+            &plugin_bytes(
+                &["Base.esm", "Patch.esp"],
+                &[("CELL", 0x0000_1234), ("REFR", 0x0200_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            data.path(),
+            "Base.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_1234)], 0x1235),
+        );
+        write_plugin(
+            data.path(),
+            "Patch.esp",
+            &plugin_bytes(&["Base.esm"], &[("WRLD", 0x0000_1234)], 0x800),
+        );
+
+        let (_plugins, probe) =
+            inspect_worldspace_master_probe_input(staged.path(), None, data.path()).unwrap();
+        assert!(!probe.resolution_complete);
+        assert_eq!(probe.master_override_count, 1);
+        assert_eq!(probe.resolved_master_override_count, 0);
+        assert_eq!(probe.type_mismatch_override_count, 1);
+        assert!(probe.blockers.iter().any(|blocker| {
+            blocker.contains(
+                "master-override-type-mismatch:0x00001234:expected-CELL:found-WRLD:provider-Patch.esp",
+            )
+        }));
+    }
+
+    #[test]
+    fn worldspace_probe_reports_missing_master_and_deleted_override() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\WorldFixture.esp",
+            &plugin_bytes_with_record_flags(
+                &["Missing.esm"],
+                &[("CELL", 0x0000_1234, DELETED_RECORD)],
+                0x800,
+            ),
+        );
+
+        let (_plugins, probe) =
+            inspect_worldspace_master_probe_input(staged.path(), None, data.path()).unwrap();
+        assert!(!probe.resolution_complete);
+        assert_eq!(probe.found_master_count, 0);
+        assert_eq!(probe.parsed_master_count, 0);
+        assert_eq!(probe.master_override_count, 1);
+        assert_eq!(probe.deleted_master_override_count, 1);
+        assert_eq!(probe.unresolved_master_override_count, 1);
+        assert!(
+            probe
+                .blockers
+                .contains(&"declared-master-missing:Missing.esm".to_owned())
+        );
+        assert!(probe.blockers.iter().any(|blocker| {
+            blocker == "deleted-master-overrides-require-dedicated-semantic-validation:found-1"
+        }));
+    }
+
+    #[test]
+    fn worldspace_probe_blocks_unmappable_installed_target_collision() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\WorldFixture.esp",
+            &plugin_bytes(
+                &["Base.esm"],
+                &[("CELL", 0x0000_1234), ("REFR", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            data.path(),
+            "Base.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_1234), ("WRLD", 0x0100_1234)], 0x1235),
+        );
+
+        let (_plugins, probe) =
+            inspect_worldspace_master_probe_input(staged.path(), None, data.path()).unwrap();
+        assert!(!probe.resolution_complete);
+        assert_eq!(probe.parsed_master_count, 1);
+        assert_eq!(probe.resolved_master_override_count, 1);
+        assert_eq!(probe.masters[0].unmappable_record_count, 1);
+        assert_eq!(probe.masters[0].unmappable_target_collision_count, 1);
+        assert!(probe.blockers.iter().any(|blocker| {
+            blocker
+                == "installed-master-unmappable-record-collides-with-target-local-id:Base.esm:0x01001234"
+        }));
     }
 }

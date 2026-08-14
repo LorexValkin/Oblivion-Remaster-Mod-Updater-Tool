@@ -24,6 +24,23 @@ $ReleaseNotesPath = Join-Path $RepoRoot "docs\NEXUS-$Version-BETA.md"
 $ReleaseTarget = Join-Path $RepoRoot ".tmp\release-target-$Version"
 $ReleaseBin = Join-Path $ReleaseTarget "release"
 
+function Get-SafeRelativePath {
+    param(
+        [Parameter(Mandatory = $true)][string] $BasePath,
+        [Parameter(Mandatory = $true)][string] $TargetPath
+    )
+    $BaseFull = [IO.Path]::GetFullPath($BasePath).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar
+    )
+    $TargetFull = [IO.Path]::GetFullPath($TargetPath)
+    $Prefix = $BaseFull + [IO.Path]::DirectorySeparatorChar
+    if (-not $TargetFull.StartsWith($Prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Release file is outside the staging root: $TargetFull"
+    }
+    return $TargetFull.Substring($Prefix.Length)
+}
+
 if (-not (Test-Path -LiteralPath $ReleaseNotesPath -PathType Leaf)) {
     throw "Version-specific release notes missing: $ReleaseNotesPath"
 }
@@ -116,13 +133,15 @@ $SensitiveTokens = @(
     [pscustomobject]@{ Label = "Git author email"; Value = (git config user.email 2>$null) },
     [pscustomobject]@{ Label = "Git remote URL"; Value = (git config --get remote.origin.url 2>$null) }
 ) | Where-Object {
-    -not [string]::IsNullOrWhiteSpace($_.Value) -and
-    $_.Value.Length -ge 6 -and
-    -not $_.Value.Equals("Lorex_", [StringComparison]::OrdinalIgnoreCase)
+    $TokenValue = [string]$_.Value
+    -not [string]::IsNullOrWhiteSpace($TokenValue) -and
+    $TokenValue.Length -ge 6 -and
+    -not [string]::Equals($TokenValue, "Lorex_", [StringComparison]::OrdinalIgnoreCase)
 }
 foreach ($File in Get-ChildItem -LiteralPath $StageRoot -File -Recurse) {
     $Bytes = [IO.File]::ReadAllBytes($File.FullName)
-    $SingleByteText = [Text.Encoding]::Latin1.GetString($Bytes)
+    # Encoding.Latin1 is unavailable in Windows PowerShell's older .NET runtime.
+    $SingleByteText = [Text.Encoding]::GetEncoding(28591).GetString($Bytes)
     $WideText = [Text.Encoding]::Unicode.GetString($Bytes)
     foreach ($Token in $SensitiveTokens) {
         $SingleByteMatch = $SingleByteText.IndexOf(
@@ -134,7 +153,7 @@ foreach ($File in Get-ChildItem -LiteralPath $StageRoot -File -Recurse) {
             [StringComparison]::OrdinalIgnoreCase
         ) -ge 0
         if ($SingleByteMatch -or $WideMatch) {
-            $Relative = [IO.Path]::GetRelativePath($StageRoot, $File.FullName)
+            $Relative = Get-SafeRelativePath -BasePath $StageRoot -TargetPath $File.FullName
             throw "Release privacy gate failed: $Relative contains $($Token.Label)"
         }
     }
@@ -144,7 +163,7 @@ $Files = Get-ChildItem -LiteralPath $StageRoot -File -Recurse |
     Sort-Object FullName |
     ForEach-Object {
         [ordered]@{
-            path = [IO.Path]::GetRelativePath($StageRoot, $_.FullName).Replace("\", "/")
+            path = (Get-SafeRelativePath -BasePath $StageRoot -TargetPath $_.FullName).Replace("\", "/")
             bytes = $_.Length
             sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         }

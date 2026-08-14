@@ -7,6 +7,7 @@ use std::fs;
 use std::path::Path;
 
 pub const DEPENDENCY_TRACE_API: &str = "zen-dependency-trace-v1";
+pub const DEPENDENCY_DIAGNOSTIC_API: &str = "zen-dependency-diagnostic-v1";
 pub const EXACT_DEPENDENCY_EXTRACTION_API: &str = "zen-exact-dependency-extraction-v1";
 pub const DEPENDENCY_PRESERVATION_API: &str = "zen-dependency-preservation-v1";
 
@@ -40,6 +41,30 @@ pub struct DependencyTrace {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UnresolvedDependencyEdgeTrace {
+    pub source_package_id: u64,
+    pub source_package_path: String,
+    pub missing_dependency_package_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DependencyDiagnosticReport {
+    pub api: String,
+    pub bundled_package_count: usize,
+    pub current_game_package_count: usize,
+    pub dependency_edge_count: usize,
+    pub resolved_edge_count: usize,
+    pub unresolved_edge_count: usize,
+    pub bundled_edge_count: usize,
+    pub current_game_edge_count: usize,
+    pub fully_resolved: bool,
+    pub resolved_edges: Vec<DependencyEdgeTrace>,
+    pub unresolved_edges: Vec<UnresolvedDependencyEdgeTrace>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExactExtractionReport {
     pub api: String,
     pub package_count: usize,
@@ -55,11 +80,36 @@ pub struct DependencyPreservationReport {
     pub preserved: bool,
 }
 
-fn normalized_package_path(path: &str) -> String {
-    path.replace('\\', "/")
-        .trim_start_matches("../")
-        .trim_start_matches("./")
-        .to_ascii_lowercase()
+fn normalized_package_path(path: &str) -> Result<String> {
+    if path.is_empty() || path.contains('\0') || path.contains(':') {
+        bail!("package path is empty or unsafe: {path}");
+    }
+    let replaced = path.replace('\\', "/");
+    if replaced.starts_with('/') {
+        bail!("package path is absolute: {path}");
+    }
+    let mut parts = Vec::new();
+    let mut leading_parent_count = 0_usize;
+    for part in replaced.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            if !parts.is_empty() {
+                bail!("package path traverses after its logical root: {path}");
+            }
+            leading_parent_count += 1;
+            if leading_parent_count > 3 {
+                bail!("package path exceeds the bounded Retoc mount prefix: {path}");
+            }
+            continue;
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        bail!("package path is empty after normalization: {path}");
+    }
+    Ok(parts.join("/").to_ascii_lowercase())
 }
 
 fn index_package_store<'a>(
@@ -72,7 +122,7 @@ fn index_package_store<'a>(
         if by_id.insert(entry.package_id, entry).is_some() {
             bail!("{label} repeats package ID {}", entry.package_id);
         }
-        let path = normalized_package_path(&entry.path);
+        let path = normalized_package_path(&entry.path)?;
         if !paths.insert(path) {
             bail!("{label} repeats package path {}", entry.path);
         }
@@ -84,50 +134,98 @@ pub fn trace_package_dependencies(
     source: &[PackageStoreEntry],
     current_game: &[PackageStoreEntry],
 ) -> Result<DependencyTrace> {
+    let diagnostic = diagnose_package_dependencies(source, current_game)?;
+    if let Some(unresolved) = diagnostic.unresolved_edges.first() {
+        bail!(
+            "package {} ({}) has unresolved dependency {} in both the bundled mod and current game",
+            unresolved.source_package_path,
+            unresolved.source_package_id,
+            unresolved.missing_dependency_package_id
+        );
+    }
+    Ok(DependencyTrace {
+        api: DEPENDENCY_TRACE_API.to_owned(),
+        source_package_count: diagnostic.bundled_package_count,
+        dependency_edge_count: diagnostic.resolved_edge_count,
+        bundled_edge_count: diagnostic.bundled_edge_count,
+        current_game_edge_count: diagnostic.current_game_edge_count,
+        edges: diagnostic.resolved_edges,
+    })
+}
+
+pub fn diagnose_package_dependencies(
+    source: &[PackageStoreEntry],
+    current_game: &[PackageStoreEntry],
+) -> Result<DependencyDiagnosticReport> {
     let source_by_id = index_package_store(source, "source dependency graph")?;
     let current_by_id = index_package_store(current_game, "current-game dependency graph")?;
-    let mut edges = Vec::new();
+    let mut resolved_edges = Vec::new();
+    let mut unresolved_edges = Vec::new();
     for package in source {
         for dependency in &package.imported_package_ids {
-            let (target, origin) = if let Some(target) = source_by_id.get(dependency) {
-                (*target, DependencyOrigin::BundledMod)
-            } else if let Some(target) = current_by_id.get(dependency) {
-                (*target, DependencyOrigin::CurrentGame)
+            let resolved = source_by_id
+                .get(dependency)
+                .map(|target| (*target, DependencyOrigin::BundledMod))
+                .or_else(|| {
+                    current_by_id
+                        .get(dependency)
+                        .map(|target| (*target, DependencyOrigin::CurrentGame))
+                });
+            if let Some((target, origin)) = resolved {
+                resolved_edges.push(DependencyEdgeTrace {
+                    source_package_id: package.package_id,
+                    source_package_path: package.path.clone(),
+                    dependency_package_id: *dependency,
+                    dependency_package_path: target.path.clone(),
+                    origin,
+                });
             } else {
-                bail!(
-                    "package {} ({}) has unresolved dependency {} in both the bundled mod and current game",
-                    package.path,
-                    package.package_id,
-                    dependency
-                );
-            };
-            edges.push(DependencyEdgeTrace {
-                source_package_id: package.package_id,
-                source_package_path: package.path.clone(),
-                dependency_package_id: *dependency,
-                dependency_package_path: target.path.clone(),
-                origin,
-            });
+                unresolved_edges.push(UnresolvedDependencyEdgeTrace {
+                    source_package_id: package.package_id,
+                    source_package_path: package.path.clone(),
+                    missing_dependency_package_id: *dependency,
+                });
+            }
         }
     }
-    edges.sort_by(|left, right| {
+    resolved_edges.sort_by(|left, right| {
         left.source_package_id
             .cmp(&right.source_package_id)
             .then(left.dependency_package_id.cmp(&right.dependency_package_id))
             .then(left.source_package_path.cmp(&right.source_package_path))
+            .then(
+                left.dependency_package_path
+                    .cmp(&right.dependency_package_path),
+            )
     });
-    let bundled_edge_count = edges
+    unresolved_edges.sort_by(|left, right| {
+        left.source_package_id
+            .cmp(&right.source_package_id)
+            .then(
+                left.missing_dependency_package_id
+                    .cmp(&right.missing_dependency_package_id),
+            )
+            .then(left.source_package_path.cmp(&right.source_package_path))
+    });
+    let bundled_edge_count = resolved_edges
         .iter()
         .filter(|edge| edge.origin == DependencyOrigin::BundledMod)
         .count();
-    let current_game_edge_count = edges.len() - bundled_edge_count;
-    Ok(DependencyTrace {
-        api: DEPENDENCY_TRACE_API.to_owned(),
-        source_package_count: source.len(),
-        dependency_edge_count: edges.len(),
+    let current_game_edge_count = resolved_edges.len() - bundled_edge_count;
+    let resolved_edge_count = resolved_edges.len();
+    let unresolved_edge_count = unresolved_edges.len();
+    Ok(DependencyDiagnosticReport {
+        api: DEPENDENCY_DIAGNOSTIC_API.to_owned(),
+        bundled_package_count: source.len(),
+        current_game_package_count: current_game.len(),
+        dependency_edge_count: resolved_edge_count + unresolved_edge_count,
+        resolved_edge_count,
+        unresolved_edge_count,
         bundled_edge_count,
         current_game_edge_count,
-        edges,
+        fully_resolved: unresolved_edges.is_empty(),
+        resolved_edges,
+        unresolved_edges,
     })
 }
 
@@ -222,8 +320,8 @@ pub fn verify_dependency_preservation(
     for package_id in source_ids {
         let source_package = source_by_id[&package_id];
         let rebuilt_package = rebuilt_by_id[&package_id];
-        if normalized_package_path(&source_package.path)
-            != normalized_package_path(&rebuilt_package.path)
+        if normalized_package_path(&source_package.path)?
+            != normalized_package_path(&rebuilt_package.path)?
         {
             bail!(
                 "rebuilt package path changed for ID {package_id}: source {}, rebuilt {}",
@@ -294,6 +392,121 @@ mod tests {
         assert_eq!(trace.dependency_edge_count, 3);
         assert_eq!(trace.bundled_edge_count, 1);
         assert_eq!(trace.current_game_edge_count, 2);
+    }
+
+    #[test]
+    fn diagnoses_every_dependency_edge_deterministically() {
+        let source = vec![
+            package(20, "../../../Content/Forms/B.uasset", &[99, 30]),
+            package(10, "../../../Content/Forms/A.uasset", &[98, 30, 20]),
+        ];
+        let current = vec![package(
+            30,
+            "../../../OblivionRemastered/Content/Materials/M_A.uasset",
+            &[],
+        )];
+
+        let report = diagnose_package_dependencies(&source, &current).unwrap();
+
+        assert_eq!(report.api, DEPENDENCY_DIAGNOSTIC_API);
+        assert_eq!(report.bundled_package_count, 2);
+        assert_eq!(report.current_game_package_count, 1);
+        assert_eq!(report.dependency_edge_count, 5);
+        assert_eq!(report.resolved_edge_count, 3);
+        assert_eq!(report.unresolved_edge_count, 2);
+        assert_eq!(report.bundled_edge_count, 1);
+        assert_eq!(report.current_game_edge_count, 2);
+        assert!(!report.fully_resolved);
+        assert_eq!(
+            report
+                .resolved_edges
+                .iter()
+                .map(|edge| (
+                    edge.source_package_id,
+                    edge.dependency_package_id,
+                    &edge.origin
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (10, 20, &DependencyOrigin::BundledMod),
+                (10, 30, &DependencyOrigin::CurrentGame),
+                (20, 30, &DependencyOrigin::CurrentGame),
+            ]
+        );
+        assert_eq!(
+            report
+                .unresolved_edges
+                .iter()
+                .map(|edge| (
+                    edge.source_package_id,
+                    edge.missing_dependency_package_id,
+                    edge.source_package_path.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (10, 98, "../../../Content/Forms/A.uasset"),
+                (20, 99, "../../../Content/Forms/B.uasset"),
+            ]
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["api"], DEPENDENCY_DIAGNOSTIC_API);
+        assert_eq!(json["unresolvedEdges"][0]["missingDependencyPackageId"], 98);
+
+        let reordered = diagnose_package_dependencies(
+            &[
+                package(10, "../../../Content/Forms/A.uasset", &[20, 30, 98]),
+                package(20, "../../../Content/Forms/B.uasset", &[30, 99]),
+            ],
+            &current,
+        )
+        .unwrap();
+        assert_eq!(report, reordered);
+    }
+
+    #[test]
+    fn dependency_diagnostic_fails_closed_on_duplicate_graph_entries() {
+        let duplicate_id = diagnose_package_dependencies(
+            &[
+                package(10, "../../../Content/Forms/A.uasset", &[]),
+                package(10, "../../../Content/Forms/B.uasset", &[]),
+            ],
+            &[],
+        )
+        .unwrap_err();
+        assert!(duplicate_id.to_string().contains("repeats package ID 10"));
+
+        let duplicate_path = diagnose_package_dependencies(
+            &[],
+            &[
+                package(
+                    20,
+                    "../../../OblivionRemastered/Content/Materials/M_A.uasset",
+                    &[],
+                ),
+                package(
+                    30,
+                    "..\\..\\..\\oblivionremastered\\content\\materials\\m_a.uasset",
+                    &[],
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(duplicate_path.to_string().contains("repeats package path"));
+    }
+
+    #[test]
+    fn dependency_diagnostic_rejects_unsafe_package_paths() {
+        for path in [
+            "../../../Content/Forms/../Unsafe.uasset",
+            "../../../../Content/Forms/Unsafe.uasset",
+            "/Content/Forms/Unsafe.uasset",
+            "C:/Content/Forms/Unsafe.uasset",
+        ] {
+            assert!(
+                diagnose_package_dependencies(&[package(10, path, &[])], &[]).is_err(),
+                "unsafe package path was accepted: {path}"
+            );
+        }
     }
 
     #[test]

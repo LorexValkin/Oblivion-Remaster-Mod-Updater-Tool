@@ -42,19 +42,33 @@ export component AppWindow inherits Window {
     in-out property <string> live-warning: "";
     in-out property <bool> update-running: false;
     in-out property <bool> update-complete: false;
+    in-out property <bool> install-running: false;
+    in-out property <bool> install-complete: false;
+    in-out property <bool> install-available: false;
+    in-out property <bool> install-prompt-visible: false;
+    in-out property <string> install-target-path: "";
     in-out property <bool> experimental-notice-visible: true;
     in-out property <bool> modlist-warning-visible: false;
     in-out property <bool> modlist-risk-accepted: false;
 
     out property <bool> can-copy-log: root.log-text != "";
-    out property <bool> can-open-output: root.update-complete;
+    out property <bool> can-open-output: root.update-complete && !root.install-running;
+    out property <bool> can-install-output: root.install-available
+        && root.update-complete
+        && !root.update-running
+        && !root.install-running
+        && !root.install-complete;
     out property <bool> can-open-report: root.last-report-path != "";
     out property <bool> can-update: !root.update-running
+        && !root.install-running
+        && !root.install-prompt-visible
         && !root.experimental-notice-visible
         && root.mod-path != ""
         && root.game-valid
         && root.output-path != "";
     out property <bool> can-fix-modlist: !root.update-running
+        && !root.install-running
+        && !root.install-prompt-visible
         && !root.experimental-notice-visible
         && !root.modlist-warning-visible
         && root.game-valid
@@ -71,6 +85,7 @@ export component AppWindow inherits Window {
     callback copy-log();
     callback open-kofi();
     callback open-output();
+    callback install-output();
     callback open-report();
     callback update-mod();
     callback fix-modlist();
@@ -565,6 +580,13 @@ export component AppWindow inherits Window {
                             enabled: root.can-open-output;
                             clicked => { root.open-output(); }
                         }
+
+                        PrimaryButton {
+                            text: root.install-complete ? "Installed" : "Install to game";
+                            width: 132px;
+                            enabled: root.can-install-output;
+                            clicked => { root.install-prompt-visible = true; }
+                        }
                     }
                 }
             }
@@ -630,8 +652,99 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.modlist-warning-visible : Rectangle {
+    if root.install-prompt-visible : Rectangle {
         z: 110;
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: #c0000000;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            x: max(16px, (parent.width - self.width) / 2);
+            y: max(16px, (parent.height - self.height) / 2);
+            width: min(600px, parent.width - 32px);
+            height: min(360px, parent.height - 32px);
+            background: Theme.surface;
+            border-color: Theme.warning-border;
+            border-width: 2px;
+            border-radius: 8px;
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 14px;
+
+                Text {
+                    text: "Install the converted mod?";
+                    color: Theme.text-primary;
+                    font-size: 22px;
+                    font-weight: 700;
+                }
+
+                Rectangle {
+                    height: 52px;
+                    vertical-stretch: 0;
+                    background: Theme.warning-surface;
+                    border-color: Theme.warning-border;
+                    border-width: 1px;
+                    border-radius: 6px;
+
+                    Text {
+                        x: 16px;
+                        width: parent.width - 32px;
+                        text: "CLOSE OBLIVION REMASTERED BEFORE INSTALLING";
+                        color: Theme.warning;
+                        font-size: 14px;
+                        font-weight: 750;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Text {
+                    vertical-stretch: 1;
+                    text: "The conversion completed successfully and its output folder is ready. Choose Yes to copy that confirmed candidate into the selected game. Existing files at the same mod destinations will be backed up beside the output.";
+                    color: Theme.text-secondary;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: "Install target:\n" + root.install-target-path;
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    height: 44px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+
+                    Button {
+                        horizontal-stretch: 1;
+                        text: "No";
+                        clicked => { root.install-prompt-visible = false; }
+                    }
+
+                    PrimaryButton {
+                        horizontal-stretch: 1;
+                        text: "Yes, install";
+                        clicked => { root.install-output(); }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.modlist-warning-visible : Rectangle {
+        z: 120;
         x: 0px;
         y: 0px;
         width: root.width;

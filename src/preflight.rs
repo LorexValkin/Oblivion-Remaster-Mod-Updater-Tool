@@ -5,27 +5,45 @@ use crate::archive::{
 use crate::dependencies::{
     DependencyCandidate, DependencyKind, installed_state, scan_dependencies,
 };
+use crate::dependency_layers::{
+    LAYERED_IOSTORE_DEPENDENCY_API, LayeredIoStoreDependencyReport,
+    probe_layered_iostore_dependencies,
+};
 use crate::game::{normalize_install_root, validate_game_install};
+use crate::install_plan::{
+    InstallPlan, LOGICAL_INSTALL_PUBLICATION_API, logical_install_adapter_id,
+    resolve_staged_install_view, supports_logical_install_publication,
+};
+use crate::mixed::{
+    MIXED_IOSTORE_DEPENDENCY_PROBE_API, MixedIoStoreDependencyReport,
+    probe_mixed_iostore_dependencies,
+};
 use crate::plugin::{
     ADDITIVE_CONTRACT_API, AdditiveContractReport, PLUGIN_MANIFEST_API, PluginSetReport,
-    inspect_additive_contract_input, inspect_plugin_input_at_root,
+    WORLDSPACE_MASTER_PROBE_API, WorldspaceMasterProbeReport, inspect_additive_contract_input,
+    inspect_plugin_input_at_root, inspect_worldspace_master_probe_input,
 };
 use crate::replacement::{
-    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER,
-    ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER, probe_additive_static_mesh_input,
-    probe_input, probe_mixed_armor_input, probe_texture_input,
+    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, HETEROGENEOUS_REPLACEMENT_ADAPTER,
+    HeterogeneousReplacementProbeSummary, MIXED_ARMOR_REPLACEMENT_ADAPTER,
+    MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API, MixedReplacementPackageDiagnosticReport,
+    ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER, diagnose_mixed_replacement_input,
+    probe_additive_static_mesh_input, probe_heterogeneous_replacement_input, probe_input,
+    probe_mixed_armor_input, probe_texture_input, stage_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 use walkdir::WalkDir;
 
 pub const REPORT_SCHEMA: &str = "obr-mod-preflight-report";
-pub const REPORT_VERSION: u32 = 4;
+pub const REPORT_VERSION: u32 = 8;
+pub const MAGIC_LOADER_SIDECAR_API: &str = "magicloader-config-sidecar-v1";
 pub const MAX_SCAN_ENTRIES: usize = MAX_ARCHIVE_ENTRIES;
 pub const MAX_DECLARED_BYTES: u64 = MAX_ARCHIVE_DECLARED_BYTES;
 
@@ -64,6 +82,7 @@ pub struct ModInventory {
     pub script_or_loader_file_count: usize,
     pub loose_file_count: usize,
     pub functional_or_unknown_loose_file_count: usize,
+    pub magic_loader_config_count: usize,
     pub candidate_mod_root_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidate_mod_root: Option<String>,
@@ -135,6 +154,42 @@ pub struct StressReport {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdateDisposition {
+    pub code: String,
+    pub automatic_update: bool,
+    pub runtime_validation_required: bool,
+    pub reason: String,
+    pub blocker_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogicalInstallAnalysis {
+    pub inventory: Option<ModInventory>,
+    pub checks: Vec<CheckResult>,
+    pub capabilities: Vec<Capability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_compatibility: Option<PluginSetReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additive_contract: Option<AdditiveContractReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_iostore_dependency_probe: Option<MixedIoStoreDependencyReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_replacement_package_diagnostic: Option<MixedReplacementPackageDiagnosticReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layered_iostore_dependency_probe: Option<LayeredIoStoreDependencyReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unreal_replacement_probe: Option<ReplacementProbeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heterogeneous_replacement_probe: Option<HeterogeneousReplacementProbeSummary>,
+    pub selected_adapter: Option<String>,
+    pub can_update: bool,
+    pub status: String,
+    pub disposition: UpdateDisposition,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreflightReport {
     pub schema: String,
     pub version: u32,
@@ -157,10 +212,25 @@ pub struct PreflightReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additive_contract: Option<AdditiveContractReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worldspace_master_probe: Option<WorldspaceMasterProbeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_iostore_dependency_probe: Option<MixedIoStoreDependencyReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mixed_replacement_package_diagnostic: Option<MixedReplacementPackageDiagnosticReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layered_iostore_dependency_probe: Option<LayeredIoStoreDependencyReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub install_plan: Option<InstallPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_install_analysis: Option<LogicalInstallAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unreal_replacement_probe: Option<ReplacementProbeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heterogeneous_replacement_probe: Option<HeterogeneousReplacementProbeSummary>,
     pub selected_adapter: Option<String>,
     pub can_update: bool,
     pub status: String,
+    pub disposition: UpdateDisposition,
     pub performance: PerformanceReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stress: Option<StressReport>,
@@ -179,6 +249,7 @@ struct InventoryBuilder {
     scripts: usize,
     loose: usize,
     functional_or_unknown_loose: usize,
+    magic_loader_configs_by_root: BTreeMap<String, usize>,
     samples: Vec<String>,
     containers: BTreeMap<String, BTreeSet<String>>,
     data_roots: BTreeSet<String>,
@@ -210,6 +281,30 @@ fn root_before(path: &str, marker: &str) -> Option<String> {
     let index = lower.find(&format!("/{marker}"))?;
     let root = path[..index].trim_matches('/');
     Some(if root.is_empty() { "." } else { root }.to_owned())
+}
+
+fn direct_magic_loader_config_root(path: &str, extension: &str) -> Option<String> {
+    if extension != "json" {
+        return None;
+    }
+    let normalized = normalized_path(path);
+    let lower = normalized.to_ascii_lowercase();
+    let marker = "content/dev/obvdata/data/magicloader/";
+    let (root, tail) = if let Some(tail) = lower.strip_prefix(marker) {
+        (".".to_owned(), tail)
+    } else {
+        let needle = format!("/{marker}");
+        let index = lower.find(&needle)?;
+        (
+            normalized[..index].trim_matches('/').to_owned(),
+            &lower[index + needle.len()..],
+        )
+    };
+    (!tail.is_empty() && !tail.contains('/')).then_some(if root.is_empty() {
+        ".".to_owned()
+    } else {
+        root
+    })
 }
 
 impl InventoryBuilder {
@@ -281,7 +376,9 @@ impl InventoryBuilder {
                 "readme" | "license" | "licence" | "notice" | "changelog"
             ) || (lower.starts_with("fomod/") || lower.contains("/fomod/"))
                 && extension == "xml";
-            if !documentation {
+            if let Some(root) = direct_magic_loader_config_root(&path, &extension) {
+                *self.magic_loader_configs_by_root.entry(root).or_default() += 1;
+            } else if !documentation {
                 self.functional_or_unknown_loose += 1;
             }
         }
@@ -317,19 +414,29 @@ impl InventoryBuilder {
             .collect::<Vec<_>>();
         let roots = candidate_roots.len();
         let candidate_mod_root = (roots == 1).then(|| candidate_roots[0].clone());
+        let magic_loader_total = self.magic_loader_configs_by_root.values().sum::<usize>();
+        let magic_loader_config_count = candidate_mod_root
+            .as_ref()
+            .and_then(|root| self.magic_loader_configs_by_root.get(root))
+            .copied()
+            .unwrap_or(0);
+        self.functional_or_unknown_loose +=
+            magic_loader_total.saturating_sub(magic_loader_config_count);
         let esp = *self.plugins.get("esp").unwrap_or(&0);
         let plugin_total = self.plugins.values().sum::<usize>();
         let has_plugins = plugin_total > 0;
-        let classification = if roots == 1
+        let syncmap_iostore_shape = roots == 1
             && esp == 1
             && plugin_total == 1
             && self.sync_maps == 1
             && complete > 0
             && incomplete == 0
             && self.scripts == 0
-            && self.functional_or_unknown_loose == 0
-        {
+            && self.functional_or_unknown_loose == 0;
+        let classification = if syncmap_iostore_shape && magic_loader_config_count == 0 {
             "additive-syncmap-iostore"
+        } else if syncmap_iostore_shape && magic_loader_config_count > 0 {
+            "magicloader-syncmap-iostore"
         } else if self.scripts > 0 && !has_plugins && self.containers.is_empty() {
             "script-or-loader"
         } else if has_plugins && self.containers.is_empty() && self.scripts == 0 {
@@ -365,6 +472,7 @@ impl InventoryBuilder {
             script_or_loader_file_count: self.scripts,
             loose_file_count: self.loose,
             functional_or_unknown_loose_file_count: self.functional_or_unknown_loose,
+            magic_loader_config_count,
             candidate_mod_root_count: roots,
             candidate_mod_root,
             sample_files: self.samples,
@@ -471,6 +579,48 @@ fn scan_input(path: &Path) -> Result<ModInventory> {
     }
 }
 
+fn inspect_logical_install_input(
+    request: &PreflightRequest,
+) -> Result<(InstallPlan, LogicalInstallAnalysis)> {
+    let temporary = tempfile::Builder::new()
+        .prefix("obr-install-plan-")
+        .tempdir()?;
+    let staged = temporary.path().join("physical");
+    stage_input(&request.mod_input, &staged)
+        .context("staging the selected source for install-layout analysis")?;
+    let resolved = resolve_staged_install_view(&staged)?;
+    let logical_request = PreflightRequest {
+        mod_input: resolved.view.root().to_path_buf(),
+        game_root: request.game_root.clone(),
+        output_parent: request.output_parent.clone(),
+        connected_tools: request.connected_tools.clone(),
+    };
+    // A materialized logical view is the terminal analysis boundary. If its
+    // topology is still noncanonical, reporting that result is useful, but
+    // recursively planning the derived view would reproduce the same mapping
+    // forever (and could overflow the process stack).
+    let report = analyze_internal(&logical_request, &mut |_| {}, false);
+    Ok((
+        resolved.plan,
+        LogicalInstallAnalysis {
+            inventory: report.inventory,
+            checks: report.checks,
+            capabilities: report.capabilities,
+            plugin_compatibility: report.plugin_compatibility,
+            additive_contract: report.additive_contract,
+            mixed_iostore_dependency_probe: report.mixed_iostore_dependency_probe,
+            mixed_replacement_package_diagnostic: report.mixed_replacement_package_diagnostic,
+            layered_iostore_dependency_probe: report.layered_iostore_dependency_probe,
+            unreal_replacement_probe: report.unreal_replacement_probe,
+            heterogeneous_replacement_probe: report.heterogeneous_replacement_probe,
+            selected_adapter: report.selected_adapter,
+            can_update: report.can_update,
+            status: report.status,
+            disposition: report.disposition,
+        },
+    ))
+}
+
 fn candidate_count(candidates: &[DependencyCandidate], kind: DependencyKind) -> usize {
     candidates
         .iter()
@@ -534,6 +684,14 @@ fn built_in_tool(
     }
 }
 
+fn has_portable_executable_magic(path: &Path) -> bool {
+    let mut magic = [0_u8; 2];
+    File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"MZ"
+}
+
 fn check(
     id: &str,
     passed: bool,
@@ -566,6 +724,107 @@ fn existing_absolute(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn comparable_absolute_path(path: &Path) -> String {
+    existing_absolute(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn selects_active_game_mods(request: &PreflightRequest) -> bool {
+    if !request.mod_input.is_dir() {
+        return false;
+    }
+    request.game_root.as_deref().is_some_and(|game_root| {
+        let active_mods =
+            normalize_install_root(game_root).join(r"OblivionRemastered\Content\Paks\~mods");
+        active_mods.is_dir()
+            && comparable_absolute_path(&request.mod_input)
+                == comparable_absolute_path(&active_mods)
+    })
+}
+
+fn is_direct_mod_container_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    parts.len() == 4
+        && parts[0].eq_ignore_ascii_case("Content")
+        && parts[1].eq_ignore_ascii_case("Paks")
+        && parts[2].eq_ignore_ascii_case("~mods")
+        && Path::new(parts[3])
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
+}
+
+fn path_redaction_variants(path: &Path) -> Vec<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|root| root.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut paths = vec![absolute.clone(), existing_absolute(&absolute)];
+    if let Some(normalized) = absolute
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+    {
+        paths.push(normalized);
+    }
+    let mut variants = BTreeSet::new();
+    for candidate in paths {
+        let raw = candidate.to_string_lossy();
+        if raw.len() >= 3 {
+            variants.insert(raw.to_string());
+            variants.insert(raw.replace('\\', "/"));
+            variants.insert(raw.replace('/', "\\"));
+        }
+    }
+    let mut variants = variants.into_iter().collect::<Vec<_>>();
+    variants.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    variants
+}
+
+fn redact_preflight_error(error: &anyhow::Error, request: &PreflightRequest) -> String {
+    let mut text = format!("{error:#}");
+    let temp_root = std::env::temp_dir();
+    let mut roots: Vec<(&Path, &str)> = vec![
+        (request.mod_input.as_path(), "<MOD_INPUT>"),
+        (temp_root.as_path(), "<TEMP>"),
+    ];
+    if let Some(game_root) = request.game_root.as_ref() {
+        roots.push((game_root.as_path(), "<GAME_ROOT>"));
+    }
+    if let Some(output_root) = request.output_parent.as_ref() {
+        roots.push((output_root.as_path(), "<OUTPUT_ROOT>"));
+    }
+    for tool in &request.connected_tools {
+        roots.push((tool.as_path(), "<CONNECTED_TOOL>"));
+    }
+    let mut redactions = Vec::new();
+    for (root, replacement) in roots {
+        for variant in path_redaction_variants(root) {
+            redactions.push((variant, replacement));
+        }
+    }
+    redactions.sort_by_key(|(variant, _)| std::cmp::Reverse(variant.len()));
+    for (variant, replacement) in redactions {
+        let pattern = regex::RegexBuilder::new(&regex::escape(&variant))
+            .case_insensitive(true)
+            .build();
+        if let Ok(pattern) = pattern {
+            text = pattern.replace_all(&text, replacement).into_owned();
+        }
+    }
+    text
+}
+
 fn output_isolated(request: &PreflightRequest) -> bool {
     let Some(output) = request
         .output_parent
@@ -589,12 +848,20 @@ fn output_isolated(request: &PreflightRequest) -> bool {
 }
 
 pub fn analyze(request: &PreflightRequest) -> PreflightReport {
-    analyze_with_progress(request, &mut |_| {})
+    analyze_internal(request, &mut |_| {}, true)
 }
 
 pub fn analyze_with_progress(
     request: &PreflightRequest,
     progress: &mut dyn FnMut(&str),
+) -> PreflightReport {
+    analyze_internal(request, progress, true)
+}
+
+fn analyze_internal(
+    request: &PreflightRequest,
+    progress: &mut dyn FnMut(&str),
+    allow_install_plan: bool,
 ) -> PreflightReport {
     // Treat every run as a fresh snapshot. Saved setup is convenient, but it is never proof that the current input is safe.
     let started = Instant::now();
@@ -618,7 +885,7 @@ pub fn analyze_with_progress(
     };
     let (inventory, scan_error) = match scan {
         Ok(inventory) => (Some(inventory), None),
-        Err(error) => (None, Some(format!("{error:#}"))),
+        Err(error) => (None, Some(redact_preflight_error(&error, request))),
     };
     progress(
         &inventory
@@ -631,12 +898,37 @@ pub fn analyze_with_progress(
             })
             .unwrap_or_else(|| "Mod inventory could not be completed".to_owned()),
     );
+    let needs_install_plan = allow_install_plan
+        && inventory.as_ref().is_some_and(|value| {
+            value.candidate_mod_root_count == 0
+                && !value.scan_truncated
+                && matches!(
+                    value.classification.as_str(),
+                    "mixed-mod" | "loose-files-or-unknown"
+                )
+        });
+    let (install_plan, logical_install_analysis, install_plan_error) = if needs_install_plan {
+        progress("Resolving the physical archive layout into a logical install view");
+        match inspect_logical_install_input(request) {
+            Ok((plan, analysis)) => (Some(plan), Some(analysis), None),
+            Err(error) => (None, None, Some(redact_preflight_error(&error, request))),
+        }
+    } else {
+        (None, None, None)
+    };
     let expected_plugin_count = inventory
         .as_ref()
         .map(|value| value.plugin_counts.values().sum::<usize>())
         .unwrap_or(0);
     let additive_layout = inventory.as_ref().is_some_and(|value| {
         value.classification == "additive-syncmap-iostore"
+            && value.incomplete_container_count == 0
+            && value.link_count == 0
+            && !value.scan_truncated
+    });
+    let magic_loader_layout = inventory.as_ref().is_some_and(|value| {
+        value.classification == "magicloader-syncmap-iostore"
+            && value.magic_loader_config_count > 0
             && value.incomplete_container_count == 0
             && value.link_count == 0
             && !value.scan_truncated
@@ -649,41 +941,67 @@ pub fn analyze_with_progress(
         .as_deref()
         .map(normalize_install_root)
         .map(|root| root.join(r"OblivionRemastered\Content\Dev\ObvData\Data\Oblivion.esm"));
-    let (plugin_compatibility, additive_contract) = if expected_plugin_count > 0
-        && inventory
-            .as_ref()
-            .is_some_and(|value| !value.scan_truncated)
-    {
-        progress("Reading plugin headers, masters, FormIDs, and record domains");
-        if additive_layout {
-            match inspect_additive_contract_input(
-                &request.mod_input,
-                candidate_mod_root,
-                current_esm.as_deref(),
-            ) {
-                Ok((plugin_set, contract)) => (Some(plugin_set), Some(contract)),
-                Err(_) => (
-                    Some(PluginSetReport::unavailable(expected_plugin_count)),
+    let current_game_data = request
+        .game_root
+        .as_deref()
+        .map(normalize_install_root)
+        .map(|root| root.join(r"OblivionRemastered\Content\Dev\ObvData\Data"));
+    let (plugin_compatibility, additive_contract, worldspace_master_probe) =
+        if expected_plugin_count > 0
+            && inventory
+                .as_ref()
+                .is_some_and(|value| !value.scan_truncated)
+        {
+            progress("Reading plugin headers, masters, FormIDs, and record domains");
+            if additive_layout {
+                match inspect_additive_contract_input(
+                    &request.mod_input,
+                    candidate_mod_root,
+                    current_esm.as_deref(),
+                ) {
+                    Ok((plugin_set, contract)) => (Some(plugin_set), Some(contract), None),
+                    Err(_) => (
+                        Some(PluginSetReport::unavailable(expected_plugin_count)),
+                        None,
+                        None,
+                    ),
+                }
+            } else if magic_loader_layout
+                && current_game_data.as_ref().is_some_and(|path| path.is_dir())
+            {
+                match inspect_worldspace_master_probe_input(
+                    &request.mod_input,
+                    candidate_mod_root,
+                    current_game_data.as_deref().unwrap(),
+                ) {
+                    Ok((plugin_set, probe)) => (Some(plugin_set), None, Some(probe)),
+                    Err(_) => (
+                        Some(PluginSetReport::unavailable(expected_plugin_count)),
+                        None,
+                        None,
+                    ),
+                }
+            } else {
+                (
+                    Some(
+                        inspect_plugin_input_at_root(&request.mod_input, candidate_mod_root)
+                            .unwrap_or_else(|_| {
+                                PluginSetReport::unavailable(expected_plugin_count)
+                            }),
+                    ),
                     None,
-                ),
+                    None,
+                )
             }
-        } else {
+        } else if expected_plugin_count > 0 {
             (
-                Some(
-                    inspect_plugin_input_at_root(&request.mod_input, candidate_mod_root)
-                        .unwrap_or_else(|_| PluginSetReport::unavailable(expected_plugin_count)),
-                ),
+                Some(PluginSetReport::unavailable(expected_plugin_count)),
+                None,
                 None,
             )
-        }
-    } else if expected_plugin_count > 0 {
-        (
-            Some(PluginSetReport::unavailable(expected_plugin_count)),
-            None,
-        )
-    } else {
-        (None, None)
-    };
+        } else {
+            (None, None, None)
+        };
     let additive_shape = additive_layout
         && plugin_compatibility
             .as_ref()
@@ -700,8 +1018,16 @@ pub fn analyze_with_progress(
             && value.loose_file_count == 0
             && value.file_count == value.complete_container_triple_count * 3
     });
-    let requires_adapter = additive_layout || replacement_shape;
-    let requires_runtime = additive_shape;
+    let selected_active_game_mods = selects_active_game_mods(request);
+    let logical_selected_adapter = logical_install_analysis
+        .as_ref()
+        .and_then(|analysis| analysis.selected_adapter.as_deref());
+    let logical_adapter_matched = logical_install_analysis
+        .as_ref()
+        .is_some_and(|analysis| analysis.can_update);
+    let requires_adapter = additive_layout || replacement_shape || logical_adapter_matched;
+    let requires_runtime = additive_shape
+        || logical_selected_adapter.is_some_and(|adapter| adapter == "native-additive-syncmap-v1");
 
     progress("Validating the selected game installation and current metadata");
     let game = request
@@ -709,6 +1035,92 @@ pub fn analyze_with_progress(
         .as_deref()
         .map(|path| validate_game_install(path, "preflight"));
     let game_valid = game.as_ref().is_some_and(|value| value.valid);
+    let (mixed_iostore_dependency_probe, _mixed_iostore_dependency_probe_error) =
+        if magic_loader_layout || additive_layout {
+            progress("Tracing mixed IoStore package identities and dependency closure");
+            if let Some(game) = game.as_ref().filter(|value| value.valid) {
+                match probe_mixed_iostore_dependencies(
+                    &request.mod_input,
+                    candidate_mod_root,
+                    &game.root,
+                ) {
+                    Ok(report) => (Some(report), None),
+                    Err(error) => (None, Some(redact_preflight_error(&error, request))),
+                }
+            } else {
+                (
+                    None,
+                    Some(
+                        "A complete current game is required for mixed IoStore dependency tracing."
+                            .to_owned(),
+                    ),
+                )
+            }
+        } else {
+            (None, None)
+        };
+    let (mixed_replacement_package_diagnostic, mixed_replacement_diagnostic_error) =
+        if replacement_shape {
+            progress("Inventorying every replacement package identity and dependency edge");
+            if let Some(game) = game.as_ref().filter(|value| value.valid) {
+                match diagnose_mixed_replacement_input(
+                    &request.mod_input,
+                    candidate_mod_root,
+                    &game.root,
+                ) {
+                    Ok(report) => (Some(report), None),
+                    Err(_) => (
+                        None,
+                        Some(
+                            "The per-package replacement diagnostic could not inspect the bounded IoStore input."
+                                .to_owned(),
+                        ),
+                    ),
+                }
+            } else {
+                (
+                    None,
+                    Some(
+                        "A complete current game is required for per-package replacement diagnostics."
+                            .to_owned(),
+                    ),
+                )
+            }
+        } else {
+            (None, None)
+        };
+    let needs_layered_dependency_probe = mixed_replacement_package_diagnostic
+        .as_ref()
+        .is_some_and(|report| report.dependencies.unresolved_edge_count > 0)
+        || mixed_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|report| report.dependencies.unresolved_edge_count > 0);
+    let (layered_iostore_dependency_probe, layered_iostore_dependency_error) =
+        if needs_layered_dependency_probe {
+            progress(
+                "Resolving dependencies across selected, connected, installed, DLC, and stock layers",
+            );
+            if let Some(game) = game.as_ref().filter(|value| value.valid) {
+                match probe_layered_iostore_dependencies(
+                    &request.mod_input,
+                    &request.connected_tools,
+                    &game.root,
+                ) {
+                    Ok(report) => (Some(report), None),
+                    Err(error) => (None, Some(redact_preflight_error(&error, request))),
+                }
+            } else {
+                (
+                    None,
+                    Some(
+                        "A complete current game is required for layered package resolution."
+                            .to_owned(),
+                    ),
+                )
+            }
+        } else {
+            (None, None)
+        };
     let (
         armor_probe,
         armor_probe_error,
@@ -718,16 +1130,31 @@ pub fn analyze_with_progress(
         texture_probe_error,
         additive_static_mesh_probe,
         additive_static_mesh_probe_error,
-    ) = if replacement_shape {
+        heterogeneous_replacement_probe,
+        heterogeneous_replacement_probe_error,
+    ) = if replacement_shape && !selected_active_game_mods {
         progress("Classifying replacement assets and comparing them with the current game");
         if let Some(game) = game.as_ref().filter(|value| value.valid) {
             match probe_input(&request.mod_input, &game.root) {
-                Ok(summary) => (Some(summary), None, None, None, None, None, None, None),
+                Ok(summary) => (
+                    Some(summary),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
                 Err(armor_error) => match probe_mixed_armor_input(&request.mod_input, &game.root) {
                     Ok(summary) => (
                         None,
-                        Some(format!("{armor_error:#}")),
+                        Some(redact_preflight_error(&armor_error, request)),
                         Some(summary),
+                        None,
+                        None,
                         None,
                         None,
                         None,
@@ -737,10 +1164,12 @@ pub fn analyze_with_progress(
                     Err(mixed_error) => match probe_texture_input(&request.mod_input, &game.root) {
                         Ok(summary) => (
                             None,
-                            Some(format!("{armor_error:#}")),
+                            Some(redact_preflight_error(&armor_error, request)),
                             None,
-                            Some(format!("{mixed_error:#}")),
+                            Some(redact_preflight_error(&mixed_error, request)),
                             Some(summary),
+                            None,
+                            None,
                             None,
                             None,
                             None,
@@ -749,24 +1178,45 @@ pub fn analyze_with_progress(
                             match probe_additive_static_mesh_input(&request.mod_input, &game.root) {
                                 Ok(summary) => (
                                     None,
-                                    Some(format!("{armor_error:#}")),
+                                    Some(redact_preflight_error(&armor_error, request)),
                                     None,
-                                    Some(format!("{mixed_error:#}")),
+                                    Some(redact_preflight_error(&mixed_error, request)),
                                     None,
-                                    Some(format!("{texture_error:#}")),
+                                    Some(redact_preflight_error(&texture_error, request)),
                                     Some(summary),
                                     None,
+                                    None,
+                                    None,
                                 ),
-                                Err(static_error) => (
-                                    None,
-                                    Some(format!("{armor_error:#}")),
-                                    None,
-                                    Some(format!("{mixed_error:#}")),
-                                    None,
-                                    Some(format!("{texture_error:#}")),
-                                    None,
-                                    Some(format!("{static_error:#}")),
-                                ),
+                                Err(static_error) => match probe_heterogeneous_replacement_input(
+                                    &request.mod_input,
+                                    &game.root,
+                                ) {
+                                    Ok(summary) => (
+                                        None,
+                                        Some(redact_preflight_error(&armor_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&mixed_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&texture_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&static_error, request)),
+                                        Some(summary),
+                                        None,
+                                    ),
+                                    Err(heterogeneous_error) => (
+                                        None,
+                                        Some(redact_preflight_error(&armor_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&mixed_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&texture_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&static_error, request)),
+                                        None,
+                                        Some(redact_preflight_error(&heterogeneous_error, request)),
+                                    ),
+                                },
                             }
                         }
                     },
@@ -783,10 +1233,32 @@ pub fn analyze_with_progress(
                 Some(message.clone()),
                 None,
                 Some(message),
+                None,
+                Some(
+                    "A complete target game is required for heterogeneous package classification."
+                        .to_owned(),
+                ),
             )
         }
+    } else if replacement_shape {
+        let message = "Class-specific update probes were not run against the active game ~mods directory; select one original mod archive or its complete extracted root.".to_owned();
+        (
+            None,
+            Some(message.clone()),
+            None,
+            Some(message.clone()),
+            None,
+            Some(message.clone()),
+            None,
+            Some(message),
+            None,
+            Some(
+                "Heterogeneous package probes are not run against the active game ~mods directory."
+                    .to_owned(),
+            ),
+        )
     } else {
-        (None, None, None, None, None, None, None, None)
+        (None, None, None, None, None, None, None, None, None, None)
     };
     let replacement_probe = armor_probe
         .as_ref()
@@ -804,6 +1276,16 @@ pub fn analyze_with_progress(
         .as_ref()
         .filter(|value| value.valid)
         .map(|value| installed_state(&value.root));
+    let magic_loader_executable = game
+        .as_ref()
+        .filter(|value| value.valid)
+        .map(|value| value.root.join(r"MagicLoader\MagicLoader.exe"));
+    let magic_loader_present = magic_loader_executable
+        .as_ref()
+        .is_some_and(|path| path.is_file());
+    let magic_loader_installed = magic_loader_executable
+        .as_ref()
+        .is_some_and(|path| has_portable_executable_magic(path));
     let ue4ss_candidates = candidate_count(&candidates, DependencyKind::UE4SS);
     let injector_candidates = candidate_count(&candidates, DependencyKind::TesSyncMapInjector);
     let ue4ss_ready = installed
@@ -876,6 +1358,39 @@ pub fn analyze_with_progress(
             components: connected_components(&candidates, kind),
         });
     }
+    if magic_loader_layout {
+        let components = magic_loader_executable
+            .as_ref()
+            .filter(|path| path.is_file())
+            .map(|path| {
+                vec![ToolComponent {
+                    name: "MagicLoader.exe".to_owned(),
+                    bytes: path
+                        .metadata()
+                        .map(|metadata| metadata.len() as usize)
+                        .unwrap_or(0),
+                    sha256: sha256_file(path).unwrap_or_else(|_| "unreadable".to_owned()),
+                    portable_executable: has_portable_executable_magic(path),
+                }]
+            })
+            .unwrap_or_default();
+        tools.push(ToolStatus {
+            id: "magic-loader".to_owned(),
+            display_name: "MagicLoader runtime".to_owned(),
+            source: "game-install".to_owned(),
+            status: if magic_loader_installed {
+                "installed"
+            } else if magic_loader_present {
+                "invalid-runtime-dependency"
+            } else {
+                "missing-runtime-dependency"
+            }
+            .to_owned(),
+            required_for_selected_adapter: false,
+            candidate_count: 0,
+            components,
+        });
+    }
 
     let mut checks = vec![
         check(
@@ -943,6 +1458,16 @@ pub fn analyze_with_progress(
             Some("Choose a separate report/output folder."),
         ),
         check(
+            "source-is-not-active-game-mods",
+            !selected_active_game_mods,
+            true,
+            "The selected mod input is separate from the active game ~mods directory.",
+            "The selected input is the active game ~mods directory, which can mix unrelated installed mods and omit an archive's ESP, SyncMap, sidecars, or wrapper root.",
+            Some(
+                "Select the original mod archive or its complete extracted root. Use the installed-mod scan for the active ~mods directory.",
+            ),
+        ),
+        check(
             "ue4ss-connection",
             !requires_runtime || ue4ss_ready,
             requires_runtime,
@@ -967,6 +1492,71 @@ pub fn analyze_with_progress(
             Some("Connect an original TesSyncMapInjector archive/folder in Setup."),
         ),
     ];
+    if needs_install_plan {
+        checks.push(CheckResult {
+            id: "logical-install-layout".to_owned(),
+            status: if install_plan.is_some() { "pass" } else { "warning" }.to_owned(),
+            blocking: false,
+            message: install_plan
+                .as_ref()
+                .map(|plan| {
+                    format!(
+                        "Resolved {} physical payload mapping(s) into a source-agnostic logical install view using {:?} evidence; {} option group(s) remain explicit.",
+                        plan.mappings.len(),
+                        plan.evidence,
+                        plan.choice_groups.len(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    install_plan_error.clone().unwrap_or_else(|| {
+                        "No bounded logical install layout could be inferred.".to_owned()
+                    })
+                }),
+            remediation: install_plan.is_none().then(|| {
+                "Use a canonical game-relative layout, a bounded FOMOD with explicit file mappings, or matching Place-in-Data/Place-in-Paks folders with complete container triples."
+                    .to_owned()
+            }),
+        });
+    }
+    if magic_loader_layout {
+        checks.push(CheckResult {
+            id: "magic-loader-sidecar".to_owned(),
+            status: "pass".to_owned(),
+            blocking: false,
+            message: format!(
+                "Recognized {} path-bound MagicLoader configuration file(s) as functional runtime sidecars.",
+                inventory
+                    .as_ref()
+                    .map(|value| value.magic_loader_config_count)
+                    .unwrap_or(0)
+            ),
+            remediation: None,
+        });
+        checks.push(CheckResult {
+            id: "magic-loader-runtime".to_owned(),
+            status: if magic_loader_installed {
+                "pass"
+            } else {
+                "warning"
+            }
+            .to_owned(),
+            blocking: false,
+            message: if magic_loader_installed {
+                "MagicLoader.exe has a readable Windows executable signature in the expected game-root MagicLoader folder. Its version and runtime behavior are not claimed."
+                    .to_owned()
+            } else if magic_loader_present {
+                "A file named MagicLoader.exe exists in the expected game-root folder, but it does not have a readable Windows executable signature."
+                    .to_owned()
+            } else {
+                "This mod includes a MagicLoader configuration, but MagicLoader.exe was not found in the expected game-root MagicLoader folder."
+                    .to_owned()
+            },
+            remediation: (!magic_loader_installed).then(|| {
+                "Install MagicLoader 2 beside OblivionRemastered.exe before running this mod; the updater does not install an unverified MagicLoader payload."
+                    .to_owned()
+            }),
+        });
+    }
     if let Some(plugin_report) = plugin_compatibility.as_ref() {
         let metadata_staging_failed = plugin_report.scan_mode == "unavailable";
         checks.push(check(
@@ -1038,9 +1628,323 @@ pub fn analyze_with_progress(
                 Some("Use a non-empty SyncMap whose local IDs exist in the ESP, and rebase CONT overrides against the current Oblivion.esm without changing or removing existing content."),
             ));
         }
+        if magic_loader_layout {
+            let declared_master_count = plugin_report
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.masters.len())
+                .sum::<usize>();
+            let master_override_count = plugin_report
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.master_override_record_count)
+                .sum::<usize>();
+            let deleted_record_count = plugin_report
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.deleted_record_count)
+                .sum::<usize>();
+            let mut override_types = BTreeMap::<String, usize>::new();
+            for artifact in &plugin_report.artifacts {
+                for (kind, count) in &artifact.master_override_type_counts {
+                    *override_types.entry(kind.clone()).or_default() += count;
+                }
+            }
+            let override_summary = override_types
+                .iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(CheckResult {
+                id: "mixed-worldspace-plugin-semantics".to_owned(),
+                status: "warning".to_owned(),
+                blocking: false,
+                message: format!(
+                    "The ESP declares {declared_master_count} master(s) and {master_override_count} master override(s) ({override_summary}), with {deleted_record_count} deleted record(s). Byte preservation proves identity, not compatibility for current CELL/REFR/WRLD or deleted-record semantics."
+                ),
+                remediation: Some(
+                    "Keep this archive report-only until a bridge-aware multi-master adapter resolves current master records and has an explicit deleted-REFR policy."
+                        .to_owned(),
+                ),
+            });
+        }
+        if magic_loader_layout {
+            if let Some(probe) = mixed_iostore_dependency_probe.as_ref() {
+                checks.push(CheckResult {
+                id: "mixed-iostore-package-identity".to_owned(),
+                status: if probe.collision_count == 0 {
+                    "pass"
+                } else {
+                    "warning"
+                }
+                .to_owned(),
+                blocking: false,
+                message: format!(
+                    "Inventoried {} package(s) in {} UTOC container(s): {} are additive and {} source/current collision(s) were found.",
+                    probe.source_package_count,
+                    probe.container_count,
+                    probe.additive_package_count,
+                    probe.collision_count,
+                ),
+                remediation: (probe.collision_count > 0).then(|| {
+                    "Keep this mod report-only until each replacement package has a class-specific current-game rebase contract."
+                        .to_owned()
+                }),
+            });
+                let unresolved_summary = probe
+                    .dependencies
+                    .unresolved_edges
+                    .iter()
+                    .take(8)
+                    .map(|edge| {
+                        format!(
+                            "{} -> {}",
+                            edge.source_package_path, edge.missing_dependency_package_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                checks.push(CheckResult {
+                id: "mixed-iostore-dependency-closure".to_owned(),
+                status: if probe.dependencies.fully_resolved {
+                    "pass"
+                } else {
+                    "warning"
+                }
+                .to_owned(),
+                blocking: false,
+                message: if probe.dependencies.fully_resolved {
+                    format!(
+                        "Resolved all {} package dependency edge(s) against bundled mod or current-game packages.",
+                        probe.dependencies.dependency_edge_count
+                    )
+                } else {
+                    format!(
+                        "Found {} unresolved package dependency edge(s): {unresolved_summary}",
+                        probe.dependencies.unresolved_edge_count
+                    )
+                },
+                remediation: (!probe.dependencies.fully_resolved).then(|| {
+                    "Use a current-version mod package that removes the stale assets, or wait for a class- and shader-aware repair adapter; unresolved package IDs are never dropped automatically."
+                        .to_owned()
+                }),
+            });
+            } else {
+                checks.push(CheckResult {
+                    id: "mixed-iostore-dependency-closure".to_owned(),
+                    status: "warning".to_owned(),
+                    blocking: false,
+                    message: "The report-only mixed IoStore dependency probe could not complete."
+                        .to_owned(),
+                    remediation: Some(
+                        "Connect a complete current game and provide intact UTOC/UCAS package-store data within the bounded probe limit. Absolute setup paths are not serialized into the shareable report."
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+    if magic_loader_layout {
+        if let Some(probe) = worldspace_master_probe.as_ref() {
+            let identity_resolved = probe.found_master_count == probe.declared_master_count
+                && probe.parsed_master_count == probe.declared_master_count
+                && probe.resolved_master_override_count == probe.master_override_count
+                && probe.unresolved_master_override_count == 0
+                && probe.type_mismatch_override_count == 0;
+            checks.push(CheckResult {
+                id: "worldspace-master-resolution".to_owned(),
+                status: if identity_resolved { "pass" } else { "warning" }.to_owned(),
+                blocking: false,
+                message: format!(
+                    "Resolved {}/{} master override target(s) through {}/{} installed master(s), with {} unresolved target(s), {} type mismatch(es), and {} deleted override(s). This proves record identity only, not field semantics.",
+                    probe.resolved_master_override_count,
+                    probe.master_override_count,
+                    probe.parsed_master_count,
+                    probe.declared_master_count,
+                    probe.unresolved_master_override_count,
+                    probe.type_mismatch_override_count,
+                    probe.deleted_master_override_count,
+                ),
+                remediation: (!identity_resolved).then(|| {
+                    "Install the exact declared masters and keep this mod report-only until every override target resolves to the same current record type."
+                        .to_owned()
+                }),
+            });
+        } else {
+            checks.push(CheckResult {
+                id: "worldspace-master-resolution".to_owned(),
+                status: "warning".to_owned(),
+                blocking: false,
+                message: "The read-only multi-master override probe could not run without a valid current game Data directory."
+                    .to_owned(),
+                remediation: Some(
+                    "Connect a complete current game installation to resolve the ESP's declared masters and override targets."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+    if additive_layout {
+        let publishable_container_layout =
+            mixed_iostore_dependency_probe
+                .as_ref()
+                .is_some_and(|probe| {
+                    probe
+                        .containers
+                        .iter()
+                        .all(|container| is_direct_mod_container_path(&container.relative_path))
+                });
+        checks.push(check(
+            "additive-container-layout",
+            publishable_container_layout,
+            true,
+            "Every additive container is a direct child of Content/Paks/~mods, matching the native publisher's path-preservation contract.",
+            "One or more additive containers are nested below Content/Paks/~mods. They are included in diagnostics, but the native publisher cannot yet preserve that nested physical layout.",
+            Some(
+                "Keep this layout report-only until native additive publication preserves nested container paths atomically.",
+            ),
+        ));
+        let dependency_closure = mixed_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved);
+        let failure = mixed_iostore_dependency_probe
+            .as_ref()
+            .map(|probe| {
+                format!(
+                    "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s). The updater can only consume dependencies bundled with the selected mod or present in the current game package store.",
+                    probe.collision_count, probe.dependencies.unresolved_edge_count
+                )
+            })
+            .unwrap_or_else(|| {
+                "The additive package dependency closure could not be inspected against the current game."
+                    .to_owned()
+            });
+        checks.push(check(
+            "additive-iostore-dependency-closure",
+            dependency_closure,
+            true,
+            "Every additive package dependency resolves from the selected mod or current game, with no source/current package collisions.",
+            failure,
+            Some(
+                "Bundle every required package with the selected mod or update the mod against the current game. Dependencies supplied only by unrelated installed mods are reported diagnostically but are not used to authorize an update.",
+            ),
+        ));
     }
     if replacement_shape {
-        let passed = replacement_probe.is_some();
+        if let Some(diagnostic) = mixed_replacement_package_diagnostic.as_ref() {
+            checks.push(CheckResult {
+                id: "replacement-package-identity".to_owned(),
+                status: if diagnostic.conflict_package_count == 0 {
+                    "pass"
+                } else {
+                    "warning"
+                }
+                .to_owned(),
+                blocking: false,
+                message: format!(
+                    "Inventoried {} package(s) in {} container(s): {} exact replacement(s), {} additive package(s), and {} path/package-ID conflict(s).",
+                    diagnostic.source_package_count,
+                    diagnostic.container_count,
+                    diagnostic.exact_replacement_count,
+                    diagnostic.additive_package_count,
+                    diagnostic.conflict_package_count,
+                ),
+                remediation: (diagnostic.conflict_package_count > 0).then(|| {
+                    "Keep conflicting packages report-only until their current identity and intended target are unambiguous."
+                        .to_owned()
+                }),
+            });
+            let unresolved_summary = diagnostic
+                .dependencies
+                .unresolved_edges
+                .iter()
+                .take(8)
+                .map(|edge| {
+                    format!(
+                        "{} -> {}",
+                        edge.source_package_path, edge.missing_dependency_package_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            checks.push(CheckResult {
+                id: "replacement-dependency-closure".to_owned(),
+                status: if diagnostic.dependencies.fully_resolved {
+                    "pass"
+                } else {
+                    "warning"
+                }
+                .to_owned(),
+                blocking: false,
+                message: if diagnostic.dependencies.fully_resolved {
+                    format!(
+                        "Resolved all {} replacement dependency edge(s) against bundled or stock-main-game packages.",
+                        diagnostic.dependencies.dependency_edge_count
+                    )
+                } else {
+                    format!(
+                        "Found {} unresolved replacement dependency edge(s): {unresolved_summary}",
+                        diagnostic.dependencies.unresolved_edge_count
+                    )
+                },
+                remediation: (!diagnostic.dependencies.fully_resolved).then(|| {
+                    "Unresolved package IDs are never removed automatically; keep this input report-only until a class-aware repair is proven."
+                        .to_owned()
+                }),
+            });
+        } else {
+            checks.push(CheckResult {
+                id: "replacement-package-diagnostic".to_owned(),
+                status: "warning".to_owned(),
+                blocking: false,
+                message: mixed_replacement_diagnostic_error.clone().unwrap_or_else(|| {
+                    "The per-package replacement diagnostic was unavailable.".to_owned()
+                }),
+                remediation: Some(
+                    "Connect a complete current game and provide the intact original archive or complete extracted mod root."
+                        .to_owned(),
+                ),
+            });
+        }
+    }
+    if needs_layered_dependency_probe {
+        checks.push(CheckResult {
+            id: "layered-iostore-dependency-closure".to_owned(),
+            status: layered_iostore_dependency_probe
+                .as_ref()
+                .map(|report| if report.resolution_complete { "pass" } else { "warning" })
+                .unwrap_or("warning")
+                .to_owned(),
+            blocking: false,
+            message: layered_iostore_dependency_probe
+                .as_ref()
+                .map(|report| {
+                    format!(
+                        "Resolved {}/{} reachable dependency edge(s) across {} provider(s) with explicit precedence; {} edge(s) remain unresolved and {} cross-layer collision(s) were recorded.",
+                        report.resolved_edge_count,
+                        report.dependency_edge_count,
+                        report.provider_count,
+                        report.unresolved_edge_count,
+                        report.cross_layer_collision_count,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    layered_iostore_dependency_error.clone().unwrap_or_else(|| {
+                        "The layered IoStore dependency probe was unavailable.".to_owned()
+                    })
+                }),
+            remediation: if layered_iostore_dependency_probe
+                .as_ref()
+                .is_some_and(|report| report.resolution_complete)
+            {
+                None
+            } else {
+                Some("Connect the missing dependency mod, remove ambiguous same-layer providers, or use a source version whose imports resolve under the reported precedence.".to_owned())
+            },
+        });
+    }
+    if replacement_shape {
+        let passed = replacement_probe.is_some() || heterogeneous_replacement_probe.is_some();
         let success = armor_probe
             .as_ref()
             .map(|summary| {
@@ -1079,9 +1983,26 @@ pub fn analyze_with_progress(
                         summary.package_count, summary.container_count, summary.asset_kind
                     )
                 })
+            })
+            .or_else(|| {
+                heterogeneous_replacement_probe.as_ref().map(|summary| {
+                    let warning_count = summary
+                        .packages
+                        .iter()
+                        .map(|package| package.warnings.len())
+                        .sum::<usize>();
+                    format!(
+                        "The input contains {} independently proven package(s) in {} complete container(s): {} StaticMesh and {} Texture2D package(s), with exact current identities, matching import sets, complete dependency closure, and {} disclosed diagnostic warning(s).",
+                        summary.package_count,
+                        summary.container_count,
+                        summary.static_mesh_count,
+                        summary.texture_count,
+                        warning_count,
+                    )
+                })
             });
         let failure = format!(
-            "No proven content adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} StaticMesh: {}",
+            "No proven content adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} StaticMesh: {} Heterogeneous StaticMesh/Texture2D: {}",
             armor_probe_error
                 .as_deref()
                 .unwrap_or("not evaluated as armor."),
@@ -1093,7 +2014,10 @@ pub fn analyze_with_progress(
                 .unwrap_or("not evaluated as Texture2D."),
             additive_static_mesh_probe_error
                 .as_deref()
-                .unwrap_or("not evaluated as a StaticMesh container.")
+                .unwrap_or("not evaluated as a StaticMesh container."),
+            heterogeneous_replacement_probe_error
+                .as_deref()
+                .unwrap_or("not evaluated as a heterogeneous replacement container.")
         );
         checks.push(check(
             "replacement-contract",
@@ -1113,7 +2037,11 @@ pub fn analyze_with_progress(
         .filter(|value| value.blocking)
         .map(|value| value.id.clone())
         .collect::<Vec<_>>();
-    let additive_can_update = additive_shape && adapter_blockers.is_empty();
+    let additive_dependency_closure = mixed_iostore_dependency_probe
+        .as_ref()
+        .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved);
+    let additive_can_update =
+        additive_shape && additive_dependency_closure && adapter_blockers.is_empty();
     let armor_can_update =
         replacement_shape && armor_probe.is_some() && adapter_blockers.is_empty();
     let mixed_armor_can_update =
@@ -1122,11 +2050,25 @@ pub fn analyze_with_progress(
         replacement_shape && texture_probe.is_some() && adapter_blockers.is_empty();
     let additive_static_mesh_can_update =
         replacement_shape && additive_static_mesh_probe.is_some() && adapter_blockers.is_empty();
-    let can_update = additive_can_update
+    let heterogeneous_replacement_can_update = replacement_shape
+        && heterogeneous_replacement_probe.is_some()
+        && adapter_blockers.is_empty();
+    let direct_can_update = additive_can_update
         || armor_can_update
         || mixed_armor_can_update
         || texture_can_update
-        || additive_static_mesh_can_update;
+        || additive_static_mesh_can_update
+        || heterogeneous_replacement_can_update;
+    let logical_publication_adapter = install_plan
+        .as_ref()
+        .filter(|plan| supports_logical_install_publication(plan))
+        .and(logical_install_analysis.as_ref())
+        .filter(|analysis| analysis.can_update)
+        .and_then(|analysis| analysis.selected_adapter.as_deref())
+        .and_then(|adapter| logical_install_adapter_id(adapter).ok());
+    let logical_install_can_update =
+        logical_publication_adapter.is_some() && adapter_blockers.is_empty();
+    let can_update = direct_can_update || logical_install_can_update;
     let mut capabilities = vec![Capability {
         id: "report-only-v1".to_owned(),
         available: inventory.is_some(),
@@ -1152,6 +2094,32 @@ pub fn analyze_with_progress(
             .unwrap_or_else(|| vec!["inventory-incomplete".to_owned()]),
     });
     capabilities.push(Capability {
+        id: crate::install_plan::INSTALL_PLAN_API.to_owned(),
+        available: install_plan.is_some(),
+        evidence_level: "bounded-physical-to-logical-install-mapping".to_owned(),
+        description: "Separates archive paths from logical game destinations, understands canonical roots, bounded explicit FOMOD file mappings, and conservative Place-in-Data/Place-in-Paks structures, preserves option groups, and rejects traversal, links, incomplete triples, and destination collisions.".to_owned(),
+        blockers: if install_plan.is_some() {
+            Vec::new()
+        } else if needs_install_plan {
+            vec!["logical-install-layout-unresolved".to_owned()]
+        } else {
+            vec!["physical-layout-already-canonical-or-not-applicable".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
+        id: LOGICAL_INSTALL_PUBLICATION_API.to_owned(),
+        available: logical_install_can_update,
+        evidence_level: "immutable-plan-nested-adapter-physical-reconstruction".to_owned(),
+        description: "Publishes a proven nested adapter through a choice-free canonical or manual-structural install plan. The complete physical source is hash-snapshotted, only adapter-owned mapped IoStore payloads may change, original wrapper and pass-through paths are reconstructed, fresh preflight must reproduce the plan, and the portable archive is reopened and verified.".to_owned(),
+        blockers: if logical_install_can_update {
+            Vec::new()
+        } else if install_plan.is_some() {
+            vec!["logical-install-publication-not-implemented".to_owned()]
+        } else {
+            vec!["logical-install-plan-not-applicable".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
         id: PLUGIN_MANIFEST_API.to_owned(),
         available: plugin_compatibility
             .as_ref()
@@ -1162,6 +2130,99 @@ pub fn analyze_with_progress(
             .as_ref()
             .map(|value| value.blockers.clone())
             .unwrap_or_else(|| vec!["no-plugin-files".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: MAGIC_LOADER_SIDECAR_API.to_owned(),
+        available: magic_loader_layout,
+        evidence_level: "path-bound-functional-sidecar-inventory".to_owned(),
+        description: "Recognizes JSON configuration files directly under the selected mod root's Content/Dev/ObvData/Data/MagicLoader folder, keeps them distinct from documentation and unknown loose payloads, and reports the separate MagicLoader runtime requirement. Recognition alone never enables an update adapter.".to_owned(),
+        blockers: if magic_loader_layout {
+            Vec::new()
+        } else {
+            vec!["no-path-bound-magicloader-config-sidecar".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
+        id: WORLDSPACE_MASTER_PROBE_API.to_owned(),
+        available: worldspace_master_probe.is_some(),
+        evidence_level: "esp-declared-master-order-record-identity".to_owned(),
+        description: "Resolves a multi-master worldspace ESP's override targets in the ESP-declared master order against the matching installed files, using defining-plugin plus local FormID identity, and requires current record-type agreement. This read-only probe never claims field semantics or enables mutation.".to_owned(),
+        blockers: worldspace_master_probe
+            .as_ref()
+            .map(|probe| probe.blockers.clone())
+            .unwrap_or_else(|| vec!["worldspace-master-probe-not-run".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: MIXED_IOSTORE_DEPENDENCY_PROBE_API.to_owned(),
+        available: mixed_iostore_dependency_probe.is_some(),
+        evidence_level: "selected-bounded-iostore-package-store-graph".to_owned(),
+        description: "Stages only bounded source UTOC/UCAS package-store data, compares package paths and IDs with the current game, and reports every resolved or unresolved dependency edge without enabling conversion.".to_owned(),
+        blockers: mixed_iostore_dependency_probe
+            .as_ref()
+            .map(|probe| probe.blockers.clone())
+            .unwrap_or_else(|| vec!["mixed-iostore-dependency-probe-not-run".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API.to_owned(),
+        available: mixed_replacement_package_diagnostic.is_some(),
+        evidence_level: "current-stock-main-package-store-identity-and-dependency-graph".to_owned(),
+        description: "Inventories every package in heterogeneous Unreal-container-only inputs, preserves its container/path/ID/import evidence, distinguishes exact stock-main replacements from additions and identity conflicts, and reports the complete dependency closure against bundled and stock-main packages. Installed-mod precedence, other game containers, export classes, and mutation are not claimed.".to_owned(),
+        blockers: mixed_replacement_package_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.blockers.clone())
+            .unwrap_or_else(|| vec!["mixed-replacement-package-diagnostic-not-run".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: LAYERED_IOSTORE_DEPENDENCY_API.to_owned(),
+        available: layered_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|report| report.resolution_complete),
+        evidence_level: "deterministic-multi-provider-package-store-precedence".to_owned(),
+        description: "Resolves transitive imports in explicit order across the selected mod, connected dependency mods, installed active mods, game/DLC containers, and stock main data. Same-layer ambiguity fails closed; cross-layer shadowing and every selected provider remain visible in the report.".to_owned(),
+        blockers: layered_iostore_dependency_probe
+            .as_ref()
+            .map(|report| report.blockers.clone())
+            .unwrap_or_else(|| {
+                if needs_layered_dependency_probe {
+                    vec!["layered-iostore-dependency-probe-unavailable".to_owned()]
+                } else {
+                    vec!["stock-or-bundled-dependency-closure-was-already-complete".to_owned()]
+                }
+            }),
+    });
+    capabilities.push(Capability {
+        id: "native-magicloader-worldspace-syncmap-v1".to_owned(),
+        available: false,
+        evidence_level: "report-only-cross-plane-inventory".to_owned(),
+        description: "Reserved fail-closed lane for a MagicLoader sidecar, multi-master worldspace ESP, stock-plus-mod SyncMap closure, and additive Unreal packages. It remains unavailable until current-master override semantics and every Unreal dependency are proven.".to_owned(),
+        blockers: if magic_loader_layout {
+            let mut blockers = vec!["current-master-worldspace-semantics-not-proven".to_owned()];
+            match mixed_iostore_dependency_probe.as_ref() {
+                Some(probe) => {
+                    if probe.collision_count > 0 {
+                        blockers.push("source-current-package-collisions".to_owned());
+                    }
+                    if !probe.dependencies.fully_resolved {
+                        blockers.push("mixed-zen-dependencies-unresolved".to_owned());
+                    }
+                }
+                None => blockers.push("mixed-zen-dependency-probe-unavailable".to_owned()),
+            }
+            if plugin_compatibility.as_ref().is_some_and(|report| {
+                report
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.deleted_record_count > 0)
+            }) {
+                blockers.push("deleted-master-record-policy-not-proven".to_owned());
+            }
+            if !magic_loader_installed {
+                blockers.push("magicloader-runtime-not-installed".to_owned());
+            }
+            blockers
+        } else {
+            vec!["mod-layout-does-not-match-magicloader-worldspace-lane".to_owned()]
+        },
     });
     capabilities.push(Capability {
         id: ADDITIVE_CONTRACT_API.to_owned(),
@@ -1231,13 +2292,29 @@ pub fn analyze_with_progress(
         },
     });
     capabilities.push(Capability {
+        id: HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned(),
+        available: heterogeneous_replacement_can_update,
+        evidence_level: "guarded-per-package-static-mesh-texture-rebase".to_owned(),
+        description: "Classifies every package independently and accepts only containers composed entirely of structurally proven StaticMesh and Texture2D assets. Each package must have one exact current-game path and ID, matching source/current imports, complete dependency closure, exact source-case extraction, and verified inventory, imports, class, and payload preservation after one container rebuild.".to_owned(),
+        blockers: if heterogeneous_replacement_probe.is_some() {
+            adapter_blockers.clone()
+        } else {
+            vec!["packages-did-not-pass-the-heterogeneous-static-mesh-texture-contract".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
         id: "pinned-offhand-staff-a-v1".to_owned(),
         available: false,
         evidence_level: "separate-audited-donor-cli".to_owned(),
         description: "The Staff A donor repair remains available only through its separately pinned console lane and cannot be inferred from a generic mod input.".to_owned(),
         blockers: vec!["audited-donor-selection-required".to_owned()],
     });
-    if !additive_shape && replacement_probe.is_none() && inventory.is_some() {
+    if !additive_shape
+        && replacement_probe.is_none()
+        && heterogeneous_replacement_probe.is_none()
+        && !logical_adapter_matched
+        && inventory.is_some()
+    {
         checks.push(CheckResult {
             id: "proven-update-adapter".to_owned(),
             status: "warning".to_owned(),
@@ -1248,6 +2325,82 @@ pub fn analyze_with_progress(
             ),
         });
     }
+    let selected_adapter = if additive_can_update {
+        Some("native-additive-syncmap-v1".to_owned())
+    } else if armor_can_update {
+        Some(ARMOR_REPLACEMENT_ADAPTER.to_owned())
+    } else if mixed_armor_can_update {
+        Some(MIXED_ARMOR_REPLACEMENT_ADAPTER.to_owned())
+    } else if texture_can_update {
+        Some(TEXTURE_REPLACEMENT_ADAPTER.to_owned())
+    } else if additive_static_mesh_can_update {
+        Some(ADDITIVE_STATIC_MESH_ADAPTER.to_owned())
+    } else if heterogeneous_replacement_can_update {
+        Some(HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned())
+    } else if logical_install_can_update {
+        logical_publication_adapter.clone()
+    } else {
+        None
+    };
+    let mut disposition_blockers = adapter_blockers.clone();
+    if let Some(plugin) = plugin_compatibility.as_ref() {
+        disposition_blockers.extend(plugin.blockers.iter().cloned());
+    }
+    if let Some(layered) = layered_iostore_dependency_probe.as_ref() {
+        disposition_blockers.extend(layered.blockers.iter().cloned());
+    }
+    if let Some(logical) = logical_install_analysis.as_ref() {
+        disposition_blockers.extend(logical.disposition.blocker_ids.iter().cloned());
+    }
+    if install_plan.is_some() && !logical_install_can_update {
+        disposition_blockers.push("logical-install-publication-not-implemented".to_owned());
+    }
+    disposition_blockers.sort();
+    disposition_blockers.dedup();
+    let (disposition_code, disposition_reason) = if can_update {
+        (
+            "guarded-update-candidate",
+            "Every selected adapter gate passed. The output must still be tested in the shipping game.",
+        )
+    } else if inventory.is_none() {
+        (
+            "input-error",
+            "The selected source could not be inventoried safely.",
+        )
+    } else if layered_iostore_dependency_probe
+        .as_ref()
+        .is_some_and(|report| !report.resolution_complete)
+    {
+        (
+            "dependency-closure-unresolved",
+            "At least one reachable IoStore import remains unresolved under explicit provider precedence.",
+        )
+    } else if plugin_compatibility
+        .as_ref()
+        .is_some_and(|report| !report.blockers.is_empty())
+    {
+        (
+            "plugin-structural-or-semantic-review-required",
+            "Plugin structure or record semantics exceed the currently proven mutation policies.",
+        )
+    } else if install_plan.is_some() {
+        (
+            "install-layout-resolved-report-only",
+            "Physical-to-logical install mappings were resolved, but no end-to-end mutation adapter passed for that logical component.",
+        )
+    } else {
+        (
+            "unsupported-structural-content",
+            "The input is reportable, but one or more selected files lack a proven update capability.",
+        )
+    };
+    let disposition = UpdateDisposition {
+        code: disposition_code.to_owned(),
+        automatic_update: can_update,
+        runtime_validation_required: can_update,
+        reason: disposition_reason.to_owned(),
+        blocker_ids: disposition_blockers,
+    };
     let status = if can_update {
         "ready-for-guarded-update"
     } else if inventory.is_some() {
@@ -1286,26 +2439,22 @@ pub fn analyze_with_progress(
         capabilities,
         plugin_compatibility,
         additive_contract,
+        worldspace_master_probe,
+        mixed_iostore_dependency_probe,
+        mixed_replacement_package_diagnostic,
+        layered_iostore_dependency_probe,
+        install_plan,
+        logical_install_analysis,
         unreal_replacement_probe: replacement_probe,
-        selected_adapter: if additive_shape {
-            Some("native-additive-syncmap-v1".to_owned())
-        } else if armor_can_update {
-            Some(ARMOR_REPLACEMENT_ADAPTER.to_owned())
-        } else if mixed_armor_can_update {
-            Some(MIXED_ARMOR_REPLACEMENT_ADAPTER.to_owned())
-        } else if texture_can_update {
-            Some(TEXTURE_REPLACEMENT_ADAPTER.to_owned())
-        } else if additive_static_mesh_can_update {
-            Some(ADDITIVE_STATIC_MESH_ADAPTER.to_owned())
-        } else {
-            None
-        },
+        heterogeneous_replacement_probe,
+        selected_adapter,
         can_update,
         status: status.to_owned(),
+        disposition,
         performance: PerformanceReport {
             elapsed_ms: started.elapsed().as_millis(),
             scan_entry_limit: MAX_SCAN_ENTRIES,
-            metadata_only_archive_scan: !replacement_shape,
+            metadata_only_archive_scan: !replacement_shape && !magic_loader_layout,
             large_file_hashing_streamed: true,
         },
         stress: None,
@@ -1324,6 +2473,29 @@ pub fn stable_signature(report: &PreflightReport) -> String {
         "sourceSha256": report.input.source_sha256,
         "classification": inventory.map(|value| &value.classification),
         "manifest": inventory.map(|value| &value.metadata_manifest_sha256),
+        "installPlan": report.install_plan.as_ref().map(|value| (
+            &value.evidence,
+            &value.mappings,
+            &value.choice_groups,
+            &value.unmapped_sources,
+        )),
+        "logicalInstallAnalysis": report.logical_install_analysis.as_ref().map(|value| (
+            value.inventory.as_ref().map(|inventory| (
+                &inventory.classification,
+                &inventory.metadata_manifest_sha256,
+            )),
+            value.plugin_compatibility.as_ref().map(|plugin| (
+                &plugin.status,
+                &plugin.manifest_sha256,
+                plugin.logical_plugin_count,
+                &plugin.blockers,
+            )),
+            &value.selected_adapter,
+            value.can_update,
+            &value.status,
+            &value.disposition.code,
+            &value.disposition.blocker_ids,
+        )),
         "pluginManifest": report
             .plugin_compatibility
             .as_ref()
@@ -1336,6 +2508,73 @@ pub fn stable_signature(report: &PreflightReport) -> String {
             .additive_contract
             .as_ref()
             .map(|value| (&value.status, value.compatible, &value.sync_map_sha256)),
+        "worldspaceMasterProbe": report
+            .worldspace_master_probe
+            .as_ref()
+            .map(|value| (
+                &value.status,
+                value.resolution_complete,
+                value.resolved_master_override_count,
+                value.unresolved_master_override_count,
+                value.type_mismatch_override_count,
+                value.deleted_master_override_count,
+                &value.blockers,
+            )),
+        "mixedIoStoreDependencyProbe": report
+            .mixed_iostore_dependency_probe
+            .as_ref()
+            .map(|value| (
+                &value.status,
+                value.container_count,
+                value.source_package_count,
+                value.collision_count,
+                value.dependencies.resolved_edge_count,
+                value.dependencies.unresolved_edges.iter().map(|edge| (
+                    edge.source_package_id,
+                    edge.missing_dependency_package_id,
+                )).collect::<Vec<_>>(),
+            )),
+        "mixedReplacementPackageDiagnostic": report
+            .mixed_replacement_package_diagnostic
+            .as_ref()
+            .map(|value| (
+                &value.status,
+                value.container_count,
+                value.source_package_count,
+                value.exact_replacement_count,
+                value.additive_package_count,
+                value.conflict_package_count,
+                &value.containers,
+                &value.packages,
+                &value.dependencies.resolved_edges,
+                &value.dependencies.unresolved_edges,
+                &value.blockers,
+            )),
+        "layeredIoStoreDependencyProbe": report
+            .layered_iostore_dependency_probe
+            .as_ref()
+            .map(|value| (
+                &value.status,
+                value.resolution_complete,
+                &value.logical_sha256,
+                value.provider_count,
+                value.reachable_package_count,
+                value.resolved_edge_count,
+                value.unresolved_edge_count,
+                value.cross_layer_collision_count,
+                &value.blockers,
+            )),
+        "heterogeneousReplacementProbe": report
+            .heterogeneous_replacement_probe
+            .as_ref()
+            .map(|value| (
+                &value.adapter,
+                value.container_count,
+                value.package_count,
+                value.static_mesh_count,
+                value.texture_count,
+                &value.packages,
+            )),
         "gameValid": report.game_valid,
         "toolStatus": report
             .tools
@@ -1347,6 +2586,12 @@ pub fn stable_signature(report: &PreflightReport) -> String {
             .iter()
             .map(|value| (&value.id, value.available))
             .collect::<Vec<_>>(),
+        "disposition": (
+            &report.disposition.code,
+            report.disposition.automatic_update,
+            report.disposition.runtime_validation_required,
+            &report.disposition.blocker_ids,
+        ),
     });
     sha256_bytes(&serde_json::to_vec(&value).expect("stable signature JSON is serializable"))
 }
@@ -1452,6 +2697,20 @@ pub fn human_summary(report: &PreflightReport) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_additive_publication_only_accepts_direct_mod_containers() {
+        assert!(is_direct_mod_container_path(
+            "Content/Paks/~mods/Fixture_P.utoc"
+        ));
+        assert!(is_direct_mod_container_path(
+            "content\\paks\\~MODS\\Fixture_P.UTOC"
+        ));
+        assert!(!is_direct_mod_container_path(
+            "Content/Paks/~mods/Nested/Fixture_P.utoc"
+        ));
+        assert!(!is_direct_mod_container_path("Content/Paks/Fixture_P.utoc"));
+    }
+
     fn tes4_subrecord(kind: &str, data: &[u8]) -> Vec<u8> {
         let mut bytes = kind.as_bytes().to_vec();
         bytes.extend_from_slice(&(data.len() as u16).to_le_bytes());
@@ -1531,6 +2790,41 @@ mod tests {
         bytes
     }
 
+    fn worldspace_plugin_bytes() -> Vec<u8> {
+        let mut hedr = 0.8_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&2_u32.to_le_bytes());
+        hedr.extend_from_slice(&0x801_u32.to_le_bytes());
+        let mut header_data = tes4_subrecord("HEDR", &hedr);
+        header_data.extend(tes4_subrecord("MAST", b"Oblivion.esm\0"));
+        header_data.extend(tes4_subrecord("DATA", &[0; 8]));
+        let mut bytes = tes4_record_bytes("TES4", 0, &header_data);
+        bytes.extend(tes4_record_bytes(
+            "CELL",
+            0x0000_1234,
+            &tes4_subrecord("EDID", b"CurrentCell\0"),
+        ));
+        bytes.extend(tes4_record_bytes(
+            "REFR",
+            0x0100_0800,
+            &tes4_subrecord("EDID", b"OwnedReference\0"),
+        ));
+        bytes
+    }
+
+    fn current_worldspace_master_bytes() -> Vec<u8> {
+        let mut hedr = 0.8_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&1_u32.to_le_bytes());
+        hedr.extend_from_slice(&0x1235_u32.to_le_bytes());
+        let header_data = tes4_subrecord("HEDR", &hedr);
+        let mut bytes = tes4_record_bytes("TES4", 0, &header_data);
+        bytes.extend(tes4_record_bytes(
+            "CELL",
+            0x0000_1234,
+            &tes4_subrecord("EDID", b"CurrentCell\0"),
+        ));
+        bytes
+    }
+
     fn additive_fixture(root: &Path) {
         let data = root.join(r"Fixture\Content\Dev\ObvData\Data");
         let paks = root.join(r"Fixture\Content\Paks\~mods");
@@ -1545,6 +2839,14 @@ mod tests {
         for extension in ["pak", "ucas", "utoc"] {
             fs::write(paks.join(format!("AAAA_Fixture_P.{extension}")), extension).unwrap();
         }
+    }
+
+    fn magic_loader_sidecar_fixture(root: &Path) {
+        let config = root.join(r"Fixture\Content\Dev\ObvData\Data\MagicLoader\Fixture.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        // MagicLoader configuration files in the wild may accept JSON-like
+        // trailing commas. Inventory is intentionally path/byte based here.
+        fs::write(config, br#"{"FullNames_Edit":{"LOC_FN_Test":"Test",}}"#).unwrap();
     }
 
     fn game_fixture(root: &Path) {
@@ -1587,6 +2889,148 @@ mod tests {
         let inventory = scan_directory(&wrapped).unwrap();
         assert_eq!(inventory.classification, "additive-syncmap-iostore");
         assert_eq!(inventory.candidate_mod_root_count, 1);
+    }
+
+    #[test]
+    fn additive_layout_does_not_run_mixed_replacement_diagnostic() {
+        let temp = tempfile::tempdir().unwrap();
+        additive_fixture(temp.path());
+        let report = analyze(&PreflightRequest {
+            mod_input: temp.path().to_path_buf(),
+            game_root: None,
+            output_parent: None,
+            connected_tools: Vec::new(),
+        });
+        assert!(report.mixed_replacement_package_diagnostic.is_none());
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.id == MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API && !capability.available
+        }));
+    }
+
+    #[test]
+    fn recognizes_the_active_game_mods_directory_as_partial_installed_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        let active_mods = game.join(r"OblivionRemastered\Content\Paks\~mods");
+        fs::create_dir_all(&active_mods).unwrap();
+        let request = PreflightRequest {
+            mod_input: active_mods,
+            game_root: Some(game),
+            output_parent: None,
+            connected_tools: Vec::new(),
+        };
+        assert!(selects_active_game_mods(&request));
+    }
+
+    #[test]
+    fn recognizes_path_bound_magic_loader_sidecar_without_enabling_additive_adapter() {
+        let temp = tempfile::tempdir().unwrap();
+        additive_fixture(temp.path());
+        magic_loader_sidecar_fixture(temp.path());
+
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.classification, "magicloader-syncmap-iostore");
+        assert_eq!(inventory.magic_loader_config_count, 1);
+        assert_eq!(inventory.loose_file_count, 1);
+        assert_eq!(inventory.functional_or_unknown_loose_file_count, 0);
+
+        let report = analyze(&PreflightRequest {
+            mod_input: temp.path().to_path_buf(),
+            game_root: None,
+            output_parent: None,
+            connected_tools: Vec::new(),
+        });
+        assert!(!report.can_update);
+        assert_eq!(report.selected_adapter, None);
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.id == MAGIC_LOADER_SIDECAR_API && capability.available
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.id == "magic-loader-runtime" && check.status == "warning" && !check.blocking
+        }));
+    }
+
+    #[test]
+    fn magic_loader_runtime_requires_a_readable_executable_signature() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("MagicLoader.exe");
+        fs::write(&executable, b"not-an-executable").unwrap();
+        assert!(!has_portable_executable_magic(&executable));
+        fs::write(&executable, b"MZfixture").unwrap();
+        assert!(has_portable_executable_magic(&executable));
+    }
+
+    #[test]
+    fn magic_loader_worldspace_layout_runs_read_only_current_master_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_input = temp.path().join("mod");
+        let game = temp.path().join("game");
+        additive_fixture(&mod_input);
+        magic_loader_sidecar_fixture(&mod_input);
+        fs::write(
+            mod_input.join(r"Fixture\Content\Dev\ObvData\Data\Fixture.esp"),
+            worldspace_plugin_bytes(),
+        )
+        .unwrap();
+        game_fixture(&game);
+        fs::write(
+            game.join(r"OblivionRemastered\Content\Dev\ObvData\Data\Oblivion.esm"),
+            current_worldspace_master_bytes(),
+        )
+        .unwrap();
+
+        let report = analyze(&PreflightRequest {
+            mod_input,
+            game_root: Some(game),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        let probe = report.worldspace_master_probe.as_ref().unwrap();
+        assert_eq!(probe.declared_master_count, 1);
+        assert_eq!(probe.parsed_master_count, 1);
+        assert_eq!(probe.master_override_count, 1);
+        assert_eq!(probe.resolved_master_override_count, 1);
+        assert_eq!(probe.unresolved_master_override_count, 0);
+        assert_eq!(probe.type_mismatch_override_count, 0);
+        assert!(
+            report.checks.iter().any(|check| {
+                check.id == "worldspace-master-resolution" && check.status == "pass"
+            })
+        );
+        assert!(!report.can_update);
+        assert_eq!(report.selected_adapter, None);
+    }
+
+    #[test]
+    fn magic_loader_sidecar_outside_selected_root_remains_unknown_functional_content() {
+        let temp = tempfile::tempdir().unwrap();
+        additive_fixture(temp.path());
+        let misplaced = temp
+            .path()
+            .join(r"Other\Content\Dev\ObvData\Data\MagicLoader\Misplaced.json");
+        fs::create_dir_all(misplaced.parent().unwrap()).unwrap();
+        fs::write(misplaced, b"{}").unwrap();
+
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.classification, "mixed-mod");
+        assert_eq!(inventory.magic_loader_config_count, 0);
+        assert_eq!(inventory.functional_or_unknown_loose_file_count, 1);
+    }
+
+    #[test]
+    fn nested_magic_loader_payload_remains_unknown_functional_content() {
+        let temp = tempfile::tempdir().unwrap();
+        additive_fixture(temp.path());
+        let nested = temp
+            .path()
+            .join(r"Fixture\Content\Dev\ObvData\Data\MagicLoader\Nested\Config.json");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(nested, b"{}").unwrap();
+
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.classification, "mixed-mod");
+        assert_eq!(inventory.magic_loader_config_count, 0);
+        assert_eq!(inventory.functional_or_unknown_loose_file_count, 1);
     }
 
     fn assert_extra_payload_is_report_only(relative: &str, payload: &[u8]) {
@@ -1816,6 +3260,118 @@ mod tests {
     }
 
     #[test]
+    fn logical_install_analysis_stops_after_one_derived_view() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input");
+        let data = input.join(r"Wrapper\Content\Dev\ObvData\Data");
+        let containers = input.join(r"Wrapper\Content\Paks\Mods\Nested");
+        fs::create_dir_all(data.join("SyncMap")).unwrap();
+        fs::create_dir_all(&containers).unwrap();
+        fs::write(data.join("Fixture.esp"), b"plugin").unwrap();
+        fs::write(data.join(r"SyncMap\Fixture.ini"), b"map").unwrap();
+        for extension in ["pak", "ucas", "utoc"] {
+            fs::write(
+                containers.join(format!("Fixture_P.{extension}")),
+                extension.as_bytes(),
+            )
+            .unwrap();
+        }
+
+        let report = analyze(&PreflightRequest {
+            mod_input: input,
+            game_root: None,
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+
+        assert!(report.install_plan.is_some());
+        let logical = report.logical_install_analysis.as_ref().unwrap();
+        assert_eq!(
+            logical.inventory.as_ref().unwrap().classification,
+            "mixed-mod"
+        );
+        assert!(!logical.can_update);
+        assert!(!report.can_update);
+        assert!(
+            report
+                .disposition
+                .blocker_ids
+                .iter()
+                .any(|blocker| blocker == "logical-install-publication-not-implemented")
+        );
+    }
+
+    fn mixed_replacement_signature_fixture(path: &str) -> MixedReplacementPackageDiagnosticReport {
+        MixedReplacementPackageDiagnosticReport {
+            api: MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API.to_owned(),
+            status: "complete-report-only".to_owned(),
+            mutation_policy: "report-only".to_owned(),
+            automatic_update_enabled: false,
+            container_count: 1,
+            source_package_count: 1,
+            current_game_package_count: 1,
+            exact_replacement_count: 1,
+            additive_package_count: 0,
+            conflict_package_count: 0,
+            path_conflict_count: 0,
+            package_id_conflict_count: 0,
+            containers: vec![crate::replacement::MixedReplacementContainerDiagnostic {
+                name: "Fixture_P".to_owned(),
+                relative_utoc: "Fixture_P.utoc".to_owned(),
+                package_count: 1,
+            }],
+            packages: vec![crate::replacement::MixedReplacementPackageDiagnostic {
+                container: "Fixture_P.utoc".to_owned(),
+                container_name: "Fixture_P".to_owned(),
+                name: "T_fixture.uasset".to_owned(),
+                path: path.to_owned(),
+                package_id: 7,
+                imported_package_ids: Vec::new(),
+                identity_status:
+                    crate::replacement::MixedReplacementIdentityStatus::ExactReplacement,
+                current_path_match_package_id: Some(7),
+                current_id_match_path: Some(path.to_owned()),
+            }],
+            dependencies: crate::fixes::DependencyDiagnosticReport {
+                api: crate::fixes::DEPENDENCY_DIAGNOSTIC_API.to_owned(),
+                bundled_package_count: 1,
+                current_game_package_count: 1,
+                dependency_edge_count: 0,
+                resolved_edge_count: 0,
+                unresolved_edge_count: 0,
+                bundled_edge_count: 0,
+                current_game_edge_count: 0,
+                fully_resolved: true,
+                resolved_edges: Vec::new(),
+                unresolved_edges: Vec::new(),
+            },
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mixed_replacement_identity_changes_the_stable_signature() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("readme.txt"), b"fixture").unwrap();
+        let request = PreflightRequest {
+            mod_input: temp.path().to_path_buf(),
+            game_root: None,
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        };
+        let mut first = analyze(&request);
+        let mut second = analyze(&request);
+        first.mixed_replacement_package_diagnostic = Some(mixed_replacement_signature_fixture(
+            "../../../OblivionRemastered/Content/A/T_fixture.uasset",
+        ));
+        second.mixed_replacement_package_diagnostic = Some(mixed_replacement_signature_fixture(
+            "../../../OblivionRemastered/Content/B/T_fixture.uasset",
+        ));
+        assert_ne!(stable_signature(&first), stable_signature(&second));
+    }
+
+    #[test]
     fn shareable_report_omits_absolute_paths() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("readme.txt"), b"fixture").unwrap();
@@ -1831,7 +3387,35 @@ mod tests {
     }
 
     #[test]
-    fn supported_adapter_requires_content_validated_tool_connections() {
+    fn malformed_replacement_probe_errors_omit_absolute_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_input = temp.path().join("replacement");
+        let game = temp.path().join("game");
+        let output = temp.path().join("output");
+        fs::create_dir_all(&mod_input).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        game_fixture(&game);
+        for extension in ["pak", "ucas", "utoc"] {
+            fs::write(
+                mod_input.join(format!("Malformed_P.{extension}")),
+                b"not-an-iostore-container",
+            )
+            .unwrap();
+        }
+        let report = analyze(&PreflightRequest {
+            mod_input,
+            game_root: Some(game),
+            output_parent: Some(output),
+            connected_tools: Vec::new(),
+        });
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
+        assert!(!report.can_update);
+        assert_eq!(report.status, "report-only");
+    }
+
+    #[test]
+    fn tool_connections_do_not_bypass_additive_package_validation() {
         let temp = tempfile::tempdir().unwrap();
         let mod_root = temp.path().join("mod");
         let game_root = temp.path().join("game");
@@ -1857,22 +3441,25 @@ mod tests {
 
         request.connected_tools.push(tools_root);
         let connected = analyze(&request);
-        assert!(connected.can_update);
-        assert_eq!(
-            connected.selected_adapter.as_deref(),
-            Some("native-additive-syncmap-v1")
-        );
+        assert!(!connected.can_update);
+        assert!(connected.selected_adapter.is_none());
         assert!(
             connected
                 .tools
                 .iter()
-                .filter(|tool| tool.required_for_selected_adapter)
+                .filter(|tool| matches!(tool.id.as_str(), "ue4ss" | "tes-sync-map-injector"))
                 .all(|tool| tool.status != "missing")
+        );
+        assert!(
+            connected
+                .checks
+                .iter()
+                .any(|check| check.id == "additive-iostore-dependency-closure" && check.blocking)
         );
     }
 
     #[test]
-    fn additive_zip_reads_only_selected_metadata_and_remains_updatable() {
+    fn additive_zip_reads_only_selected_metadata_before_package_validation() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let game_root = temp.path().join("game");
@@ -1893,16 +3480,29 @@ mod tests {
             output_parent: Some(output),
             connected_tools: vec![tools_root],
         });
-        assert!(report.can_update);
+        assert!(!report.can_update);
         assert!(report.performance.metadata_only_archive_scan);
         assert_eq!(
             report.plugin_compatibility.as_ref().unwrap().scan_mode,
             "validated-selected-entry-extraction"
         );
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|check| check.id.starts_with("mixed-iostore-")),
+            "mixed-IoStore diagnostics are reserved for the MagicLoader mixed layout"
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "additive-iostore-dependency-closure" && check.blocking)
+        );
     }
 
     #[test]
-    fn additive_preflight_accepts_the_inner_project_game_folder() {
+    fn additive_preflight_accepts_inner_game_folder_but_rejects_invalid_iostore() {
         let temp = tempfile::tempdir().unwrap();
         let mod_root = temp.path().join("mod");
         let game_root = temp.path().join("game");
@@ -1919,7 +3519,8 @@ mod tests {
             connected_tools: vec![tools_root],
         });
 
-        assert!(report.can_update);
+        assert!(!report.can_update);
+        assert!(report.game_valid);
         assert!(
             report
                 .additive_contract

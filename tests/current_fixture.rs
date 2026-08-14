@@ -423,3 +423,62 @@ fn updates_current_additive_static_mesh_fixture() {
     );
     assert_eq!(report["verification"]["roundtripFileSetsPreserved"], true);
 }
+
+#[test]
+#[ignore = "requires an installed game and a local heterogeneous StaticMesh/Texture2D fixture"]
+fn updates_current_heterogeneous_replacement_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let expected_package_count = std::env::var("OBR_TEST_HETEROGENEOUS_PACKAGE_COUNT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("invalid OBR_TEST_HETEROGENEOUS_PACKAGE_COUNT")
+        })
+        .unwrap_or(3);
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-heterogeneous-static-mesh-texture-v1".to_owned(),
+            mod_input: required("OBR_TEST_HETEROGENEOUS_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "heterogeneous replacement update failed:\n{error:#}\n{}",
+            log.join("\n")
+        )
+    });
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    assert_eq!(
+        outcome.adapter,
+        "native-heterogeneous-static-mesh-texture-v1"
+    );
+    assert_eq!(outcome.package_count, expected_package_count);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["structurallyVerified"], true);
+    assert_eq!(report["runtimeVerified"], false);
+    assert_eq!(report["identity"]["packageCount"], expected_package_count);
+    assert!(report["identity"]["staticMeshCount"].as_u64().unwrap() > 0);
+    assert!(report["identity"]["texture2DCount"].as_u64().unwrap() > 0);
+    assert_eq!(report["verification"]["sourceExactCaseExtraction"], true);
+    assert_eq!(report["verification"]["packagePathsAndIdsPreserved"], true);
+    assert_eq!(report["verification"]["packageImportsPreserved"], true);
+    assert_eq!(report["verification"]["roundtripClassesPreserved"], true);
+    assert_eq!(
+        report["verification"]["payloadsPreservedOutsideAllowedLinkageMetadata"],
+        true
+    );
+}

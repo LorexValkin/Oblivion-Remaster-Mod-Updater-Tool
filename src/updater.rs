@@ -3,6 +3,7 @@ use crate::engine::{UpdateOutcome, UpdateRequest, run_update};
 use crate::game::{
     find_game_installs, load_settings, save_settings_with_tools, validate_game_install,
 };
+use crate::installer::{CandidateInstallRequest, install_candidate};
 use crate::modlist::{ModlistRequest, run_modlist_update};
 use crate::preflight::{
     PreflightRequest, analyze_with_progress, human_summary, stable_signature, write_report,
@@ -29,12 +30,22 @@ enum Tone {
 struct AppState {
     dependency_inputs: Vec<PathBuf>,
     last_output: Option<PathBuf>,
+    last_installable_candidate: Option<InstallableCandidate>,
     last_report: Option<PathBuf>,
     last_preflight_signature: Option<String>,
 }
 
+#[derive(Clone)]
+struct InstallableCandidate {
+    outcome: UpdateOutcome,
+    game_root: PathBuf,
+}
+
 enum WorkflowCompletion {
-    Candidate(UpdateOutcome),
+    Candidate {
+        outcome: UpdateOutcome,
+        game_root: PathBuf,
+    },
     ReportOnly {
         status: String,
         signature: String,
@@ -669,6 +680,105 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
     {
         let weak = app.as_weak();
         let shared = Arc::clone(shared);
+        app.on_install_output(move || {
+            let Some(app) = weak.upgrade() else {
+                return;
+            };
+            if app.get_update_running()
+                || app.get_install_running()
+                || !app.get_update_complete()
+            {
+                return;
+            }
+            let candidate = state(&shared).last_installable_candidate.clone();
+            let Some(candidate) = candidate else {
+                app.set_install_prompt_visible(false);
+                app.set_install_available(false);
+                set_status(
+                    &app,
+                    "No confirmed candidate",
+                    "A mod can be installed only after its conversion completes successfully.",
+                    Tone::Warning,
+                );
+                return;
+            };
+            let backup_parent = candidate
+                .outcome
+                .output_directory
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| candidate.outcome.output_directory.clone());
+            let request = CandidateInstallRequest {
+                adapter: candidate.outcome.adapter.clone(),
+                candidate_root: candidate.outcome.output_directory.clone(),
+                game_root: candidate.game_root,
+                backup_parent,
+            };
+            app.set_install_prompt_visible(false);
+            app.set_install_running(true);
+            app.set_install_complete(false);
+            set_status(
+                &app,
+                "Installing converted mod",
+                "Copying the confirmed output into the selected game.",
+                Tone::Neutral,
+            );
+            let mut log = app.get_log_text().to_string();
+            append_log_line(&mut log, "[install] START: installing confirmed candidate");
+            app.set_log_text(log.clone().into());
+
+            let weak = app.as_weak();
+            std::thread::spawn(move || {
+                let result = install_candidate(request);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = weak.upgrade() {
+                        app.set_install_running(false);
+                        match result {
+                            Ok(outcome) => {
+                                app.set_install_complete(true);
+                                append_log_line(
+                                    &mut log,
+                                    &format!(
+                                        "[install] PASS: installed={} replaced={} unchanged={}",
+                                        outcome.installed_file_count,
+                                        outcome.replaced_file_count,
+                                        outcome.unchanged_file_count
+                                    ),
+                                );
+                                if let Some(backup) = outcome.backup_directory {
+                                    append_log_line(
+                                        &mut log,
+                                        &format!("[install] BACKUP: {}", backup.display()),
+                                    );
+                                }
+                                app.set_log_text(log.into());
+                                set_status(
+                                    &app,
+                                    "Mod installed",
+                                    "The confirmed candidate was copied into the game and verified.",
+                                    Tone::Success,
+                                );
+                            }
+                            Err(error) => {
+                                append_log_line(&mut log, &format!("[install] ERROR: {error:#}"));
+                                app.set_log_text(log.into());
+                                set_status(
+                                    &app,
+                                    "Install stopped safely",
+                                    &format!("{error:#}"),
+                                    Tone::Error,
+                                );
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    {
+        let weak = app.as_weak();
+        let shared = Arc::clone(shared);
         app.on_fix_modlist(move || {
             let Some(app) = weak.upgrade() else {
                 return;
@@ -716,11 +826,16 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
             {
                 let mut app_state = state(&shared);
                 app_state.last_output = None;
+                app_state.last_installable_candidate = None;
                 app_state.last_report = None;
                 app_state.last_preflight_signature = None;
             }
             app.set_update_running(true);
             app.set_update_complete(false);
+            app.set_install_running(false);
+            app.set_install_complete(false);
+            app.set_install_available(false);
+            app.set_install_prompt_visible(false);
             app.set_preflight_ready(false);
             app.set_last_report_path("".into());
             app.set_preflight_status("Scanning installed ~mods containers.".into());
@@ -931,11 +1046,16 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
             {
                 let mut app_state = state(&shared);
                 app_state.last_output = None;
+                app_state.last_installable_candidate = None;
                 app_state.last_report = None;
                 app_state.last_preflight_signature = None;
             }
             app.set_update_running(true);
             app.set_update_complete(false);
+            app.set_install_running(false);
+            app.set_install_complete(false);
+            app.set_install_available(false);
+            app.set_install_prompt_visible(false);
             app.set_preflight_ready(false);
             app.set_last_report_path("".into());
             app.set_preflight_status("Automatic safety checks are running.".into());
@@ -958,6 +1078,7 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
                 let mut log = "[workflow] START: automatic preflight will continue into update only if every gate passes.".to_owned();
                 let result = (|| -> Result<WorkflowCompletion, String> {
                     let mut request = request;
+                    let candidate_game_root = request.game_root.clone();
                     let preflight_request = PreflightRequest {
                         mod_input: request.mod_input.clone(),
                         game_root: Some(request.game_root.clone()),
@@ -1059,12 +1180,23 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
                         );
                     })
                     .map_err(|error| format!("{error:#}"))?;
-                    Ok(WorkflowCompletion::Candidate(outcome))
+                    Ok(WorkflowCompletion::Candidate {
+                        outcome,
+                        game_root: candidate_game_root,
+                    })
                 })();
 
                 match result {
-                    Ok(WorkflowCompletion::Candidate(outcome)) => {
-                        state(&shared).last_output = Some(outcome.output_directory.clone());
+                    Ok(WorkflowCompletion::Candidate { outcome, game_root }) => {
+                        {
+                            let mut app_state = state(&shared);
+                            app_state.last_output = Some(outcome.output_directory.clone());
+                            app_state.last_installable_candidate = Some(InstallableCandidate {
+                                outcome: outcome.clone(),
+                                game_root: game_root.clone(),
+                            });
+                        }
+                        let install_target = game_root.display().to_string();
                         let weak = weak.clone();
                         append_log_line(
                             &mut log,
@@ -1099,6 +1231,11 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
                                 app.set_progress(100);
                                 app.set_update_running(false);
                                 app.set_update_complete(true);
+                                app.set_install_running(false);
+                                app.set_install_complete(false);
+                                app.set_install_available(true);
+                                app.set_install_target_path(install_target.into());
+                                app.set_install_prompt_visible(true);
                                 app.set_log_text(log.into());
                                 set_status(
                                     &app,
@@ -1121,6 +1258,8 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
                                 app.set_progress(100);
                                 app.set_update_running(false);
                                 app.set_update_complete(false);
+                                app.set_install_available(false);
+                                app.set_install_prompt_visible(false);
                                 app.set_preflight_ready(false);
                                 app.set_preflight_status(
                                     format!("{status}. Stable signature: {signature}").into(),
@@ -1143,6 +1282,8 @@ fn register_callbacks(app: &AppWindow, shared: &SharedState) {
                             if let Some(app) = weak.upgrade() {
                                 app.set_update_running(false);
                                 app.set_update_complete(false);
+                                app.set_install_available(false);
+                                app.set_install_prompt_visible(false);
                                 app.set_preflight_ready(false);
                                 app.set_preflight_status(
                                     "Workflow stopped before completion. Review the live output."
@@ -1186,6 +1327,7 @@ mod tests {
         assert!(!app.get_can_update());
         assert!(!app.get_can_copy_log());
         assert!(!app.get_can_open_output());
+        assert!(!app.get_can_install_output());
         assert!(!app.get_can_open_report());
         assert!(!app.get_can_fix_modlist());
         assert!(app.get_experimental_notice_visible());
@@ -1212,6 +1354,16 @@ mod tests {
         app.set_last_report_path("report.json".into());
         assert!(app.get_can_copy_log());
         assert!(app.get_can_open_output());
+        assert!(!app.get_can_install_output());
         assert!(app.get_can_open_report());
+        app.set_update_running(false);
+        assert!(!app.get_can_install_output());
+        app.set_install_available(true);
+        assert!(app.get_can_install_output());
+        app.set_install_running(true);
+        assert!(!app.get_can_install_output());
+        app.set_install_running(false);
+        app.set_install_complete(true);
+        assert!(!app.get_can_install_output());
     }
 }

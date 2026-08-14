@@ -1,9 +1,13 @@
 pub mod archive;
 pub mod container;
 pub mod dependencies;
+pub mod dependency_layers;
 pub mod engine;
 pub mod fixes;
 pub mod game;
+pub mod install_plan;
+pub mod installer;
+pub mod mixed;
 pub mod modlist;
 pub mod offhand_export;
 pub mod plugin;

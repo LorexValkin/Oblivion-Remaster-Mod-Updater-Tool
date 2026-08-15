@@ -1829,10 +1829,19 @@ fn analyze_internal(
                     .iter()
                     .take(8)
                     .map(|edge| {
-                        format!(
-                            "{} -> {}",
-                            edge.source_package_path, edge.missing_dependency_package_id
-                        )
+                        if edge.authored_package_names.is_empty() {
+                            format!(
+                                "{} -> {}",
+                                edge.source_package_path, edge.missing_dependency_package_id
+                            )
+                        } else {
+                            format!(
+                                "{} -> {} (authored import name: {})",
+                                edge.source_package_path,
+                                edge.missing_dependency_package_id,
+                                edge.authored_package_names.join(", ")
+                            )
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("; ");

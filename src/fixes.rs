@@ -45,6 +45,12 @@ pub struct UnresolvedDependencyEdgeTrace {
     pub source_package_id: u64,
     pub source_package_path: String,
     pub missing_dependency_package_id: u64,
+    /// Mounted package names spelled inside the consumer package's own Zen
+    /// name map whose derived package ID equals the missing dependency ID.
+    /// Empty whenever no hash-exact authored name was recovered; the field is
+    /// evidence only and never resolves, drops, or rebinds the edge.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub authored_package_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -184,6 +190,7 @@ pub fn diagnose_package_dependencies(
                     source_package_id: package.package_id,
                     source_package_path: package.path.clone(),
                     missing_dependency_package_id: *dependency,
+                    authored_package_names: Vec::new(),
                 });
             }
         }
@@ -448,9 +455,23 @@ mod tests {
                 (20, 99, "../../../Content/Forms/B.uasset"),
             ]
         );
+        assert!(
+            report
+                .unresolved_edges
+                .iter()
+                .all(|edge| edge.authored_package_names.is_empty())
+        );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["api"], DEPENDENCY_DIAGNOSTIC_API);
         assert_eq!(json["unresolvedEdges"][0]["missingDependencyPackageId"], 98);
+        assert!(
+            json["unresolvedEdges"][0]
+                .as_object()
+                .unwrap()
+                .get("authoredPackageNames")
+                .is_none(),
+            "unproven authored names must stay out of the serialized report"
+        );
 
         let reordered = diagnose_package_dependencies(
             &[

@@ -419,11 +419,23 @@ impl InventoryBuilder {
             })
             .count();
         let incomplete = self.containers.len().saturating_sub(complete);
-        let candidate_roots = self
-            .data_roots
-            .intersection(&self.pak_roots)
-            .cloned()
-            .collect::<Vec<_>>();
+        let esp = *self.plugins.get("esp").unwrap_or(&0);
+        let plugin_total = self.plugins.values().sum::<usize>();
+        let has_plugins = plugin_total > 0;
+        let plugin_only_shape = has_plugins && self.containers.is_empty() && self.scripts == 0;
+        // A mod that ships IoStore containers binds its candidate root where the
+        // Data and Paks planes agree. A plugin-only mod has no Paks plane at all,
+        // so its canonical wrapper root is proven by the Data plane alone; other
+        // classifications keep the stricter two-plane binding so the logical
+        // install-plan analysis still runs for unrooted mixed layouts.
+        let candidate_roots = if plugin_only_shape && self.pak_roots.is_empty() {
+            self.data_roots.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.data_roots
+                .intersection(&self.pak_roots)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let roots = candidate_roots.len();
         let candidate_mod_root = (roots == 1).then(|| candidate_roots[0].clone());
         let magic_loader_total = self.magic_loader_configs_by_root.values().sum::<usize>();
@@ -434,9 +446,6 @@ impl InventoryBuilder {
             .unwrap_or(0);
         self.functional_or_unknown_loose +=
             magic_loader_total.saturating_sub(magic_loader_config_count);
-        let esp = *self.plugins.get("esp").unwrap_or(&0);
-        let plugin_total = self.plugins.values().sum::<usize>();
-        let has_plugins = plugin_total > 0;
         let syncmap_iostore_shape = roots == 1
             && esp == 1
             && plugin_total == 1
@@ -3284,6 +3293,32 @@ mod tests {
         let inventory = scan_directory(&wrapped).unwrap();
         assert_eq!(inventory.classification, "additive-syncmap-iostore");
         assert_eq!(inventory.candidate_mod_root_count, 1);
+    }
+
+    #[test]
+    fn binds_plugin_only_candidate_root_from_the_data_plane() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp
+            .path()
+            .join(r"OblivionRemastered\Content\Dev\ObvData\Data");
+        fs::create_dir_all(data.join("SyncMap")).unwrap();
+        fs::create_dir_all(data.join("MagicLoader")).unwrap();
+        fs::write(data.join("Fixture.esp"), valid_plugin_bytes()).unwrap();
+        fs::write(
+            data.join(r"SyncMap\Fixture.ini"),
+            b"[Meshes]\n000800=../../../OblivionRemastered/Content/Fixture/SM_Fixture.SM_Fixture\n",
+        )
+        .unwrap();
+        fs::write(data.join(r"MagicLoader\Fixture.json"), b"{}").unwrap();
+
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.classification, "plugin-only");
+        assert_eq!(inventory.candidate_mod_root_count, 1);
+        assert_eq!(
+            inventory.candidate_mod_root.as_deref(),
+            Some("OblivionRemastered")
+        );
+        assert_eq!(inventory.magic_loader_config_count, 1);
     }
 
     #[test]

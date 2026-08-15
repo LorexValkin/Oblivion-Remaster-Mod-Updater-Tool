@@ -23,13 +23,15 @@ use crate::plugin::{
 };
 use crate::preflight::{PreflightRequest, analyze};
 use crate::replacement::{
-    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, HETEROGENEOUS_REPLACEMENT_ADAPTER,
-    MIXED_ARMOR_REPLACEMENT_ADAPTER, ProvenHeterogeneousAsset, TEXTURE_REPLACEMENT_ADAPTER,
-    canonical_additive_static_mesh_path, canonical_package_path, classify_heterogeneous_asset,
-    extract_source_packages_exact, extract_source_static_mesh_packages,
-    inspect_additive_static_mesh_staged, inspect_heterogeneous_replacement_staged,
-    inspect_mixed_armor_staged, inspect_staged, inspect_texture_staged, stage_input,
-    validate_texture_replacement_pair,
+    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, COMPOSITE_PACKAGE_REBASE_ADAPTER,
+    HETEROGENEOUS_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER, ProvenHeterogeneousAsset,
+    TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
+    classify_heterogeneous_asset, composite_effective_package_path,
+    extract_composite_packages_exact, extract_source_packages_exact,
+    extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
+    inspect_additive_static_mesh_staged, inspect_composite_package_staged,
+    inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
+    inspect_texture_staged, stage_input, validate_texture_replacement_pair,
 };
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
@@ -38,10 +40,13 @@ use crate::tes4::{
     validate_container_addition,
 };
 use crate::uasset::{
-    BodySetupRepair, MaterialImportRepair, PayloadEquivalenceReport, SkeletalCompatibilityProfile,
-    TextureAssetDiagnostic, derive_skeletal_compatibility_profile, inspect_static_mesh_asset,
-    inspect_texture_asset, repair_legacy_body_setups, repair_skeletal_mesh_imports,
-    repair_static_mesh_imports, verify_preserved_export_payloads, verify_rebased_payloads,
+    BodySetupRepair, CompositePackageAssetKind, CompositePackageImportRepair, MaterialImportRepair,
+    PayloadEquivalenceReport, SkeletalCompatibilityProfile, TextureAssetDiagnostic,
+    classify_composite_package_asset, derive_skeletal_compatibility_profile,
+    inspect_static_mesh_asset, inspect_texture_asset, repair_composite_skeletal_mesh_imports,
+    repair_current_template_imports, repair_legacy_body_setups, repair_single_external_import,
+    repair_skeletal_mesh_imports, repair_static_mesh_imports, verify_preserved_export_payloads,
+    verify_rebased_asset_metadata, verify_rebased_payloads,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -263,18 +268,9 @@ fn ensure_no_installed_replacement_collisions(
     if !mods.is_dir() {
         return Ok(());
     }
-    let expected = packages
+    let expected_ids = packages
         .iter()
-        .map(|package| {
-            Ok((
-                canonical_package_path(&package.path)?.to_ascii_lowercase(),
-                package.path.clone(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let expected_keys = expected
-        .iter()
-        .map(|(key, _)| key.as_str())
+        .map(|package| package.package_id)
         .collect::<HashSet<_>>();
     let exclusions = exclusions
         .iter()
@@ -312,18 +308,14 @@ fn ensure_no_installed_replacement_collisions(
             .package_entries(&utoc)
             .with_context(|| format!("inspecting installed override {}", utoc.display()))?;
         for package in installed {
-            let Ok(key) = canonical_package_path(&package.path) else {
-                continue;
-            };
-            let key = key.to_ascii_lowercase();
-            if expected_keys.contains(key.as_str()) {
+            if expected_ids.contains(&package.package_id) {
                 collisions.push(format!("{} in {}", package.path, utoc.display()));
             }
         }
     }
     if !collisions.is_empty() {
         bail!(
-            "a replacement of the same armor is installed in the game ~mods directory. Remove it before updating so the current stock assets can be used as clean material donors:\n{}",
+            "a replacement of the same runtime package ID is installed in the game ~mods directory. Remove it before updating so current stock assets can be used as clean donors:\n{}",
             collisions.join("\n")
         );
     }
@@ -772,6 +764,7 @@ fn run_direct_update(
         HETEROGENEOUS_REPLACEMENT_ADAPTER => {
             run_heterogeneous_replacement_update(request, callback)
         }
+        COMPOSITE_PACKAGE_REBASE_ADAPTER => run_composite_package_update(request, callback),
         "native-additive-static-mesh-v1" | ADDITIVE_STATIC_MESH_ADAPTER => {
             run_additive_static_mesh_update(request, callback)
         }
@@ -791,6 +784,7 @@ fn nested_adapter_owns_logical_destinations(
             | TEXTURE_REPLACEMENT_ADAPTER
             | ADDITIVE_STATIC_MESH_ADAPTER
             | HETEROGENEOUS_REPLACEMENT_ADAPTER
+            | COMPOSITE_PACKAGE_REBASE_ADAPTER
     ) {
         bail!("logical publication received an unsupported nested adapter: {nested_adapter}");
     }
@@ -1841,7 +1835,7 @@ fn canonical_entries(entries: &[PackageEntry]) -> Result<Vec<PackageEntry>> {
         .map(|entry| {
             Ok(PackageEntry {
                 package_id: entry.package_id,
-                path: canonical_package_path(&entry.path)?,
+                path: canonical_additive_static_mesh_path(&entry.path)?,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3254,7 +3248,20 @@ fn run_heterogeneous_replacement_update(
                 );
             }
         }
-        let payload_equivalence = verify_rebased_payloads(&legacy, &verify_legacy, &json_work)?;
+        let payload_equivalence =
+            verify_preserved_export_payloads(&legacy, &verify_legacy, &json_work)?;
+        for package in &rebuilt_packages {
+            if classifications.get(&package.package_id) != Some(&"texture2d") {
+                continue;
+            }
+            let source_asset = find_additive_static_mesh_asset(&legacy, &package.path)?;
+            let roundtrip_asset = find_additive_static_mesh_asset(&verify_legacy, &package.path)?;
+            verify_rebased_asset_metadata(
+                &source_asset,
+                &roundtrip_asset,
+                &json_work.join(format!("texture-{}", package.package_id)),
+            )?;
+        }
         metadata_rebased_count += payload_equivalence
             .assets
             .iter()
@@ -3337,9 +3344,11 @@ fn run_heterogeneous_replacement_update(
             "packageCount": inspection.packages.len(),
             "staticMeshCount": static_mesh_count,
             "texture2DCount": texture_count,
-            "currentGamePathsAndPackageIdsMatched": true,
-            "sourceAndCurrentImportSetsMatched": true,
-            "dependencyClosureComplete": true,
+            "currentGamePackageIdsMatched": true,
+            "currentGamePathOrProjectRootAliasMatched": true,
+            "sourceAndCurrentImportSetsRequiredToMatch": false,
+            "sourceDependencyClosureComplete": true,
+            "authoredSourceImportsPreserved": true,
             "metadataRebasedAssetCount": metadata_rebased_count,
         },
         "unreal": {
@@ -3386,6 +3395,620 @@ fn run_heterogeneous_replacement_update(
     );
     Ok(UpdateOutcome {
         adapter: HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned(),
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: inspection.packages.len(),
+    })
+}
+
+struct CompositePackageMigration {
+    kind: &'static str,
+    import_repair: Option<CompositePackageImportRepair>,
+    static_mesh_repair: Option<serde_json::Value>,
+    expected_imports: Vec<u64>,
+}
+
+fn extract_current_composite_asset(
+    retoc: &RetocTool,
+    current_view: &Path,
+    current: &PackageEntry,
+    output: &Path,
+    label: &str,
+) -> Result<PathBuf> {
+    extract_composite_packages_exact(
+        retoc,
+        current_view,
+        output,
+        &[(current.clone(), current.path.clone())],
+        label,
+    )?;
+    find_extracted_additive_static_mesh(output, &current.path)
+}
+
+fn migrate_composite_package(
+    package: &PackageEntry,
+    asset: &Path,
+    source_store: &PackageStoreEntry,
+    source_ids: &HashSet<u64>,
+    target_dependencies: &HashMap<u64, PackageEntry>,
+    target_package_imports: &HashMap<u64, Vec<u64>>,
+    available_dependencies: &HashMap<u64, PackageEntry>,
+    current_view: &Path,
+    retoc: &RetocTool,
+    work: &Path,
+) -> Result<CompositePackageMigration> {
+    let existing = target_dependencies.contains_key(&package.package_id);
+    let (kind, unresolved) =
+        classify_composite_package_asset(asset, existing, &work.join("classification"))?;
+    let missing = source_store
+        .imported_package_ids
+        .iter()
+        .filter(|dependency| !available_dependencies.contains_key(dependency))
+        .count();
+    let mut expected = source_store
+        .imported_package_ids
+        .iter()
+        .filter(|dependency| available_dependencies.contains_key(dependency))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut import_repair = None;
+    let mut static_mesh_repair = None;
+    let kind_name = match kind {
+        CompositePackageAssetKind::SkeletalMesh => {
+            if !existing {
+                bail!("additive SkeletalMesh packages require a separate proven donor contract");
+            }
+            if unresolved != 0 {
+                let current = target_dependencies
+                    .get(&package.package_id)
+                    .context("existing SkeletalMesh has no current donor identity")?;
+                let donor = extract_current_composite_asset(
+                    retoc,
+                    current_view,
+                    current,
+                    &work.join("current"),
+                    "current SkeletalMesh extraction",
+                )?;
+                let repair = repair_composite_skeletal_mesh_imports(
+                    asset,
+                    &donor,
+                    source_store,
+                    available_dependencies,
+                    &work.join("repair"),
+                )?;
+                expected = repair.target_imported_package_ids.iter().copied().collect();
+                import_repair = Some(repair);
+            } else if missing != 0 {
+                bail!("resolved SkeletalMesh retains unresolved package-store dependencies");
+            }
+            "skeletal-mesh"
+        }
+        CompositePackageAssetKind::StaticMesh => {
+            let imports = inspect_static_mesh_asset(asset)?;
+            if imports
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+            {
+                let repair = repair_static_mesh_imports(
+                    asset,
+                    available_dependencies,
+                    &work.join("repair"),
+                )?;
+                expected.extend(repair.target_package_ids.iter().copied());
+                static_mesh_repair = Some(serde_json::to_value(repair)?);
+            } else if missing != 0 {
+                bail!("resolved StaticMesh retains unresolved package-store dependencies");
+            }
+            "static-mesh"
+        }
+        CompositePackageAssetKind::Texture2D => {
+            inspect_texture_asset(asset)?;
+            if unresolved != 0 {
+                if !existing {
+                    bail!("additive Texture2D has unresolved imports");
+                }
+                let current = target_dependencies
+                    .get(&package.package_id)
+                    .context("existing Texture2D has no current template")?;
+                let donor = extract_current_composite_asset(
+                    retoc,
+                    current_view,
+                    current,
+                    &work.join("current"),
+                    "current Texture2D extraction",
+                )?;
+                let mut repair = repair_current_template_imports(
+                    asset,
+                    &donor,
+                    source_store,
+                    available_dependencies,
+                    &work.join("repair"),
+                )?;
+                repair.target_imported_package_ids = target_package_imports
+                    .get(&package.package_id)
+                    .context("existing Texture2D has no current package-store graph")?
+                    .clone();
+                expected = repair.target_imported_package_ids.iter().copied().collect();
+                import_repair = Some(repair);
+            } else if missing != 0 {
+                bail!("resolved Texture2D retains unresolved package-store dependencies");
+            }
+            "texture2d"
+        }
+        CompositePackageAssetKind::MaterialInstanceConstant => {
+            if unresolved != 0 {
+                let mut repair = if existing {
+                    let current = target_dependencies
+                        .get(&package.package_id)
+                        .context("existing material instance has no current template")?;
+                    let donor = extract_current_composite_asset(
+                        retoc,
+                        current_view,
+                        current,
+                        &work.join("current"),
+                        "current material extraction",
+                    )?;
+                    repair_current_template_imports(
+                        asset,
+                        &donor,
+                        source_store,
+                        available_dependencies,
+                        &work.join("repair"),
+                    )?
+                } else {
+                    let targets = source_store
+                        .imported_package_ids
+                        .iter()
+                        .filter(|dependency| !source_ids.contains(dependency))
+                        .filter_map(|dependency| target_dependencies.get(dependency))
+                        .collect::<Vec<_>>();
+                    if targets.len() != 1 {
+                        bail!(
+                            "additive material with one unresolved public export must have exactly one external current dependency; found {}",
+                            targets.len()
+                        );
+                    }
+                    let target = targets[0];
+                    let donor = extract_current_composite_asset(
+                        retoc,
+                        current_view,
+                        target,
+                        &work.join("dependency"),
+                        "current material-parent extraction",
+                    )?;
+                    repair_single_external_import(
+                        asset,
+                        &donor,
+                        target,
+                        source_store,
+                        available_dependencies,
+                        &work.join("repair"),
+                    )?
+                };
+                if existing {
+                    repair.target_imported_package_ids = target_package_imports
+                        .get(&package.package_id)
+                        .context("existing material has no current package-store graph")?
+                        .clone();
+                }
+                expected = repair.target_imported_package_ids.iter().copied().collect();
+                import_repair = Some(repair);
+            } else if missing != 0 {
+                bail!("resolved material instance retains unresolved package-store dependencies");
+            }
+            "material-instance"
+        }
+        CompositePackageAssetKind::CurrentTemplatePackage => {
+            let current = target_dependencies
+                .get(&package.package_id)
+                .context("current-template package has no current identity")?;
+            let donor = extract_current_composite_asset(
+                retoc,
+                current_view,
+                current,
+                &work.join("current"),
+                "current template extraction",
+            )?;
+            let mut repair = repair_current_template_imports(
+                asset,
+                &donor,
+                source_store,
+                available_dependencies,
+                &work.join("repair"),
+            )?;
+            repair.target_imported_package_ids = target_package_imports
+                .get(&package.package_id)
+                .context("current-template package has no current package-store graph")?
+                .clone();
+            expected = repair.target_imported_package_ids.iter().copied().collect();
+            import_repair = Some(repair);
+            "current-template-package"
+        }
+    };
+    Ok(CompositePackageMigration {
+        kind: kind_name,
+        import_repair,
+        static_mesh_repair,
+        expected_imports: expected.into_iter().collect(),
+    })
+}
+
+fn run_composite_package_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let input_type = if mod_input.is_file() {
+        "archive"
+    } else {
+        "directory"
+    };
+    let input_hash = if mod_input.is_file() {
+        sha256_file(&mod_input)?
+    } else {
+        sha256_directory(&mod_input)?
+    };
+    let game = validate_game_install(&request.game_root, "native UI");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    if !request.output_parent.is_dir() {
+        bail!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        );
+    }
+    let output_directory = request.output_parent.join(format!(
+        "{}-current-candidate-{}",
+        safe_leaf(&mod_input),
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    if output_directory.exists() || output_archive.exists() {
+        bail!("timestamped output already exists; wait one second and try again");
+    }
+    if request.persist_settings {
+        save_settings(&game.root, &request.output_parent)?;
+    }
+
+    let work = tempfile::Builder::new()
+        .prefix("obr-composite-package-update-")
+        .tempdir()?;
+    let staged = work.path().join("source");
+    let retoc = RetocTool::materialize()?;
+    stage(
+        callback,
+        1,
+        "Classifying composite package identities and repair contracts",
+    );
+    stage_input(&mod_input, &staged)?;
+    let inspection = inspect_composite_package_staged(&staged, &game.root, &retoc)?;
+    let game_paks = game.root.join(r"OblivionRemastered\Content\Paks");
+    ensure_no_installed_replacement_collisions(
+        &game_paks,
+        &inspection.packages,
+        &retoc,
+        &request.installed_collision_exclusions,
+    )?;
+    let source_view = create_isolated_stock_view(&game.root)?;
+    let current_view = create_isolated_stock_view(&game.root)?;
+    for container in &inspection.containers {
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            copy_file(
+                source,
+                &source_view.path().join(
+                    source
+                        .file_name()
+                        .context("source composite container has no filename")?,
+                ),
+            )?;
+        }
+    }
+    let mut available_dependencies = inspection.target_dependencies.clone();
+    for package in &inspection.packages {
+        available_dependencies
+            .entry(package.package_id)
+            .or_insert_with(|| package.clone());
+    }
+    let source_ids = inspection
+        .packages
+        .iter()
+        .map(|package| package.package_id)
+        .collect::<HashSet<_>>();
+    fs::create_dir_all(&output_directory)?;
+    copy_tree(&staged, &output_directory)?;
+
+    struct BuiltCompositeContainer {
+        container: crate::replacement::ReplacementContainer,
+        legacy: PathBuf,
+        rebuilt_utoc: PathBuf,
+        rebuilt_ucas: PathBuf,
+        rebuilt_pak: PathBuf,
+        package_rows: Vec<serde_json::Value>,
+        expected_imports: HashMap<u64, Vec<u64>>,
+        body_setup_repairs: Vec<BodySetupRepair>,
+    }
+    let mut built = Vec::new();
+    stage(
+        callback,
+        2,
+        "Extracting dependency-complete composite package sets",
+    );
+    for container in &inspection.containers {
+        let root = work.path().join("containers").join(&container.name);
+        let legacy = root.join("legacy");
+        let rebuilt = root.join("rebuilt");
+        fs::create_dir_all(&rebuilt)?;
+        let effective_packages = container
+            .packages
+            .iter()
+            .map(|package| {
+                Ok((
+                    package.clone(),
+                    composite_effective_package_path(package, &inspection)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        extract_composite_packages_exact(
+            &retoc,
+            source_view.path(),
+            &legacy,
+            &effective_packages,
+            &format!("composite extraction {}", container.name),
+        )?;
+        let source_store = container
+            .package_store
+            .iter()
+            .map(|entry| (entry.package_id, entry))
+            .collect::<HashMap<_, _>>();
+        let mut rows = Vec::new();
+        let mut expected_imports = HashMap::new();
+        for package in &container.packages {
+            let effective = composite_effective_package_path(package, &inspection)?;
+            let asset = find_extracted_additive_static_mesh(&legacy, &effective)?;
+            let migration = migrate_composite_package(
+                package,
+                &asset,
+                source_store
+                    .get(&package.package_id)
+                    .context("composite container lost a package-store row")?,
+                &source_ids,
+                &inspection.target_dependencies,
+                &inspection.target_package_imports,
+                &available_dependencies,
+                current_view.path(),
+                &retoc,
+                &root.join("packages").join(package.package_id.to_string()),
+            )
+            .with_context(|| format!("migrating composite package {}", package.path))?;
+            expected_imports.insert(package.package_id, migration.expected_imports.clone());
+            rows.push(json!({
+                "packageId": package.package_id,
+                "sourcePath": package.path,
+                "outputPath": effective,
+                "assetKind": migration.kind,
+                "importRepair": migration.import_repair,
+                "staticMeshRepair": migration.static_mesh_repair,
+            }));
+        }
+        let body_setup_repairs = repair_legacy_body_setups(&legacy)?;
+        stage(
+            callback,
+            3,
+            &format!("Rebuilding composite container {}", container.name),
+        );
+        let rebuilt_utoc = rebuilt.join(format!("{}.utoc", container.name));
+        let result = retoc.run(args([
+            OsString::from("to-zen"),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            legacy.as_os_str().to_owned(),
+            rebuilt_utoc.as_os_str().to_owned(),
+        ]))?;
+        RetocTool::assert_success(&result, &format!("retoc to-zen {}", container.name))?;
+        let rebuilt_ucas = rebuilt_utoc.with_extension("ucas");
+        let rebuilt_pak = rebuilt_utoc.with_extension("pak");
+        for path in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
+            if !path.is_file() {
+                bail!("rebuilt composite output is missing: {}", path.display());
+            }
+        }
+        retoc.verify(&rebuilt_utoc, &format!("retoc verify {}", container.name))?;
+        let (_, rebuilt_packages) = retoc.package_entries(&rebuilt_utoc)?;
+        let expected_inventory = effective_packages
+            .iter()
+            .map(|(package, path)| {
+                Ok((
+                    canonical_additive_static_mesh_path(path)?.to_ascii_lowercase(),
+                    package.package_id,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let actual_inventory = rebuilt_packages
+            .iter()
+            .map(|package| {
+                Ok((
+                    canonical_additive_static_mesh_path(&package.path)?.to_ascii_lowercase(),
+                    package.package_id,
+                ))
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        if expected_inventory != actual_inventory {
+            bail!(
+                "rebuilt composite package inventory changed for {}",
+                container.name
+            );
+        }
+        let (_, rebuilt_store) = retoc.package_store_entries(&rebuilt_utoc)?;
+        for (package_id, expected) in &expected_imports {
+            let actual = rebuilt_store
+                .iter()
+                .find(|entry| entry.package_id == *package_id)
+                .with_context(|| format!("rebuilt composite store lost package {package_id}"))?;
+            if actual
+                .imported_package_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != expected.iter().copied().collect::<BTreeSet<_>>()
+            {
+                bail!("rebuilt composite imports changed for package {package_id}");
+            }
+        }
+        built.push(BuiltCompositeContainer {
+            container: container.clone(),
+            legacy,
+            rebuilt_utoc,
+            rebuilt_ucas,
+            rebuilt_pak,
+            package_rows: rows,
+            expected_imports,
+            body_setup_repairs,
+        });
+    }
+
+    stage(
+        callback,
+        4,
+        "Roundtripping every rebuilt composite package against current stock",
+    );
+    let verify_view = create_isolated_stock_view(&game.root)?;
+    for container in &built {
+        for source in [
+            &container.rebuilt_utoc,
+            &container.rebuilt_ucas,
+            &container.rebuilt_pak,
+        ] {
+            copy_file(
+                source,
+                &verify_view.path().join(
+                    source
+                        .file_name()
+                        .context("rebuilt composite container has no filename")?,
+                ),
+            )?;
+        }
+    }
+    let mut container_reports = Vec::new();
+    for container in &built {
+        let verify_legacy = work
+            .path()
+            .join("roundtrip")
+            .join(&container.container.name);
+        let effective_packages = container
+            .container
+            .packages
+            .iter()
+            .map(|package| {
+                Ok((
+                    package.clone(),
+                    composite_effective_package_path(package, &inspection)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        extract_composite_packages_exact(
+            &retoc,
+            verify_view.path(),
+            &verify_legacy,
+            &effective_packages,
+            &format!("composite roundtrip {}", container.container.name),
+        )?;
+        let payload = verify_preserved_export_payloads(
+            &container.legacy,
+            &verify_legacy,
+            &work
+                .path()
+                .join("payload-verification")
+                .join(&container.container.name),
+        )?;
+        let candidate_utoc = output_directory.join(&container.container.relative_utoc);
+        let candidate_ucas = candidate_utoc.with_extension("ucas");
+        let candidate_pak = candidate_utoc.with_extension("pak");
+        copy_file(&container.rebuilt_utoc, &candidate_utoc)?;
+        copy_file(&container.rebuilt_ucas, &candidate_ucas)?;
+        copy_file(&container.rebuilt_pak, &candidate_pak)?;
+        container_reports.push(json!({
+            "name": container.container.name,
+            "packageCount": container.container.packages.len(),
+            "packages": container.package_rows,
+            "bodySetupRepairs": container.body_setup_repairs,
+            "expectedImportedPackageSets": container.expected_imports,
+            "payloadEquivalence": payload,
+            "rebuilt": {
+                "utocSha256": sha256_file(&candidate_utoc)?,
+                "ucasSha256": sha256_file(&candidate_ucas)?,
+                "pakSha256": sha256_file(&candidate_pak)?,
+                "retocVerified": true,
+                "inventoryPreserved": true,
+            }
+        }));
+    }
+
+    let report_path = output_directory.join("composite-package-update-report.json");
+    let report = json!({
+        "schema": "obr-composite-package-update-report",
+        "version": 1,
+        "implementation": "native-rust",
+        "adapter": COMPOSITE_PACKAGE_REBASE_ADAPTER,
+        "generatedAt": chrono::Utc::now().to_rfc3339(),
+        "status": "candidate_ready_for_runtime_test",
+        "structurallyVerified": true,
+        "runtimeVerified": false,
+        "source": {"inputType": input_type, "inputSha256": input_hash},
+        "identity": {
+            "containerCount": inspection.containers.len(),
+            "packageCount": inspection.packages.len(),
+            "classDrivenSystemWideRules": true,
+            "modSpecificWhitelistUsed": false,
+            "packagePathsAndIdsVerified": true,
+            "packageImportSetsVerified": true,
+            "authoredPayloadsRoundtripVerified": true,
+        },
+        "fixApis": [
+            "zen-exact-dependency-extraction-v1",
+            "zen-dependency-preservation-v1",
+            "identity-and-export-topology-current-template-import-rebase-v1",
+            "serialized-role-current-template-import-rebase-v1",
+            "single-resolved-current-dependency-public-export-rebase-v1"
+        ],
+        "unreal": {"containers": container_reports},
+        "output": {"directory": output_directory, "archive": output_archive},
+        "verification": {
+            "sourceContainersVerified": true,
+            "rebuiltContainersVerified": true,
+            "packagePathsAndIdsPreservedOrCanonicallyRebased": true,
+            "packageImportSetsMatchApprovedGraph": true,
+            "roundtripFileSetsPreserved": true,
+            "approvedExportPayloadMigrationPreserved": true,
+            "productionRuntimeGateRequired": true
+        }
+    });
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    stage(
+        callback,
+        5,
+        "Creating portable composite-package candidate archive",
+    );
+    create_zip_from_paths(
+        &output_archive,
+        &output_directory,
+        std::slice::from_ref(&output_directory),
+    )?;
+    if !output_archive.is_file() {
+        bail!("composite candidate archive was not created");
+    }
+    stage(
+        callback,
+        6,
+        "Composite candidate complete; shipping-game test still required",
+    );
+    Ok(UpdateOutcome {
+        adapter: COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned(),
         output_directory,
         output_archive,
         report_path,

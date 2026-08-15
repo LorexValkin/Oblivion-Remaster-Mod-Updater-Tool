@@ -1,4 +1,6 @@
-use crate::archive::{MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions, sha256_file};
+use crate::archive::{
+    MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions_bounded, sha256_file,
+};
 use crate::fixes::{DependencyDiagnosticReport, diagnose_package_dependencies};
 use crate::game::normalize_install_root;
 use crate::retoc::{PackageStoreEntry, RetocTool};
@@ -118,10 +120,11 @@ fn stage_iostore_probe_files(
     let temporary = tempfile::Builder::new()
         .prefix("obr-mixed-iostore-probe-")
         .tempdir()?;
-    let selected = extract_archive_files_with_extensions(
+    let selected = extract_archive_files_with_extensions_bounded(
         input,
         temporary.path(),
         &["utoc", "ucas"],
+        MAX_SELECTED_IOSTORE_PROBE_BYTES,
         MAX_SELECTED_IOSTORE_PROBE_BYTES,
     )?;
     if selected == 0 {
@@ -135,11 +138,15 @@ fn stage_iostore_probe_files(
 }
 
 fn selected_utoc_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let directory = root.join(r"Content\Paks\~mods");
+    // Mods in the wild use `~mods`, `mods`, and author-named directories below
+    // Content/Paks. The probe is read-only and retains each exact relative
+    // path, so scan the stable Paks boundary instead of assuming one publisher
+    // directory.
+    let directory = root.join(r"Content\Paks");
     let directory_metadata = fs::symlink_metadata(&directory)
-        .context("reading the selected mod Content/Paks/~mods directory")?;
+        .context("reading the selected mod Content/Paks directory")?;
     if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
-        bail!("selected mod root has no Content/Paks/~mods directory");
+        bail!("selected mod root has no Content/Paks directory");
     }
     let mut files = Vec::new();
     for (index, entry) in WalkDir::new(&directory)
@@ -167,7 +174,7 @@ fn selected_utoc_files(root: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort_by_key(|path| path.to_string_lossy().to_ascii_lowercase());
     if files.is_empty() {
-        bail!("selected mod root contains no UTOC files under Content/Paks/~mods");
+        bail!("selected mod root contains no UTOC files under Content/Paks");
     }
     let mut selected_bytes = 0_u64;
     for utoc in &files {
@@ -415,6 +422,20 @@ mod tests {
         let nested = temporary
             .path()
             .join(r"Content\Paks\~mods\WeaponPack\Containers");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Fixture.utoc"), b"utoc").unwrap();
+        fs::write(nested.join("Fixture.ucas"), b"ucas").unwrap();
+
+        let files = selected_utoc_files(temporary.path()).unwrap();
+        assert_eq!(files, vec![nested.join("Fixture.utoc")]);
+    }
+
+    #[test]
+    fn discovers_container_sets_under_named_paks_directories() {
+        let temporary = tempfile::tempdir().unwrap();
+        let nested = temporary
+            .path()
+            .join(r"Content\Paks\Author Name\Containers");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("Fixture.utoc"), b"utoc").unwrap();
         fs::write(nested.join("Fixture.ucas"), b"ucas").unwrap();

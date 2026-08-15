@@ -10,8 +10,9 @@ The release builder runs:
 1. cargo fmt --all -- --check
 2. cargo test
 3. cargo build --release --bins
-4. obr-report deterministic smoke run through the ordinary test suite
-5. SHA-256 manifest generation for every shipped file
+4. executable FileVersion and ProductVersion verification
+5. privacy scan of every shipped file
+6. SHA-256 manifest generation for every shipped file
 
 Run:
 
@@ -20,8 +21,7 @@ Run:
 Output is written below ignored dist. The ZIP contains:
 
 - OBR Mod Updater.exe
-- obr-report.exe
-- obr-offhand-export.exe
+- WHATS-NEW.md
 - README.txt
 - Dependencies/PLACE TOOL ARCHIVES HERE.txt
 - LICENSE
@@ -35,21 +35,19 @@ game files, local settings, logs, captures, target, or temporary work.
 
 - Report inventory is structurally verified only to the level stated in its
   checks and metadata strategy.
-- Native additive output is a candidate_ready_for_runtime_test.
-- Staff A donor output retains runtimeVerified false until the authoritative
-  probe capture is archived and reviewed, despite the prior human shipping-game
-  confirmation.
-- Staff B remains unavailable.
-- Final release wording is blocked on the two-staff workflow and representative
-  shipping-game evidence required by the handoff.
+- A published conversion remains `candidate_ready_for_runtime_test`; successful
+  structural validation is not a gameplay claim.
+- Unsupported export classes, unresolved dependencies, missing package
+  identities, plugin semantics, and ambiguous authored choices remain
+  report-only.
+- Tested-against lists distinguish structural conversion results from completed
+  shipping-game runtime validation.
 
 ## Manual production gates still open
 
-- Reproducible Staff B current-engine donor.
-- Staff B Rust adapter with independent hashes and fail-closed anchors.
-- Full mod assembly with repaired Staff A and Staff B plus untouched content.
-- Shipping runtime probe for Staff A and BP_Iron_Shield_C with
-  actorHandlePresent true and capture_end.
-- Equivalent visual, physics, and probe gates for Staff B.
-- Archive raw JSONL and SHA-256 under docs/research/runtime-probes after reading
-  its compact unique index first.
+- Open the staged executable and confirm the visible version matches the release.
+- Confirm ZIP membership and checksums match the generated release manifest.
+- Exercise representative conversion candidates in the shipping game before
+  making runtime behavior claims.
+- Label structurally verified candidates as runtime-unverified until that test
+  is complete.

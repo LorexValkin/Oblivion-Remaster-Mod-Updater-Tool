@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1 - 2026-08-14
+
+- Add `native-composite-package-rebase-v1`, a system-wide package adapter that classifies decoded exports across content domains instead of matching mod or asset names. It supports guarded StaticMesh, Texture2D, material-instance, SkeletalMesh, and exact current-template package repairs.
+- Rebase stale current-template import tables only when package identity, cooked flags, import semantics, and export topology agree with the current game. Authored exports and sidecars must remain byte-identical, and every rebuilt package path, ID, import set, and payload is verified again after a current-Zen round trip.
+- Repair SkeletalMesh skeleton and PhysicsAsset imports only when serialized properties prove their roles. Existing custom material imports remain authored dependencies, and retired physics references are removed only under the explicit current-donor policy.
+- Make composite extraction transactional: directory batching is now a speculative optimization whose output is discarded unless it contains the exact requested package set; exact per-package extraction remains the fallback.
+- Recognize mod container sets under any bounded `Content/Paks` subdirectory for classification and read-only dependency diagnostics, including `~mods`, `mods`, and author-named folders.
+- Separate archive per-entry limits from total selected-payload limits so large bounded IoStore members can be diagnosed without weakening metadata limits.
+- Add the project-wide rule that compatibility work must first be expressed as reusable, evidence-driven, fail-closed behavior; mod-specific exceptions remain a documented last resort.
+- Structurally converted CL Blades 1.3 as a 41-package, two-container candidate with current imports and authored payloads verified. Runtime behavior remains unverified and still requires an in-game test.
+
 ## 0.6.0 - 2026-08-14
 
 - Upgrade preflight reports to schema v8 with bounded per-package diagnostics for heterogeneous replacement containers, including exact replacements, additions, path/ID conflicts, and complete dependency-edge results.

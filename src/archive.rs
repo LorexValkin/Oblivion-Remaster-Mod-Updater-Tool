@@ -356,17 +356,15 @@ fn selected_extension(path: &Path, extensions: &[&str]) -> bool {
         })
 }
 
-fn add_selected_size(total: &mut u64, size: u64, limit: u64) -> Result<()> {
-    if size > MAX_SELECTED_METADATA_ENTRY_BYTES {
-        bail!(
-            "selected archive entry declares {size} bytes; per-entry limit is {MAX_SELECTED_METADATA_ENTRY_BYTES}"
-        );
+fn add_selected_size(total: &mut u64, size: u64, total_limit: u64, entry_limit: u64) -> Result<()> {
+    if size > entry_limit {
+        bail!("selected archive entry declares {size} bytes; per-entry limit is {entry_limit}");
     }
     *total = total
         .checked_add(size)
         .context("selected archive entry size overflow")?;
-    if *total > limit {
-        bail!("selected archive entries declare {total} bytes; limit is {limit}");
+    if *total > total_limit {
+        bail!("selected archive entries declare {total} bytes; limit is {total_limit}");
     }
     Ok(())
 }
@@ -425,6 +423,7 @@ fn extract_selected_zip(
     destination: &Path,
     extensions: &[&str],
     selected_bytes_limit: u64,
+    selected_entry_bytes_limit: u64,
 ) -> Result<usize> {
     let mut archive = zip::ZipArchive::new(File::open(source)?)
         .with_context(|| format!("reading ZIP {}", source.display()))?;
@@ -459,7 +458,12 @@ fn extract_selected_zip(
             .checked_add(entry.size())
             .context("ZIP declared size overflow")?;
         if selected_extension(&relative, extensions) {
-            add_selected_size(&mut selected_bytes, entry.size(), selected_bytes_limit)?;
+            add_selected_size(
+                &mut selected_bytes,
+                entry.size(),
+                selected_bytes_limit,
+                selected_entry_bytes_limit,
+            )?;
             selected_count += 1;
         }
     }
@@ -499,6 +503,7 @@ fn extract_selected_7z(
     destination: &Path,
     extensions: &[&str],
     selected_bytes_limit: u64,
+    selected_entry_bytes_limit: u64,
 ) -> Result<usize> {
     let reader = sevenz_rust::SevenZReader::open(source, sevenz_rust::Password::empty())
         .with_context(|| format!("reading 7Z metadata {}", source.display()))?;
@@ -531,7 +536,12 @@ fn extract_selected_7z(
             .checked_add(entry.size())
             .context("7Z declared size overflow")?;
         if is_selected {
-            add_selected_size(&mut selected_bytes, entry.size(), selected_bytes_limit)?;
+            add_selected_size(
+                &mut selected_bytes,
+                entry.size(),
+                selected_bytes_limit,
+                selected_entry_bytes_limit,
+            )?;
         }
         expected.push(ValidatedSevenZEntry::from_entry(entry, is_selected));
     }
@@ -617,6 +627,7 @@ fn extract_selected_rar(
     destination: &Path,
     extensions: &[&str],
     selected_bytes_limit: u64,
+    selected_entry_bytes_limit: u64,
 ) -> Result<usize> {
     let expected = rar_entries(source)?;
     let mut selected_bytes = 0_u64;
@@ -628,6 +639,7 @@ fn extract_selected_rar(
                 &mut selected_bytes,
                 entry.unpacked_size,
                 selected_bytes_limit,
+                selected_entry_bytes_limit,
             )
             .map(|_| 1_usize)
         })
@@ -705,6 +717,27 @@ pub fn extract_archive_files_with_extensions(
     extensions: &[&str],
     selected_bytes_limit: u64,
 ) -> Result<usize> {
+    extract_archive_files_with_extensions_bounded(
+        source,
+        destination,
+        extensions,
+        selected_bytes_limit,
+        selected_bytes_limit.min(MAX_SELECTED_METADATA_ENTRY_BYTES),
+    )
+}
+
+/// Validates the complete archive inventory while allowing the caller to set a
+/// separate per-entry bound for large selected payloads such as IoStore UCAS files.
+pub fn extract_archive_files_with_extensions_bounded(
+    source: &Path,
+    destination: &Path,
+    extensions: &[&str],
+    selected_bytes_limit: u64,
+    selected_entry_bytes_limit: u64,
+) -> Result<usize> {
+    if selected_entry_bytes_limit > selected_bytes_limit {
+        bail!("selected archive per-entry limit exceeds the total selected-byte limit");
+    }
     fs::create_dir_all(destination)?;
     match source
         .extension()
@@ -713,9 +746,27 @@ pub fn extract_archive_files_with_extensions(
         .to_ascii_lowercase()
         .as_str()
     {
-        "zip" => extract_selected_zip(source, destination, extensions, selected_bytes_limit),
-        "7z" => extract_selected_7z(source, destination, extensions, selected_bytes_limit),
-        "rar" => extract_selected_rar(source, destination, extensions, selected_bytes_limit),
+        "zip" => extract_selected_zip(
+            source,
+            destination,
+            extensions,
+            selected_bytes_limit,
+            selected_entry_bytes_limit,
+        ),
+        "7z" => extract_selected_7z(
+            source,
+            destination,
+            extensions,
+            selected_bytes_limit,
+            selected_entry_bytes_limit,
+        ),
+        "rar" => extract_selected_rar(
+            source,
+            destination,
+            extensions,
+            selected_bytes_limit,
+            selected_entry_bytes_limit,
+        ),
         extension => bail!("unsupported archive extension: {extension}"),
     }
 }
@@ -819,6 +870,20 @@ pub fn create_zip_from_paths(output: &Path, root: &Path, paths: &[PathBuf]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_entry_bound_is_independent_from_the_total_bound() {
+        let mut total = 0_u64;
+        add_selected_size(&mut total, 96, 256, 128).unwrap();
+        assert_eq!(total, 96);
+        assert!(
+            add_selected_size(&mut total, 160, 512, 128)
+                .unwrap_err()
+                .to_string()
+                .contains("per-entry limit is 128")
+        );
+        assert!(add_selected_size(&mut total, 40, 128, 128).is_err());
+    }
 
     #[test]
     fn directory_digest_is_stable() {

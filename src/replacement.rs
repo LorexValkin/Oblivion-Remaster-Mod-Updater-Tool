@@ -3845,6 +3845,108 @@ pub(crate) fn verify_donor_rebinds_consumed(
     Ok(())
 }
 
+pub const IDENTITY_ALIAS_RECOVERY_PROBE_API: &str = "zen-package-identity-alias-recovery-probe-v1";
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityAliasEdgeSummary {
+    pub consumer_package_id: u64,
+    pub consumer_package_path: String,
+    pub stale_package_id: u64,
+    pub authored_package_name: String,
+    pub alias_source_package_id: u64,
+    pub alias_source_package_path: String,
+    pub expected_class: String,
+    pub role: String,
+    pub role_export_name: String,
+}
+
+/// Report-only summary of the composite identity-alias recovery run against a staged
+/// mod's containers: which stale package IDs recover to disclosed, role-proven,
+/// uniquely selected bundled winners.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityAliasRecoveryProbeSummary {
+    pub api: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    pub alias_count: usize,
+    pub suppression_count: usize,
+    pub aliases: Vec<IdentityAliasEdgeSummary>,
+    pub blockers: Vec<String>,
+}
+
+/// Runs the same fail-closed identity recovery the update lanes use, in a scratch view,
+/// and reports the recovered alias plan without mutating anything the caller keeps.
+pub fn probe_identity_alias_recovery(
+    mod_input: &Path,
+    game_root: &Path,
+) -> Result<IdentityAliasRecoveryProbeSummary> {
+    let work = tempfile::Builder::new()
+        .prefix("obr-identity-alias-probe-")
+        .tempdir()?;
+    let staged = work.path().join("source");
+    stage_input(mod_input, &staged)?;
+    let container_root = unique_container_parent(&staged)?;
+    let retoc = RetocTool::materialize()?;
+    let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
+    let source_view = create_additive_probe_view(game_root)?;
+    for container in &inspection.containers {
+        for source in [&container.utoc, &container.ucas, &container.pak] {
+            fs::copy(
+                source,
+                source_view.path().join(
+                    source
+                        .file_name()
+                        .context("source container has no filename")?,
+                ),
+            )?;
+        }
+    }
+    let recovery = recover_composite_package_identities(
+        &inspection,
+        &retoc,
+        source_view.path(),
+        &work.path().join("identity-recovery"),
+    )?;
+    let summary = match recovery {
+        None => IdentityAliasRecoveryProbeSummary {
+            api: IDENTITY_ALIAS_RECOVERY_PROBE_API.to_owned(),
+            status: "none-required".to_owned(),
+            provider_name: None,
+            alias_count: 0,
+            suppression_count: 0,
+            aliases: Vec::new(),
+            blockers: Vec::new(),
+        },
+        Some(recovery) => IdentityAliasRecoveryProbeSummary {
+            api: IDENTITY_ALIAS_RECOVERY_PROBE_API.to_owned(),
+            status: "recovered".to_owned(),
+            provider_name: Some(recovery.provider_name.clone()),
+            alias_count: recovery.aliases.len(),
+            suppression_count: recovery.suppressions.len(),
+            aliases: recovery
+                .aliases
+                .iter()
+                .map(|alias| IdentityAliasEdgeSummary {
+                    consumer_package_id: alias.consumer_package_id,
+                    consumer_package_path: alias.consumer_package_path.clone(),
+                    stale_package_id: alias.identity.target_package_id,
+                    authored_package_name: alias.identity.target_package_path.clone(),
+                    alias_source_package_id: alias.identity.source_package_id,
+                    alias_source_package_path: alias.identity.source_package_path.clone(),
+                    expected_class: alias.expected_class.clone(),
+                    role: alias.role.role.clone(),
+                    role_export_name: alias.role.export_name.clone(),
+                })
+                .collect(),
+            blockers: Vec::new(),
+        },
+    };
+    Ok(summary)
+}
+
 pub fn probe_composite_package_input(
     mod_input: &Path,
     game_root: &Path,

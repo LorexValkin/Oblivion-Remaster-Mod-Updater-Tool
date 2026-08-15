@@ -19,18 +19,21 @@ use crate::mixed::{
     probe_mixed_iostore_dependencies,
 };
 use crate::plugin::{
-    ADDITIVE_CONTRACT_API, AdditiveContractReport, PLUGIN_MANIFEST_API, PluginSetReport,
-    WORLDSPACE_MASTER_PROBE_API, WorldspaceMasterProbeReport, inspect_additive_contract_input,
+    ADDITIVE_CONTRACT_API, AdditiveContractReport, MagicLoaderSyncMapGate, PLUGIN_MANIFEST_API,
+    PluginSetReport, WORLDSPACE_MASTER_PROBE_API, WorldspaceMasterProbeReport,
+    inspect_additive_contract_input, inspect_magicloader_syncmap_gate,
     inspect_plugin_input_at_root, inspect_worldspace_master_probe_input,
 };
 use crate::replacement::{
     ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, COMPOSITE_PACKAGE_REBASE_ADAPTER,
     HETEROGENEOUS_REPLACEMENT_ADAPTER, HeterogeneousReplacementProbeSummary,
+    IDENTITY_ALIAS_RECOVERY_PROBE_API, IdentityAliasRecoveryProbeSummary,
     MIXED_ARMOR_REPLACEMENT_ADAPTER, MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API,
     MixedReplacementPackageDiagnosticReport, ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER,
     diagnose_mixed_replacement_input, probe_additive_static_mesh_input,
-    probe_composite_package_input, probe_heterogeneous_replacement_input, probe_input,
-    probe_mixed_armor_input, probe_texture_input, stage_input,
+    probe_composite_package_input, probe_heterogeneous_replacement_input,
+    probe_identity_alias_recovery, probe_input, probe_mixed_armor_input, probe_texture_input,
+    stage_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -220,6 +223,10 @@ pub struct PreflightReport {
     pub mixed_replacement_package_diagnostic: Option<MixedReplacementPackageDiagnosticReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layered_iostore_dependency_probe: Option<LayeredIoStoreDependencyReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_alias_recovery_probe: Option<IdentityAliasRecoveryProbeSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub magicloader_syncmap_gate: Option<MagicLoaderSyncMapGate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub install_plan: Option<InstallPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1160,6 +1167,117 @@ fn analyze_internal(
         } else {
             (None, None)
         };
+    let identity_alias_recovery_probe = if magic_loader_layout
+        && mixed_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|probe| !probe.dependencies.fully_resolved)
+    {
+        if let Some(game) = game.as_ref().filter(|value| value.valid) {
+            progress("Attempting fail-closed identity-alias recovery for stale package imports");
+            match probe_identity_alias_recovery(&request.mod_input, &game.root) {
+                Ok(summary) => Some(summary),
+                Err(error) => Some(IdentityAliasRecoveryProbeSummary {
+                    api: IDENTITY_ALIAS_RECOVERY_PROBE_API.to_owned(),
+                    status: "unavailable".to_owned(),
+                    provider_name: None,
+                    alias_count: 0,
+                    suppression_count: 0,
+                    aliases: Vec::new(),
+                    blockers: vec![redact_preflight_error(&error, request)],
+                }),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let recovered_alias_pairs = identity_alias_recovery_probe
+        .iter()
+        .flat_map(|probe| {
+            probe
+                .aliases
+                .iter()
+                .map(|alias| (alias.consumer_package_id, alias.stale_package_id))
+        })
+        .collect::<BTreeSet<_>>();
+    let mixed_unresolved_recovered = mixed_iostore_dependency_probe
+        .as_ref()
+        .is_some_and(|probe| {
+            !probe.dependencies.fully_resolved
+                && !probe.dependencies.unresolved_edges.is_empty()
+                && probe.dependencies.unresolved_edges.iter().all(|edge| {
+                    recovered_alias_pairs
+                        .contains(&(edge.source_package_id, edge.missing_dependency_package_id))
+                })
+        });
+    let magicloader_syncmap_gate = if magic_loader_layout {
+        Some(
+            inspect_magicloader_syncmap_gate(
+                &request.mod_input,
+                inventory
+                    .as_ref()
+                    .and_then(|value| value.candidate_mod_root.as_deref()),
+            )
+            .unwrap_or_else(|error| MagicLoaderSyncMapGate {
+                api: crate::plugin::MAGICLOADER_SYNCMAP_KEY_GATE_API.to_owned(),
+                status: "blocked".to_owned(),
+                entry_count: 0,
+                plugin_owned_key_count: 0,
+                blockers: vec![redact_preflight_error(&error, request)],
+            }),
+        )
+    } else {
+        None
+    };
+    let mut magicloader_lane_blockers = Vec::new();
+    if magic_loader_layout {
+        let semantics_proven = worldspace_master_probe.as_ref().is_some_and(|probe| {
+            probe.resolution_complete
+                && probe
+                    .semantic_gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.status == "proven")
+        });
+        if !semantics_proven {
+            magicloader_lane_blockers
+                .push("current-master-worldspace-semantics-not-proven".to_owned());
+        }
+        let deletion_policy_proven = worldspace_master_probe.as_ref().is_some_and(|probe| {
+            probe.deleted_master_override_count == 0
+                || probe
+                    .deleted_override_policy
+                    .as_ref()
+                    .is_some_and(|policy| policy.status == "provable")
+        });
+        if !deletion_policy_proven {
+            magicloader_lane_blockers.push("deleted-master-record-policy-not-proven".to_owned());
+        }
+        match mixed_iostore_dependency_probe.as_ref() {
+            Some(probe) => {
+                if probe.collision_count > 0 {
+                    magicloader_lane_blockers.push("source-current-package-collisions".to_owned());
+                }
+                if !probe.dependencies.fully_resolved && !mixed_unresolved_recovered {
+                    magicloader_lane_blockers.push("mixed-zen-dependencies-unresolved".to_owned());
+                }
+            }
+            None => magicloader_lane_blockers
+                .push("mixed-zen-dependency-probe-unavailable".to_owned()),
+        }
+        if magicloader_syncmap_gate
+            .as_ref()
+            .is_none_or(|gate| gate.status != "proven")
+        {
+            magicloader_lane_blockers.push("syncmap-plugin-key-gate-blocked".to_owned());
+        }
+        if !game_valid {
+            magicloader_lane_blockers.push("current-game-unavailable".to_owned());
+        }
+    }
+    let magicloader_worldspace_gate_ready =
+        magic_loader_layout && magicloader_lane_blockers.is_empty();
+    let requires_runtime = requires_runtime || magicloader_worldspace_gate_ready;
     let (
         armor_probe,
         armor_probe_error,
@@ -1787,17 +1905,35 @@ fn analyze_internal(
                 .map(|(kind, count)| format!("{kind}={count}"))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let worldspace_gates_proven = worldspace_master_probe.as_ref().is_some_and(|probe| {
+                probe.resolution_complete
+                    && probe
+                        .semantic_gate
+                        .as_ref()
+                        .is_some_and(|gate| gate.status == "proven")
+                    && (probe.deleted_master_override_count == 0
+                        || probe
+                            .deleted_override_policy
+                            .as_ref()
+                            .is_some_and(|policy| policy.status == "provable"))
+            });
             checks.push(CheckResult {
                 id: "mixed-worldspace-plugin-semantics".to_owned(),
-                status: "warning".to_owned(),
+                status: if worldspace_gates_proven { "pass" } else { "warning" }.to_owned(),
                 blocking: false,
-                message: format!(
-                    "The ESP declares {declared_master_count} master(s) and {master_override_count} master override(s) ({override_summary}), with {deleted_record_count} deleted record(s). Byte preservation proves identity, not compatibility for current CELL/REFR/WRLD or deleted-record semantics."
-                ),
-                remediation: Some(
+                message: if worldspace_gates_proven {
+                    format!(
+                        "The ESP declares {declared_master_count} master(s) and {master_override_count} master override(s) ({override_summary}), with {deleted_record_count} deleted record(s). Every live override passed the per-subrecord current-master semantic gate and every deletion stub satisfies the fail-closed undelete-and-disable witness contract; disclosed revert-risk fields still require the shipping-game runtime test."
+                    )
+                } else {
+                    format!(
+                        "The ESP declares {declared_master_count} master(s) and {master_override_count} master override(s) ({override_summary}), with {deleted_record_count} deleted record(s). Byte preservation proves identity, not compatibility for current CELL/REFR/WRLD or deleted-record semantics."
+                    )
+                },
+                remediation: (!worldspace_gates_proven).then(|| {
                     "Keep this archive report-only until a bridge-aware multi-master adapter resolves current master records and has an explicit deleted-REFR policy."
-                        .to_owned(),
-                ),
+                        .to_owned()
+                }),
             });
         }
         if magic_loader_layout {
@@ -1847,7 +1983,7 @@ fn analyze_internal(
                     .join("; ");
                 checks.push(CheckResult {
                 id: "mixed-iostore-dependency-closure".to_owned(),
-                status: if probe.dependencies.fully_resolved {
+                status: if probe.dependencies.fully_resolved || mixed_unresolved_recovered {
                     "pass"
                 } else {
                     "warning"
@@ -1859,13 +1995,20 @@ fn analyze_internal(
                         "Resolved all {} package dependency edge(s) against bundled mod or current-game packages.",
                         probe.dependencies.dependency_edge_count
                     )
+                } else if mixed_unresolved_recovered {
+                    format!(
+                        "Resolved {}/{} package dependency edge(s) directly; the remaining {} stale import(s) recover to disclosed, role-proven bundled identity aliases: {unresolved_summary}",
+                        probe.dependencies.resolved_edge_count,
+                        probe.dependencies.dependency_edge_count,
+                        probe.dependencies.unresolved_edge_count
+                    )
                 } else {
                     format!(
                         "Found {} unresolved package dependency edge(s): {unresolved_summary}",
                         probe.dependencies.unresolved_edge_count
                     )
                 },
-                remediation: (!probe.dependencies.fully_resolved).then(|| {
+                remediation: (!probe.dependencies.fully_resolved && !mixed_unresolved_recovered).then(|| {
                     "Use a current-version mod package that removes the stale assets, or wait for a class- and shader-aware repair adapter; unresolved package IDs are never dropped automatically."
                         .to_owned()
                 }),
@@ -1883,6 +2026,17 @@ fn analyze_internal(
                     ),
                 });
             }
+            checks.push(check(
+                "magicloader-worldspace-gate",
+                magicloader_worldspace_gate_ready,
+                true,
+                "The MagicLoader worldspace lane gates passed: current-master override semantics, the undelete-and-disable deletion policy, the package dependency closure, and the SyncMap plugin-key gate are all proven.",
+                format!(
+                    "The MagicLoader worldspace lane is blocked: {}",
+                    magicloader_lane_blockers.join(", ")
+                ),
+                Some("Each named gate fails closed; the mod stays report-only until every gate is proven against the current game."),
+            ));
         }
     }
     if complex_worldspace_plugin {
@@ -2237,6 +2391,8 @@ fn analyze_internal(
         || (additive_shape && composite_package_probe.is_some());
     let additive_can_update =
         additive_shape && additive_dependency_closure && adapter_blockers.is_empty();
+    let magicloader_can_update =
+        magicloader_worldspace_gate_ready && adapter_blockers.is_empty();
     let armor_can_update =
         replacement_shape && armor_probe.is_some() && adapter_blockers.is_empty();
     let mixed_armor_can_update =
@@ -2251,6 +2407,7 @@ fn analyze_internal(
     let composite_package_can_update =
         replacement_shape && composite_package_probe.is_some() && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
+        || magicloader_can_update
         || armor_can_update
         || mixed_armor_can_update
         || texture_can_update
@@ -2401,33 +2558,18 @@ fn analyze_internal(
     });
     capabilities.push(Capability {
         id: "native-magicloader-worldspace-syncmap-v1".to_owned(),
-        available: false,
-        evidence_level: "report-only-cross-plane-inventory".to_owned(),
-        description: "Reserved fail-closed lane for a MagicLoader sidecar, multi-master worldspace ESP, stock-plus-mod SyncMap closure, and additive Unreal packages. It remains unavailable until current-master override semantics and every Unreal dependency are proven.".to_owned(),
+        available: magicloader_can_update,
+        evidence_level: if magicloader_can_update {
+            "guarded-structural-adapter".to_owned()
+        } else {
+            "report-only-cross-plane-inventory".to_owned()
+        },
+        description: "Fail-closed lane for a MagicLoader sidecar, a multi-master worldspace ESP, stock-plus-mod SyncMap closure, and additive Unreal packages. Live master overrides must pass the per-subrecord three-way current-master semantic gate, witness-shaped REFR deletion stubs are rewritten as undeleted, initially disabled, player-opposite enable-parented overrides, and stale bundled imports may resolve only through disclosed, role-proven identity aliases. The output is a runtime-test candidate; the MagicLoader runtime itself is disclosed but never installed by the updater.".to_owned(),
         blockers: if magic_loader_layout {
-            let mut blockers = vec!["current-master-worldspace-semantics-not-proven".to_owned()];
-            match mixed_iostore_dependency_probe.as_ref() {
-                Some(probe) => {
-                    if probe.collision_count > 0 {
-                        blockers.push("source-current-package-collisions".to_owned());
-                    }
-                    if !probe.dependencies.fully_resolved {
-                        blockers.push("mixed-zen-dependencies-unresolved".to_owned());
-                    }
-                }
-                None => blockers.push("mixed-zen-dependency-probe-unavailable".to_owned()),
-            }
-            if plugin_compatibility.as_ref().is_some_and(|report| {
-                report
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.deleted_record_count > 0)
-            }) {
-                blockers.push("deleted-master-record-policy-not-proven".to_owned());
-            }
-            if !magic_loader_installed {
-                blockers.push("magicloader-runtime-not-installed".to_owned());
-            }
+            let mut blockers = magicloader_lane_blockers.clone();
+            blockers.extend(adapter_blockers.iter().cloned());
+            blockers.sort();
+            blockers.dedup();
             blockers
         } else {
             vec!["mod-layout-does-not-match-magicloader-worldspace-lane".to_owned()]
@@ -2531,6 +2673,7 @@ fn analyze_internal(
         blockers: vec!["audited-donor-selection-required".to_owned()],
     });
     if !additive_shape
+        && !magicloader_worldspace_gate_ready
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
         && composite_package_probe.is_none()
@@ -2549,6 +2692,8 @@ fn analyze_internal(
     }
     let selected_adapter = if additive_can_update {
         Some("native-additive-syncmap-v1".to_owned())
+    } else if magicloader_can_update {
+        Some("native-magicloader-worldspace-syncmap-v1".to_owned())
     } else if armor_can_update {
         Some(ARMOR_REPLACEMENT_ADAPTER.to_owned())
     } else if mixed_armor_can_update {
@@ -2571,7 +2716,22 @@ fn analyze_internal(
         disposition_blockers.extend(plugin.blockers.iter().cloned());
     }
     if let Some(layered) = layered_iostore_dependency_probe.as_ref() {
-        disposition_blockers.extend(layered.blockers.iter().cloned());
+        if mixed_unresolved_recovered {
+            // Every unresolved layered edge is covered by the disclosed, role-proven
+            // identity-alias recovery reported in identityAliasRecoveryProbe; only the
+            // uncovered blockers remain dispositive.
+            disposition_blockers.extend(
+                layered
+                    .blockers
+                    .iter()
+                    .filter(|blocker| {
+                        !blocker.starts_with("unresolved-layered-package-dependencies:")
+                    })
+                    .cloned(),
+            );
+        } else {
+            disposition_blockers.extend(layered.blockers.iter().cloned());
+        }
     }
     if let Some(logical) = logical_install_analysis.as_ref() {
         disposition_blockers.extend(logical.disposition.blocker_ids.iter().cloned());
@@ -2594,6 +2754,7 @@ fn analyze_internal(
     } else if layered_iostore_dependency_probe
         .as_ref()
         .is_some_and(|report| !report.resolution_complete)
+        && !mixed_unresolved_recovered
     {
         (
             "dependency-closure-unresolved",
@@ -2667,6 +2828,8 @@ fn analyze_internal(
         mixed_iostore_dependency_probe,
         mixed_replacement_package_diagnostic,
         layered_iostore_dependency_probe,
+        identity_alias_recovery_probe,
+        magicloader_syncmap_gate,
         install_plan,
         logical_install_analysis,
         unreal_replacement_probe: replacement_probe,

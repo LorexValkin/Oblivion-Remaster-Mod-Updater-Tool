@@ -103,6 +103,113 @@ fn updates_current_offhand_staves_fixture() {
 }
 
 #[test]
+#[ignore = "requires an installed game and a local MagicLoader worldspace fixture"]
+fn updates_current_magicloader_worldspace_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let expected_package_count = std::env::var("OBR_TEST_MAGICLOADER_PACKAGE_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("invalid package count"))
+        .unwrap_or(14);
+    let expected_undelete_count = std::env::var("OBR_TEST_MAGICLOADER_UNDELETE_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("invalid undelete count"))
+        .unwrap_or(30);
+    let expected_alias_count = std::env::var("OBR_TEST_MAGICLOADER_ALIAS_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("invalid alias count"))
+        .unwrap_or(2);
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-magicloader-worldspace-syncmap-v1".to_owned(),
+            mod_input: required("OBR_TEST_MAGICLOADER_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error|
+
+        panic!("magicloader worldspace update failed:\n{error:#}\n{}", log.join("\n"))
+    );
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    assert_eq!(outcome.adapter, "native-magicloader-worldspace-syncmap-v1");
+    assert_eq!(outcome.package_count, expected_package_count);
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["schema"], "obr-magicloader-worldspace-update-report");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["adapter"], "native-magicloader-worldspace-syncmap-v1");
+    let fix_apis = report["fixApis"].as_array().unwrap();
+    for required_api in [
+        "tes4-undelete-and-disable-v1",
+        "tes4-current-master-semantic-gate-v1",
+        "tes4-magicloader-worldspace-policy-v1",
+        "zen-approved-dependency-migration-v1",
+    ] {
+        assert!(
+            fix_apis.iter().any(|value| value == required_api),
+            "missing fix API {required_api}"
+        );
+    }
+    if expected_alias_count > 0 {
+        assert!(
+            fix_apis
+                .iter()
+                .any(|value| value == "package-root-public-export-identity-alias-v1")
+        );
+    }
+    let identity = &report["identity"];
+    assert_eq!(identity["espUndeleteDisableCount"], expected_undelete_count);
+    assert_eq!(
+        identity["espUndeleteDisableRewrite"],
+        expected_undelete_count > 0
+    );
+    assert_eq!(identity["espSemanticInventoryMerge"], false);
+    assert_eq!(identity["worldspaceSemanticGate"]["status"], "proven");
+    if expected_undelete_count > 0 {
+        let policy = &identity["deletedOverridePolicy"];
+        assert_eq!(policy["status"], "provable");
+        assert_eq!(policy["deletionStubCount"], expected_undelete_count);
+        assert_eq!(policy["transformableCount"], expected_undelete_count);
+        assert_eq!(
+            policy["records"].as_array().unwrap().len(),
+            expected_undelete_count
+        );
+    }
+    assert_eq!(
+        identity["persistentUnrealIdentityAliasCount"],
+        expected_alias_count
+    );
+    let sync_resolutions = identity["syncMapResolutions"].as_array().unwrap();
+    assert!(!sync_resolutions.is_empty());
+    assert!(sync_resolutions.iter().all(|resolution| {
+        let kind = resolution["resolution"].as_str().unwrap_or_default();
+        kind.starts_with("exact-package-path") || kind.starts_with("unique-object-leaf")
+    }));
+    assert!(
+        !report["magicLoader"]["sidecars"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        report["verification"]["packageDependencyGraphsPreserved"],
+        true
+    );
+    assert_eq!(report["verification"]["dependencyCompleteExtraction"], true);
+    assert_eq!(report["unreal"]["targetPathCollisionCount"], 0);
+}
+
+#[test]
 #[ignore = "requires an installed game and a local composite-package fixture"]
 fn probes_current_composite_package_fixture() {
     let required = |name: &str| {

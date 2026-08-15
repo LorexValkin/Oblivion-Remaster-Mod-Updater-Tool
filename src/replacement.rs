@@ -182,6 +182,13 @@ pub(crate) enum ProvenHeterogeneousAsset {
 #[serde(rename_all = "kebab-case")]
 pub enum MixedReplacementIdentityStatus {
     ExactReplacement,
+    /// The container stores this package at its mount root with no
+    /// project/Content prefix, and the authoritative package ID matches
+    /// exactly one current-game package whose filename also matches. The
+    /// package ID is the load-time identity in IoStore, so this is an
+    /// unambiguous replacement of that current package, disclosed separately
+    /// from an exact path match.
+    ExactReplacementViaRootAlias,
     Additive,
     PathConflict,
     PackageIdConflict,
@@ -221,6 +228,7 @@ pub struct MixedReplacementPackageDiagnosticReport {
     pub source_package_count: usize,
     pub current_game_package_count: usize,
     pub exact_replacement_count: usize,
+    pub root_alias_replacement_count: usize,
     pub additive_package_count: usize,
     pub conflict_package_count: usize,
     pub path_conflict_count: usize,
@@ -262,6 +270,31 @@ fn diagnostic_package_name(path: &str) -> String {
         .next()
         .unwrap_or(path)
         .to_owned()
+}
+
+/// Recognizes a package stored directly at its container mount root: after
+/// dropping leading traversal segments, exactly one UAsset/UMap filename must
+/// remain with no directory or embedded traversal. Such a path carries no
+/// project or Content location of its own, so it can only ever be resolved
+/// through its authoritative package ID; anything else returns `None`.
+fn bare_root_alias_leaf(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let mut segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .peekable();
+    while segments.peek().is_some_and(|segment| *segment == "..") {
+        segments.next();
+    }
+    let leaf = segments.next()?;
+    if leaf == ".." || segments.next().is_some() {
+        return None;
+    }
+    let lower = leaf.to_ascii_lowercase();
+    if !(lower.ends_with(".uasset") || lower.ends_with(".umap")) {
+        return None;
+    }
+    Some(leaf.to_owned())
 }
 
 fn safe_diagnostic_candidate_root(candidate_root: Option<&str>) -> Result<PathBuf> {
@@ -448,7 +481,20 @@ fn build_mixed_replacement_diagnostic_report(
                 }
                 (None, None) => MixedReplacementIdentityStatus::Additive,
                 (None, Some(_)) => MixedReplacementIdentityStatus::PathConflict,
-                (Some(_), None) => MixedReplacementIdentityStatus::PackageIdConflict,
+                (Some(by_id), None) => {
+                    // Both package stores were already validated to hold unique
+                    // package IDs, so `by_id` is the only current package this
+                    // ID can name. A mount-root file whose filename also
+                    // matches that package is an unambiguous identity alias;
+                    // any other ID-only match stays a fail-closed conflict.
+                    if bare_root_alias_leaf(&package.path).is_some_and(|leaf| {
+                        leaf.eq_ignore_ascii_case(&diagnostic_package_name(&by_id.path))
+                    }) {
+                        MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
+                    } else {
+                        MixedReplacementIdentityStatus::PackageIdConflict
+                    }
+                }
                 (Some(_), Some(_)) => MixedReplacementIdentityStatus::PathAndPackageIdConflict,
             };
             let mut imported_package_ids = package.imported_package_ids.clone();
@@ -507,12 +553,19 @@ fn build_mixed_replacement_diagnostic_report(
             )
         })
         .count();
+    let root_alias_replacement_count = packages
+        .iter()
+        .filter(|package| {
+            package.identity_status == MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
+        })
+        .count();
     let conflict_package_count = packages
         .iter()
         .filter(|package| {
             !matches!(
                 package.identity_status,
                 MixedReplacementIdentityStatus::ExactReplacement
+                    | MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
                     | MixedReplacementIdentityStatus::Additive
             )
         })
@@ -542,6 +595,35 @@ fn build_mixed_replacement_diagnostic_report(
             package_count: container.package_store.len(),
         })
         .collect::<Vec<_>>();
+    // Disclose every root-alias identity resolution: the reader must be able
+    // to see that the container path carried no location and that only the
+    // unique package ID (plus filename agreement) named the current target.
+    let mut warnings = packages
+        .iter()
+        .filter(|package| {
+            package.identity_status == MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
+        })
+        .map(|package| {
+            format!(
+                "Container '{}' stores {} at its mount root with no project/Content path; its package ID {} uniquely matches current package {} and the filenames agree, so it is classified as a replacement of that package via root alias.",
+                package.container_name,
+                package.path,
+                package.package_id,
+                package
+                    .current_id_match_path
+                    .as_deref()
+                    .unwrap_or("<unavailable>"),
+            )
+        })
+        .collect::<Vec<_>>();
+    warnings.extend([
+        "Current identity and external dependency evidence comes from the connected game's stock main package store; installed-mod and other-container precedence is not claimed."
+            .to_owned(),
+        "Package identity and dependency closure do not prove export-class conversion, shader compatibility, gameplay behavior, or runtime compatibility."
+            .to_owned(),
+        "This diagnostic cannot enable an updater adapter or mutate source, game, or output files."
+            .to_owned(),
+    ]);
     Ok(MixedReplacementPackageDiagnosticReport {
         api: MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API.to_owned(),
         status: if blockers.is_empty() {
@@ -556,6 +638,7 @@ fn build_mixed_replacement_diagnostic_report(
         source_package_count: packages.len(),
         current_game_package_count: current.len(),
         exact_replacement_count,
+        root_alias_replacement_count,
         additive_package_count,
         conflict_package_count,
         path_conflict_count,
@@ -564,14 +647,7 @@ fn build_mixed_replacement_diagnostic_report(
         packages,
         dependencies,
         blockers,
-        warnings: vec![
-            "Current identity and external dependency evidence comes from the connected game's stock main package store; installed-mod and other-container precedence is not claimed."
-                .to_owned(),
-            "Package identity and dependency closure do not prove export-class conversion, shader compatibility, gameplay behavior, or runtime compatibility."
-                .to_owned(),
-            "This diagnostic cannot enable an updater adapter or mutate source, game, or output files."
-                .to_owned(),
-        ],
+        warnings,
     })
 }
 
@@ -3910,6 +3986,113 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn mixed_replacement_diagnostic_resolves_bare_root_packages_by_unique_package_id() {
+        let source = vec![
+            // Stored at the container mount root with no project/Content prefix,
+            // but its package ID and filename match exactly one current package.
+            store(50, "../../../BP_RootAlias.uasset", &[]),
+            // Bare-root file whose name does not match its ID's current package:
+            // identity is ambiguous, so it must stay a conflict.
+            store(60, "../../../BP_WrongName.uasset", &[]),
+            // ID match with an unrecognized directory path is not a root alias.
+            store(70, "../../../SomeDir/BP_Nested.uasset", &[]),
+        ];
+        let current = vec![
+            store(
+                50,
+                "../../../OblivionRemastered/Content/Forms/items/armor/BP_RootAlias.uasset",
+                &[],
+            ),
+            store(
+                60,
+                "../../../OblivionRemastered/Content/Forms/items/armor/BP_Other.uasset",
+                &[],
+            ),
+            store(
+                70,
+                "../../../OblivionRemastered/Content/Forms/items/armor/BP_Nested.uasset",
+                &[],
+            ),
+        ];
+        let report = build_mixed_replacement_diagnostic_report(
+            vec![diagnostic_container(
+                "RootAlias_P",
+                "Content/Paks/~mods/RootAlias_P.utoc",
+                source,
+            )],
+            current,
+        )
+        .unwrap();
+
+        assert_eq!(report.exact_replacement_count, 0);
+        assert_eq!(report.root_alias_replacement_count, 1);
+        assert_eq!(report.additive_package_count, 0);
+        assert_eq!(report.conflict_package_count, 2);
+        assert_eq!(report.package_id_conflict_count, 2);
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 50
+                && package.identity_status
+                    == MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
+                && package.current_id_match_path.as_deref()
+                    == Some(
+                        "../../../OblivionRemastered/Content/Forms/items/armor/BP_RootAlias.uasset"
+                    )
+        }));
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 60
+                && package.identity_status == MixedReplacementIdentityStatus::PackageIdConflict
+        }));
+        assert!(report.packages.iter().any(|package| {
+            package.package_id == 70
+                && package.identity_status == MixedReplacementIdentityStatus::PackageIdConflict
+        }));
+        assert_eq!(
+            report.blockers,
+            vec!["source-package-identity-conflicts-with-current-game:found-2".to_owned()]
+        );
+        assert!(report.warnings.iter().any(|warning| {
+            warning.contains("../../../BP_RootAlias.uasset")
+                && warning.contains(
+                    "../../../OblivionRemastered/Content/Forms/items/armor/BP_RootAlias.uasset",
+                )
+                && warning.contains("mount root")
+        }));
+        let serialized = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            serialized["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["packageId"].as_u64() == Some(50))
+                .unwrap()["identityStatus"],
+            "exact-replacement-via-root-alias"
+        );
+        assert_eq!(serialized["rootAliasReplacementCount"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn bare_root_alias_leaf_accepts_only_single_traversal_free_leaves() {
+        assert_eq!(
+            bare_root_alias_leaf("../../../BP_Item.uasset").as_deref(),
+            Some("BP_Item.uasset")
+        );
+        assert_eq!(
+            bare_root_alias_leaf("..\\..\\..\\Map_Item.umap").as_deref(),
+            Some("Map_Item.umap")
+        );
+        assert_eq!(bare_root_alias_leaf("BP_Item.uasset").as_deref(), Some("BP_Item.uasset"));
+        assert_eq!(bare_root_alias_leaf("../../../Dir/BP_Item.uasset"), None);
+        assert_eq!(
+            bare_root_alias_leaf("../../../OblivionRemastered/Content/Forms/BP_Item.uasset"),
+            None
+        );
+        assert_eq!(bare_root_alias_leaf("../../../BP_Item.txt"), None);
+        assert_eq!(bare_root_alias_leaf("../../../.."), None);
+        assert_eq!(bare_root_alias_leaf("../../../"), None);
+        assert_eq!(bare_root_alias_leaf("../../../Dir/../BP_Item.uasset"), None);
     }
 
     #[test]

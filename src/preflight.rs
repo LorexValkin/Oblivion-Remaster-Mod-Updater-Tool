@@ -1985,7 +1985,9 @@ fn analyze_internal(
         if let Some(diagnostic) = mixed_replacement_package_diagnostic.as_ref() {
             checks.push(CheckResult {
                 id: "replacement-package-identity".to_owned(),
-                status: if diagnostic.conflict_package_count == 0 {
+                status: if diagnostic.conflict_package_count == 0
+                    && diagnostic.root_alias_replacement_count == 0
+                {
                     "pass"
                 } else {
                     "warning"
@@ -1993,17 +1995,27 @@ fn analyze_internal(
                 .to_owned(),
                 blocking: false,
                 message: format!(
-                    "Inventoried {} package(s) in {} container(s): {} exact replacement(s), {} additive package(s), and {} path/package-ID conflict(s).",
+                    "Inventoried {} package(s) in {} container(s): {} exact replacement(s), {} root-alias replacement(s) resolved only by their unique package IDs, {} additive package(s), and {} path/package-ID conflict(s).",
                     diagnostic.source_package_count,
                     diagnostic.container_count,
                     diagnostic.exact_replacement_count,
+                    diagnostic.root_alias_replacement_count,
                     diagnostic.additive_package_count,
                     diagnostic.conflict_package_count,
                 ),
-                remediation: (diagnostic.conflict_package_count > 0).then(|| {
-                    "Keep conflicting packages report-only until their current identity and intended target are unambiguous."
-                        .to_owned()
-                }),
+                remediation: if diagnostic.conflict_package_count > 0 {
+                    Some(
+                        "Keep conflicting packages report-only until their current identity and intended target are unambiguous."
+                            .to_owned(),
+                    )
+                } else if diagnostic.root_alias_replacement_count > 0 {
+                    Some(
+                        "Root-alias packages are stored at their container mount root; the diagnostic warnings list each unique package-ID resolution."
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                },
             });
             let unresolved_summary = diagnostic
                 .dependencies
@@ -3568,6 +3580,7 @@ mod tests {
             source_package_count: 1,
             current_game_package_count: 1,
             exact_replacement_count: 1,
+            root_alias_replacement_count: 0,
             additive_package_count: 0,
             conflict_package_count: 0,
             path_conflict_count: 0,

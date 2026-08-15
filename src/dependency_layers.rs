@@ -38,6 +38,18 @@ impl PackageProviderLayer {
             Self::StockMain => 4,
         }
     }
+
+    /// Stable kebab-case name matching this layer's serialized form, for
+    /// human-readable provider disclosures outside serde contexts.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SelectedMod => "selected-mod",
+            Self::ConnectedDependency => "connected-dependency",
+            Self::InstalledActiveMod => "installed-active-mod",
+            Self::GameContainer => "game-container",
+            Self::StockMain => "stock-main",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1015,6 +1027,55 @@ fn safe_source_leaf(path: &Path) -> String {
     result.trim_matches('-').chars().take(96).collect()
 }
 
+/// One materialized on-disk container backing a layered provider, so the
+/// update lane can copy the exact files the probe proved into its bounded
+/// dependency view.
+#[derive(Clone, Debug)]
+pub struct MaterializedLayeredContainer {
+    pub relative_utoc: String,
+    pub utoc: PathBuf,
+    pub ucas: PathBuf,
+    pub pak: Option<PathBuf>,
+}
+
+/// One layered provider with the concrete files that produced its
+/// package-store evidence.
+#[derive(Clone, Debug)]
+pub struct MaterializedLayeredProvider {
+    pub provider_id: String,
+    pub layer: PackageProviderLayer,
+    pub containers: Vec<MaterializedLayeredContainer>,
+}
+
+/// A layered dependency report together with the materialized provider files
+/// it was computed from. Holding this value keeps any staged archive
+/// extractions alive, so the paths stay valid for the caller's lifetime.
+pub struct LayeredProbeWithSources {
+    pub report: LayeredIoStoreDependencyReport,
+    pub providers: Vec<MaterializedLayeredProvider>,
+    _staging: Vec<StagedSource>,
+}
+
+fn materialized_provider(
+    provider_id: &str,
+    layer: PackageProviderLayer,
+    containers: &[ContainerFiles],
+) -> MaterializedLayeredProvider {
+    MaterializedLayeredProvider {
+        provider_id: provider_id.to_owned(),
+        layer,
+        containers: containers
+            .iter()
+            .map(|container| MaterializedLayeredContainer {
+                relative_utoc: container.relative_utoc.clone(),
+                utoc: container.utoc.clone(),
+                ucas: container.ucas.clone(),
+                pak: container.pak.clone(),
+            })
+            .collect(),
+    }
+}
+
 /// Builds a read-only transitive package dependency report from the selected
 /// mod, explicitly connected dependency inputs, the connected game's active
 /// `~mods`, non-main game containers, and stock main package store.
@@ -1023,6 +1084,22 @@ pub fn probe_layered_iostore_dependencies(
     dependency_inputs: &[PathBuf],
     current_game_root: &Path,
 ) -> Result<LayeredIoStoreDependencyReport> {
+    probe_layered_iostore_dependencies_with_sources(
+        selected_mod_input,
+        dependency_inputs,
+        current_game_root,
+    )
+    .map(|probe| probe.report)
+}
+
+/// Same probe as [`probe_layered_iostore_dependencies`], additionally
+/// returning the materialized files behind every provider so a guarded update
+/// lane can reuse the exact proven containers.
+pub fn probe_layered_iostore_dependencies_with_sources(
+    selected_mod_input: &Path,
+    dependency_inputs: &[PathBuf],
+    current_game_root: &Path,
+) -> Result<LayeredProbeWithSources> {
     if dependency_inputs.len() >= MAX_PROVIDER_COUNT {
         bail!("connected dependency input count exceeds the bounded provider limit");
     }
@@ -1059,6 +1136,13 @@ pub fn probe_layered_iostore_dependencies(
         &retoc,
     )?;
     let mut providers = vec![selected_provider];
+    let mut materialized = vec![materialized_provider(
+        "selected-mod",
+        PackageProviderLayer::SelectedMod,
+        &selected_containers,
+    )];
+    let mut staging = Vec::new();
+    staging.push(selected_staged);
 
     let mut excluded_non_iostore_dependency_sources = Vec::new();
     let mut excluded_incomplete_containers = Vec::new();
@@ -1099,6 +1183,12 @@ pub fn probe_layered_iostore_dependencies(
             safe_source_leaf(input),
             &fingerprint[..12]
         );
+        materialized.push(materialized_provider(
+            &provider.provider_id,
+            PackageProviderLayer::ConnectedDependency,
+            &containers,
+        ));
+        staging.push(staged);
         providers.push(provider);
     }
 
@@ -1124,6 +1214,11 @@ pub fn probe_layered_iostore_dependencies(
             "installed-active-mod:{}",
             &fingerprint.logical_sha256()[..12]
         );
+        materialized.push(materialized_provider(
+            &provider.provider_id,
+            PackageProviderLayer::InstalledActiveMod,
+            std::slice::from_ref(&container),
+        ));
         providers.push(provider);
     }
 
@@ -1134,13 +1229,24 @@ pub fn probe_layered_iostore_dependencies(
             .and_then(|value| value.to_str())
             .unwrap_or("game-container")
             .to_ascii_lowercase();
+        let provider_id = format!("game-container:{stem}");
+        materialized.push(materialized_provider(
+            &provider_id,
+            PackageProviderLayer::GameContainer,
+            std::slice::from_ref(&container),
+        ));
         providers.push(provider_from_containers(
             PackageProviderLayer::GameContainer,
-            format!("game-container:{stem}"),
+            provider_id,
             std::slice::from_ref(&container),
             &retoc,
         )?);
     }
+    materialized.push(materialized_provider(
+        "stock-main",
+        PackageProviderLayer::StockMain,
+        std::slice::from_ref(&stock_main),
+    ));
     providers.push(provider_from_containers(
         PackageProviderLayer::StockMain,
         "stock-main".to_owned(),
@@ -1148,12 +1254,17 @@ pub fn probe_layered_iostore_dependencies(
         &retoc,
     )?);
 
-    build_report(
+    let report = build_report(
         providers,
         excluded_installed_selected_sources,
         excluded_non_iostore_dependency_sources,
         excluded_incomplete_containers,
-    )
+    )?;
+    Ok(LayeredProbeWithSources {
+        report,
+        providers: materialized,
+        _staging: staging,
+    })
 }
 
 #[cfg(test)]

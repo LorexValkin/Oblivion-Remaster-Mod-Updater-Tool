@@ -11,6 +11,10 @@ use crate::fixes::{
     EXACT_DEPENDENCY_EXTRACTION_API, ExactExtractionReport, diagnose_package_dependencies,
     extract_packages_with_dependency_view,
 };
+use crate::dependency_layers::{
+    LAYERED_IOSTORE_DEPENDENCY_API, LayeredProbeWithSources, PackageProviderLayer,
+    probe_layered_iostore_dependencies_with_sources,
+};
 use crate::game::{save_settings, validate_game_install};
 use crate::install_plan::{
     InstallPlan, build_logical_update_context, logical_install_adapter_id,
@@ -36,6 +40,7 @@ use crate::replacement::{
     extract_source_packages_exact,
     extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
+    inspect_composite_package_staged_with_dependencies,
     inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
     inspect_texture_staged, recover_composite_package_identities, stage_input,
     validate_texture_replacement_pair, verify_donor_rebinds_consumed,
@@ -1501,6 +1506,169 @@ impl EspSyncLane {
     }
 }
 
+/// The layered-provider support proven for one additive update: the probe
+/// evidence, the extra proven dependency entries for the composite
+/// inspection, and the per-edge provider disclosures for the update report.
+struct LayeredDependencySupport {
+    probe: LayeredProbeWithSources,
+    extra_target_dependencies: HashMap<u64, PackageEntry>,
+    disclosures: Vec<String>,
+    used_provider_ids: Vec<String>,
+}
+
+/// Attempts to satisfy the additive lane's stock-unresolved imports with the
+/// layered IoStore resolver (`zen-layered-iostore-dependency-resolver-v1`).
+///
+/// Returns `Ok(None)` when the layered resolver cannot completely resolve the
+/// reachable import graph; the guarded identity-recovery contract then stays
+/// the only remaining avenue and fails truthfully on its own evidence. When
+/// resolution is complete, every provider whose packages satisfy an import is
+/// materialized into the bounded dependency view, and every satisfied edge is
+/// disclosed with its chosen provider. A provider whose packages collide with
+/// the selected mod's own package IDs or paths fails closed instead of being
+/// mounted into the view.
+fn resolve_layered_dependency_support(
+    mod_input: &Path,
+    dependency_inputs: &[PathBuf],
+    game_root: &Path,
+    dependency_view: &Path,
+    source_package_store: &[PackageStoreEntry],
+    retoc: &RetocTool,
+) -> Result<Option<LayeredDependencySupport>> {
+    let Ok(probe) =
+        probe_layered_iostore_dependencies_with_sources(mod_input, dependency_inputs, game_root)
+    else {
+        return Ok(None);
+    };
+    if !probe.report.resolution_complete {
+        return Ok(None);
+    }
+    let supporting_layer = |layer: PackageProviderLayer| {
+        matches!(
+            layer,
+            PackageProviderLayer::ConnectedDependency
+                | PackageProviderLayer::InstalledActiveMod
+                | PackageProviderLayer::GameContainer
+        )
+    };
+    let mut needed_providers = BTreeMap::new();
+    let mut required_targets = Vec::new();
+    for edge in &probe.report.dependency_edges {
+        let Some(target) = edge.target.as_ref().filter(|_| edge.resolved) else {
+            continue;
+        };
+        if !supporting_layer(target.layer) {
+            continue;
+        }
+        needed_providers.insert(target.provider_id.clone(), target.layer);
+        required_targets.push((edge, target));
+    }
+    if required_targets.is_empty() {
+        return Ok(None);
+    }
+    let source_ids = source_package_store
+        .iter()
+        .map(|entry| entry.package_id)
+        .collect::<HashSet<_>>();
+    let source_paths = source_package_store
+        .iter()
+        .map(|entry| entry.path.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut provider_entries = HashMap::<u64, (String, PackageEntry)>::new();
+    let mut used_provider_ids = Vec::new();
+    for provider in &probe.providers {
+        if !needed_providers.contains_key(&provider.provider_id) {
+            continue;
+        }
+        used_provider_ids.push(provider.provider_id.clone());
+        for container in &provider.containers {
+            for source in [
+                Some(&container.utoc),
+                Some(&container.ucas),
+                container.pak.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let name = source
+                    .file_name()
+                    .context("layered provider container has no filename")?;
+                let target = dependency_view.join(name);
+                if target.exists() {
+                    bail!(
+                        "layered provider container filename collides with the dependency view: {}",
+                        container.relative_utoc
+                    );
+                }
+                copy_file(source, &target)?;
+            }
+            let (_, store) = retoc.package_store_entries_allow_empty(&container.utoc)?;
+            for entry in store {
+                if source_ids.contains(&entry.package_id)
+                    || source_paths.contains(&entry.path.to_ascii_lowercase())
+                {
+                    bail!(
+                        "layered provider {} shadows a selected-mod package ({}); the additive lane fails closed on selected-vs-provider identity collisions",
+                        provider.provider_id,
+                        entry.path
+                    );
+                }
+                provider_entries
+                    .entry(entry.package_id)
+                    .or_insert_with(|| {
+                        (
+                            provider.provider_id.clone(),
+                            PackageEntry {
+                                package_id: entry.package_id,
+                                path: entry.path.clone(),
+                            },
+                        )
+                    });
+            }
+        }
+    }
+    let mut extra_target_dependencies = HashMap::new();
+    let mut disclosures = Vec::new();
+    for (edge, target) in required_targets {
+        let (chosen_provider, entry) =
+            provider_entries.get(&target.package_id).with_context(|| {
+                format!(
+                    "layered provider {} no longer exposes package {}",
+                    target.provider_id, target.package_id
+                )
+            })?;
+        if !chosen_provider.eq_ignore_ascii_case(&target.provider_id) {
+            bail!(
+                "layered provider precedence disagreement for package {}: report chose {}, materialized view chose {chosen_provider}",
+                target.package_id,
+                target.provider_id
+            );
+        }
+        extra_target_dependencies
+            .entry(target.package_id)
+            .or_insert_with(|| entry.clone());
+        if edge.source.layer == PackageProviderLayer::SelectedMod {
+            disclosures.push(format!(
+                "{} required by {} is satisfied by provider {} [{}] in {}",
+                target.package_path,
+                edge.source.package_path,
+                target.provider_id,
+                target.layer.label(),
+                target.container,
+            ));
+        }
+    }
+    disclosures.sort();
+    disclosures.dedup();
+    used_provider_ids.sort();
+    Ok(Some(LayeredDependencySupport {
+        probe,
+        extra_target_dependencies,
+        disclosures,
+        used_provider_ids,
+    }))
+}
+
 fn run_additive_update(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
@@ -1946,7 +2114,33 @@ fn run_esp_sync_lane_update(
             copy_file(source, &target)?;
         }
     }
-    let composite_inspection = inspect_composite_package_staged(&mod_paks, &game.root, &retoc)?;
+    let layered_dependency_support = if lane == EspSyncLane::AdditiveSyncmap
+        && !dependency_trace.fully_resolved
+    {
+        stage(
+            callback,
+            3,
+            "Resolving stock-unresolved imports across connected, installed, and game/DLC providers",
+        );
+        resolve_layered_dependency_support(
+            &mod_input,
+            &request.dependency_inputs,
+            &game.root,
+            dependency_view.path(),
+            &source_package_store,
+            &retoc,
+        )?
+    } else {
+        None
+    };
+    let composite_inspection = inspect_composite_package_staged_with_dependencies(
+        &mod_paks,
+        &game.root,
+        &retoc,
+        layered_dependency_support
+            .as_ref()
+            .map(|support| &support.extra_target_dependencies),
+    )?;
     let identity_recovery = recover_composite_package_identities(
         &composite_inspection,
         &retoc,
@@ -2386,6 +2580,9 @@ fn run_esp_sync_lane_update(
         "single-resolved-dependency-public-export-rebase-v2",
         "package-store-decoder-placeholder-repair-v2",
     ];
+    if layered_dependency_support.is_some() {
+        fix_apis.push(LAYERED_IOSTORE_DEPENDENCY_API);
+    }
     if plugin_replacements.is_empty() {
         fix_apis.push(PLUGIN_PRESERVATION_API);
     } else if lane == EspSyncLane::MagicLoaderWorldspace {
@@ -2499,6 +2696,13 @@ fn run_esp_sync_lane_update(
             "collisionPolicy": "For structurally recognized StaticMesh BodySetup exports, the incompatible derived cooked-physics tail is normalized to the shipping game's accepted empty-cache boundary while the serialized property region (including AggGeom simple-collision source data) and BodySetupGuid are preserved. Each change remains disclosed as collisionRemoved: true and requires an in-game collision test.",
             "packagePaths": original_packages,
             "dependencyTrace": dependency_trace,
+            "layeredDependencyResolution": layered_dependency_support.as_ref().map(|support| json!({
+                "api": LAYERED_IOSTORE_DEPENDENCY_API,
+                "logicalSha256": support.probe.report.logical_sha256,
+                "usedProviderIds": support.used_provider_ids,
+                "satisfiedImportDisclosures": support.disclosures,
+                "note": "Imports listed here are satisfied by connected, installed, or game/DLC providers under explicit precedence; the candidate depends on those providers staying installed or connected.",
+            })),
             "containers": container_results,
             "containerNaming": {
                 "pSuffixCaseInsensitive": true,

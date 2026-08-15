@@ -787,6 +787,79 @@ fn is_direct_mod_container_path(path: &str) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
 }
 
+/// Decides whether the layered IoStore resolver authorizes the additive
+/// dependency-closure gate for imports the stock-plus-bundled probe could not
+/// resolve, and produces the per-edge provider disclosures that authorization
+/// requires.
+///
+/// Fail-closed contract: the mixed probe must exist with zero source/current
+/// collisions and at least one unresolved edge; the layered report must exist
+/// and be complete under its own explicit precedence; and every single
+/// stock-unresolved edge must map to a resolved layered edge for the same
+/// consumer package and missing dependency ID, naming the chosen provider.
+/// Any mismatch between the two evidence planes returns `None` so the gate
+/// stays blocked instead of trusting inconsistent reports.
+fn layered_additive_closure_disclosures(
+    mixed: Option<&MixedIoStoreDependencyReport>,
+    layered: Option<&LayeredIoStoreDependencyReport>,
+) -> Option<Vec<String>> {
+    let mixed = mixed?;
+    if mixed.collision_count != 0
+        || mixed.dependencies.fully_resolved
+        || mixed.dependencies.unresolved_edges.is_empty()
+    {
+        return None;
+    }
+    let layered = layered?;
+    if !layered.resolution_complete {
+        return None;
+    }
+    let mut disclosures = Vec::new();
+    for edge in &mixed.dependencies.unresolved_edges {
+        let resolved = layered.dependency_edges.iter().find(|candidate| {
+            candidate.resolved
+                && candidate.dependency_package_id == edge.missing_dependency_package_id
+                && candidate.source.package_id == edge.source_package_id
+        })?;
+        let target = resolved.target.as_ref()?;
+        let dependency_name = edge
+            .authored_package_names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("package-id {}", edge.missing_dependency_package_id));
+        disclosures.push(format!(
+            "{dependency_name} required by {} is satisfied by provider {} [{}] in {}",
+            edge.source_package_path,
+            target.provider_id,
+            target.layer.label(),
+            target.container,
+        ));
+    }
+    Some(disclosures)
+}
+
+/// Names the imports that stay missing from every layered provider, using the
+/// recovered authored package names so a blocked report can say which
+/// dependency mod or package the user must supply.
+fn missing_layered_import_names(mixed: &MixedIoStoreDependencyReport) -> Vec<String> {
+    mixed
+        .dependencies
+        .unresolved_edges
+        .iter()
+        .map(|edge| {
+            let dependency_name = edge
+                .authored_package_names
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("package-id {}", edge.missing_dependency_package_id));
+            format!(
+                "{dependency_name} required by {}",
+                edge.source_package_path
+            )
+        })
+        .collect()
+}
+
 fn path_redaction_variants(path: &Path) -> Vec<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -2117,17 +2190,59 @@ fn analyze_internal(
                 "Place every complete container triple together in one direct child folder of Content/Paks.",
             ),
         ));
+        let layered_closure_disclosures = layered_additive_closure_disclosures(
+            mixed_iostore_dependency_probe.as_ref(),
+            layered_iostore_dependency_probe.as_ref(),
+        );
         let dependency_closure = mixed_iostore_dependency_probe
             .as_ref()
             .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+            || layered_closure_disclosures.is_some()
             || composite_package_probe.is_some();
+        let success = match layered_closure_disclosures.as_ref() {
+            Some(disclosures) => {
+                let mut summary = disclosures
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if disclosures.len() > 8 {
+                    summary.push_str(&format!("; and {} more", disclosures.len() - 8));
+                }
+                format!(
+                    "Every reachable additive import resolves under the explicit layered provider precedence, with no source/current package collisions. {} import(s) are satisfied by disclosed non-stock providers and depend on those providers staying installed or connected: {summary}",
+                    disclosures.len()
+                )
+            }
+            None => "Every additive package dependency resolves from the selected mod or current game, with no source/current package collisions."
+                .to_owned(),
+        };
         let failure = mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| {
-                format!(
-                    "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the guarded composite identity-recovery contract.",
+                let mut message = format!(
+                    "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the layered provider resolution or the guarded composite identity-recovery contract.",
                     probe.collision_count, probe.dependencies.unresolved_edge_count
-                )
+                );
+                if layered_iostore_dependency_probe
+                    .as_ref()
+                    .is_some_and(|report| !report.resolution_complete)
+                {
+                    let missing = missing_layered_import_names(probe);
+                    if !missing.is_empty() {
+                        message.push_str(&format!(
+                            " Missing from every layered provider: {}.",
+                            missing
+                                .iter()
+                                .take(8)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        ));
+                    }
+                }
+                message
             })
             .unwrap_or_else(|| {
                 "The additive package dependency closure could not be inspected against the current game."
@@ -2137,10 +2252,10 @@ fn analyze_internal(
             "additive-iostore-dependency-closure",
             dependency_closure,
             true,
-            "Every additive package dependency resolves from the selected mod or current game, with no source/current package collisions.",
+            success,
             failure,
             Some(
-                "Bundle every required package with the selected mod or update the mod against the current game. Dependencies supplied only by unrelated installed mods are reported diagnostically but are not used to authorize an update.",
+                "Bundle every required package with the selected mod, update the mod against the current game, or connect/install the disclosed dependency mod so the layered resolver can prove the import. Layer-satisfied imports are always disclosed with their chosen provider.",
             ),
         ));
     }
@@ -2388,6 +2503,11 @@ fn analyze_internal(
     let additive_dependency_closure = mixed_iostore_dependency_probe
         .as_ref()
         .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+        || layered_additive_closure_disclosures(
+            mixed_iostore_dependency_probe.as_ref(),
+            layered_iostore_dependency_probe.as_ref(),
+        )
+        .is_some()
         || (additive_shape && composite_package_probe.is_some());
     let additive_can_update =
         additive_shape && additive_dependency_closure && adapter_blockers.is_empty();
@@ -3099,6 +3219,172 @@ mod tests {
             "Content/Paks/~mods/Nested/Fixture_P.utoc"
         ));
         assert!(!is_direct_mod_container_path("Content/Paks/Fixture_P.utoc"));
+    }
+
+    fn layered_gate_mixed_report(
+        collision_count: usize,
+        unresolved: Vec<crate::fixes::UnresolvedDependencyEdgeTrace>,
+    ) -> MixedIoStoreDependencyReport {
+        let unresolved_edge_count = unresolved.len();
+        MixedIoStoreDependencyReport {
+            api: crate::mixed::MIXED_IOSTORE_DEPENDENCY_PROBE_API.to_owned(),
+            status: "complete-report-only".to_owned(),
+            mutation_policy: "report-only".to_owned(),
+            container_count: 1,
+            source_package_count: 1,
+            current_game_package_count: 1,
+            additive_package_count: 1,
+            collision_count,
+            containers: Vec::new(),
+            collisions: Vec::new(),
+            dependencies: crate::fixes::DependencyDiagnosticReport {
+                api: crate::fixes::DEPENDENCY_DIAGNOSTIC_API.to_owned(),
+                bundled_package_count: 1,
+                current_game_package_count: 1,
+                dependency_edge_count: 1 + unresolved_edge_count,
+                resolved_edge_count: 1,
+                unresolved_edge_count,
+                bundled_edge_count: 1,
+                current_game_edge_count: 0,
+                fully_resolved: unresolved_edge_count == 0,
+                resolved_edges: Vec::new(),
+                unresolved_edges: unresolved,
+            },
+            blockers: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn layered_gate_unresolved_edge(
+        source_package_id: u64,
+        missing_dependency_package_id: u64,
+    ) -> crate::fixes::UnresolvedDependencyEdgeTrace {
+        crate::fixes::UnresolvedDependencyEdgeTrace {
+            source_package_id,
+            source_package_path:
+                "../../../OblivionRemastered/Content/Fixture/BP_Fixture.uasset".to_owned(),
+            missing_dependency_package_id,
+            authored_package_names: vec!["/Game/Fixture/MIC_Fixture".to_owned()],
+        }
+    }
+
+    fn layered_gate_provider(
+        layer: crate::dependency_layers::PackageProviderLayer,
+        provider_id: &str,
+        container: &str,
+        packages: Vec<crate::retoc::PackageStoreEntry>,
+    ) -> crate::dependency_layers::LayeredPackageProviderInput {
+        crate::dependency_layers::LayeredPackageProviderInput {
+            layer,
+            provider_id: provider_id.to_owned(),
+            containers: vec![crate::dependency_layers::LayeredContainerInput {
+                relative_utoc: container.to_owned(),
+                utoc_bytes: 128,
+                utoc_sha256: "a".repeat(64),
+                pak_present: true,
+                packages,
+            }],
+        }
+    }
+
+    fn layered_gate_report(
+        installed_provides_dependency: bool,
+    ) -> crate::dependency_layers::LayeredIoStoreDependencyReport {
+        use crate::dependency_layers::PackageProviderLayer;
+        let entry = |id: u64, path: &str, imports: &[u64]| crate::retoc::PackageStoreEntry {
+            package_id: id,
+            path: path.to_owned(),
+            imported_package_ids: imports.to_vec(),
+        };
+        let mut providers = vec![
+            layered_gate_provider(
+                PackageProviderLayer::SelectedMod,
+                "selected-mod",
+                "Content/Paks/~mods/Fixture_P.utoc",
+                vec![entry(
+                    11,
+                    "../../../OblivionRemastered/Content/Fixture/BP_Fixture.uasset",
+                    &[22],
+                )],
+            ),
+            layered_gate_provider(
+                PackageProviderLayer::StockMain,
+                "stock-main",
+                "Content/Paks/OblivionRemastered-Windows.utoc",
+                vec![entry(
+                    33,
+                    "../../../OblivionRemastered/Content/Stock/Stock.uasset",
+                    &[],
+                )],
+            ),
+        ];
+        if installed_provides_dependency {
+            providers.push(layered_gate_provider(
+                PackageProviderLayer::InstalledActiveMod,
+                "installed-active-mod:fixture",
+                "Content/Paks/~mods/FixtureDependency_P.utoc",
+                vec![entry(
+                    22,
+                    "../../../OblivionRemastered/Content/Fixture/MIC_Fixture.uasset",
+                    &[],
+                )],
+            ));
+        }
+        crate::dependency_layers::resolve_layered_package_stores(providers).unwrap()
+    }
+
+    #[test]
+    fn layered_resolver_authorizes_additive_closure_with_disclosed_providers() {
+        let mixed = layered_gate_mixed_report(0, vec![layered_gate_unresolved_edge(11, 22)]);
+        let layered = layered_gate_report(true);
+        assert!(layered.resolution_complete);
+        let disclosures =
+            layered_additive_closure_disclosures(Some(&mixed), Some(&layered)).unwrap();
+        assert_eq!(disclosures.len(), 1);
+        assert!(disclosures[0].contains("/Game/Fixture/MIC_Fixture"));
+        assert!(disclosures[0].contains("installed-active-mod:fixture"));
+        assert!(disclosures[0].contains("[installed-active-mod]"));
+    }
+
+    #[test]
+    fn layered_resolver_never_authorizes_incomplete_or_collided_closures() {
+        let unresolved_layered = layered_gate_report(false);
+        assert!(!unresolved_layered.resolution_complete);
+        let mixed = layered_gate_mixed_report(0, vec![layered_gate_unresolved_edge(11, 22)]);
+        assert!(
+            layered_additive_closure_disclosures(Some(&mixed), Some(&unresolved_layered)).is_none()
+        );
+        assert!(layered_additive_closure_disclosures(Some(&mixed), None).is_none());
+
+        let collided = layered_gate_mixed_report(1, vec![layered_gate_unresolved_edge(11, 22)]);
+        let complete_layered = layered_gate_report(true);
+        assert!(
+            layered_additive_closure_disclosures(Some(&collided), Some(&complete_layered))
+                .is_none()
+        );
+
+        let already_resolved = layered_gate_mixed_report(0, Vec::new());
+        assert!(
+            layered_additive_closure_disclosures(Some(&already_resolved), Some(&complete_layered))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn layered_authorization_requires_the_same_consumer_and_dependency_edge() {
+        // The layered report is complete, but the mixed probe names an edge the
+        // layered evidence never resolved (different consumer/dependency IDs).
+        // Inconsistent evidence planes must fail closed.
+        let mixed = layered_gate_mixed_report(0, vec![layered_gate_unresolved_edge(99, 22)]);
+        let layered = layered_gate_report(true);
+        assert!(layered.resolution_complete);
+        assert!(layered_additive_closure_disclosures(Some(&mixed), Some(&layered)).is_none());
+
+        let wrong_dependency =
+            layered_gate_mixed_report(0, vec![layered_gate_unresolved_edge(11, 44)]);
+        assert!(
+            layered_additive_closure_disclosures(Some(&wrong_dependency), Some(&layered)).is_none()
+        );
     }
 
     fn tes4_subrecord(kind: &str, data: &[u8]) -> Vec<u8> {

@@ -1700,6 +1700,20 @@ pub fn inspect_composite_package_staged(
     game_root: &Path,
     retoc: &RetocTool,
 ) -> Result<ReplacementInspection> {
+    inspect_composite_package_staged_with_dependencies(root, game_root, retoc, None)
+}
+
+/// Same inspection as [`inspect_composite_package_staged`], with additional
+/// externally proven dependency packages (for example layered-provider
+/// resolutions) that satisfy imports the stock store cannot. Extra entries
+/// never make a source package "existing" and never shadow a stock or
+/// selected-mod identity; they only extend the available dependency set.
+pub fn inspect_composite_package_staged_with_dependencies(
+    root: &Path,
+    game_root: &Path,
+    retoc: &RetocTool,
+    extra_target_dependencies: Option<&HashMap<u64, PackageEntry>>,
+) -> Result<ReplacementInspection> {
     let target_utoc =
         game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     let containers =
@@ -1801,7 +1815,10 @@ pub fn inspect_composite_package_staged(
             .imported_package_ids
             .iter()
             .filter(|dependency| {
-                !source_ids.contains(dependency) && !target_by_id.contains_key(dependency)
+                !source_ids.contains(dependency)
+                    && !target_by_id.contains_key(dependency)
+                    && !extra_target_dependencies
+                        .is_some_and(|extra| extra.contains_key(*dependency))
             })
             .count();
         if missing > 2 {
@@ -1811,7 +1828,7 @@ pub fn inspect_composite_package_staged(
             );
         }
     }
-    let target_dependencies = target_entries
+    let mut target_dependencies: HashMap<u64, PackageEntry> = target_entries
         .into_iter()
         .map(|entry| {
             (
@@ -1823,6 +1840,19 @@ pub fn inspect_composite_package_staged(
             )
         })
         .collect();
+    if let Some(extra) = extra_target_dependencies {
+        for (package_id, entry) in extra {
+            if source_ids.contains(package_id) {
+                bail!(
+                    "externally proven dependency {} collides with a selected-mod package ID",
+                    package_id
+                );
+            }
+            target_dependencies
+                .entry(*package_id)
+                .or_insert_with(|| entry.clone());
+        }
+    }
     Ok(ReplacementInspection {
         containers,
         packages,

@@ -3508,8 +3508,14 @@ fn run_heterogeneous_replacement_update(
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
                     {
+                        let source_row = container
+                            .package_store
+                            .iter()
+                            .find(|entry| entry.package_id == package.package_id)
+                            .context("heterogeneous source package store lost a StaticMesh row")?;
                         static_mesh_import_repairs.push(repair_static_mesh_imports(
                             &source_asset,
+                            &source_row.imported_package_ids,
                             &inspection.target_dependencies,
                             &root
                                 .join("import-repairs")
@@ -3606,10 +3612,24 @@ fn run_heterogeneous_replacement_update(
                 .with_context(|| {
                     format!("rebuilt package store is missing {}", source.package_id)
                 })?;
-            if BTreeSet::from_iter(source.imported_package_ids.iter().copied())
-                != BTreeSet::from_iter(rebuilt_entry.imported_package_ids.iter().copied())
-            {
-                bail!("rebuilt package imports changed for {}", source.path);
+            let authored = BTreeSet::from_iter(source.imported_package_ids.iter().copied());
+            let rebuilt_imports =
+                BTreeSet::from_iter(rebuilt_entry.imported_package_ids.iter().copied());
+            if authored != rebuilt_imports {
+                bail!(
+                    "rebuilt package imports changed for {}: authored [{}], rebuilt [{}]",
+                    source.path,
+                    authored
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    rebuilt_imports
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
 
@@ -3902,6 +3922,7 @@ fn migrate_composite_package(
             {
                 let repair = repair_static_mesh_imports(
                     asset,
+                    &source_store.imported_package_ids,
                     available_dependencies,
                     &work.join("repair"),
                 )?;
@@ -4754,8 +4775,14 @@ fn run_additive_static_mesh_update(
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
             {
+                let source_row = container
+                    .package_store
+                    .iter()
+                    .find(|entry| entry.package_id == package.package_id)
+                    .context("StaticMesh source package store lost a package row")?;
                 static_mesh_import_repairs.push(repair_static_mesh_imports(
                     &asset,
+                    &source_row.imported_package_ids,
                     &inspection.target_dependencies,
                     &root
                         .join("import-repairs")

@@ -3161,8 +3161,14 @@ pub fn probe_additive_static_mesh_input(
                 .iter()
                 .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
             {
+                let source_row = container
+                    .package_store
+                    .iter()
+                    .find(|entry| entry.package_id == package.package_id)
+                    .context("StaticMesh source package store lost a package row")?;
                 repair_static_mesh_imports(
                     &asset,
+                    &source_row.imported_package_ids,
                     &inspection.target_dependencies,
                     &root
                         .join("import-repairs")
@@ -3241,8 +3247,14 @@ pub fn probe_heterogeneous_replacement_input(
                         .iter()
                         .any(|name| name.eq_ignore_ascii_case("/Engine/UnknownPackage"))
                     {
+                        let source_row = container
+                            .package_store
+                            .iter()
+                            .find(|entry| entry.package_id == package.package_id)
+                            .context("heterogeneous source package store lost a StaticMesh row")?;
                         repair_static_mesh_imports(
                             &asset,
+                            &source_row.imported_package_ids,
                             &inspection.target_dependencies,
                             &root
                                 .join("import-repairs")
@@ -3600,6 +3612,7 @@ pub fn probe_composite_package_input(
                 {
                     repair_static_mesh_imports(
                         &asset,
+                        &effective_store.imported_package_ids,
                         &available_dependencies,
                         &package_work.join("repair"),
                     )?;

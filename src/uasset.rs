@@ -584,8 +584,28 @@ pub fn inspect_static_mesh_asset(asset: &Path) -> Result<Vec<String>> {
     Ok(package_imports)
 }
 
+/// Hashes any absolute mounted package name (`/Game/...`, `/Engine/...`)
+/// exactly the way the runtime derives FPackageId: CityHash64 over the
+/// lowercase UTF-16LE name.
+fn mounted_import_package_id(name: &str) -> u64 {
+    let lowered = name.to_lowercase();
+    let utf16le = lowered
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    cityhasher::hash::<u64>(&utf16le)
+}
+
+/// Re-anchors `/Engine/UnknownPackage` markers left by a source-only
+/// extraction to the packages the AUTHORED zen package-store row proves the
+/// asset imports. The serialized material-slot name is never identity
+/// evidence on its own: authoring pipelines clone donor meshes and keep the
+/// donor's stale slot names, so a name-first repair can silently rebind an
+/// import to an unrelated package. Slot names only disambiguate between
+/// already-proven authored targets when several markers remain.
 pub fn repair_static_mesh_imports(
     asset: &Path,
+    authored_imported_package_ids: &[u64],
     target_dependencies: &HashMap<u64, PackageEntry>,
     work: &Path,
 ) -> Result<StaticMeshImportRepair> {
@@ -649,6 +669,37 @@ pub fn repair_static_mesh_imports(
     if unknown_packages.is_empty() {
         bail!("StaticMesh has no unresolved material imports to repair");
     }
+    // Every package this asset may reference is authored in its zen
+    // package-store row. The imports that survived to-legacy with a mounted
+    // name account for part of that authored set; the remaining authored IDs
+    // are exactly the packages the markers stand for.
+    let resolved_ids = imports_snapshot
+        .iter()
+        .filter(|import| import.get("ClassName").and_then(Value::as_str) == Some("Package"))
+        .filter_map(|import| import.get("ObjectName").and_then(Value::as_str))
+        .filter(|name| {
+            name.starts_with('/')
+                && !name.eq_ignore_ascii_case("/Engine/UnknownPackage")
+                && !name
+                    .get(..8)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Script/"))
+        })
+        .map(mounted_import_package_id)
+        .collect::<BTreeSet<_>>();
+    let mut missing_targets = authored_imported_package_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|package_id| !resolved_ids.contains(package_id))
+        .collect::<Vec<_>>();
+    if missing_targets.len() != unknown_packages.len() {
+        bail!(
+            "StaticMesh carries {} unresolved package import marker(s) but its authored package-store row leaves {} import(s) unaccounted; the marker-to-package assignment cannot be proven",
+            unknown_packages.len(),
+            missing_targets.len()
+        );
+    }
     let mut patches = Vec::<(usize, usize, ImportTarget)>::new();
     for package_index in unknown_packages {
         let outer = -i64::try_from(package_index)? - 1;
@@ -668,71 +719,75 @@ pub fn repair_static_mesh_imports(
             );
         }
         let object_index = children[0];
-        let reference = -i32::try_from(object_index)? - 1;
-        let pattern = reference.to_le_bytes();
-        let mut names = BTreeSet::new();
-        for offset in 0..bytes.len().saturating_sub(11) {
-            if bytes[offset..offset + 4] != pattern {
-                continue;
+        let target_id = if missing_targets.len() == 1 {
+            missing_targets[0]
+        } else {
+            // Several markers remain: the serialized material-slot name is
+            // only a disambiguator BETWEEN authored targets, never identity
+            // evidence on its own.
+            let reference = -i32::try_from(object_index)? - 1;
+            let pattern = reference.to_le_bytes();
+            let mut candidates = BTreeSet::new();
+            for offset in 0..bytes.len().saturating_sub(11) {
+                if bytes[offset..offset + 4] != pattern {
+                    continue;
+                }
+                let Some(name_index) = little_i32(&bytes, offset + 4) else {
+                    continue;
+                };
+                let Some(name_number) = little_i32(&bytes, offset + 8) else {
+                    continue;
+                };
+                if name_number != 0 {
+                    continue;
+                }
+                let Some(name) = usize::try_from(name_index)
+                    .ok()
+                    .and_then(|index| document.get("NameMap")?.as_array()?.get(index))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let matched = missing_targets
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        target_dependencies.get(candidate).is_some_and(|entry| {
+                            Path::new(&entry.path)
+                                .file_stem()
+                                .and_then(|value| value.to_str())
+                                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(name))
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if matched.len() == 1 {
+                    candidates.insert(matched[0]);
+                }
             }
-            let Some(name_index) = little_i32(&bytes, offset + 4) else {
-                continue;
-            };
-            let Some(name_number) = little_i32(&bytes, offset + 8) else {
-                continue;
-            };
-            if name_number != 0 {
-                continue;
+            if candidates.len() != 1 {
+                bail!(
+                    "unresolved StaticMesh object import {object_index} must select exactly one remaining authored package-store target through its serialized slot name; found {}",
+                    candidates.len()
+                );
             }
-            let Some(name) = usize::try_from(name_index)
-                .ok()
-                .and_then(|index| document.get("NameMap")?.as_array()?.get(index))
-                .and_then(Value::as_str)
-            else {
-                continue;
-            };
-            let target_count = target_dependencies
-                .values()
-                .filter(|entry| {
-                    Path::new(&entry.path)
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .is_some_and(|leaf| leaf.eq_ignore_ascii_case(name))
-                })
-                .count();
-            if target_count > 0 {
-                names.insert(name.to_owned());
-            }
-        }
-        if names.len() != 1 {
-            bail!(
-                "unresolved StaticMesh object import {object_index} must resolve through one serialized current-game material slot name; found {:?}",
-                names
-            );
-        }
-        let slot_name = names.into_iter().next().unwrap();
-        let targets = target_dependencies
-            .values()
-            .filter(|entry| {
-                Path::new(&entry.path)
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&slot_name))
-            })
-            .collect::<Vec<_>>();
-        if targets.len() != 1 {
-            bail!(
-                "serialized StaticMesh material slot {slot_name} must match exactly one current-game package; found {}",
-                targets.len()
-            );
-        }
+            candidates.into_iter().next().unwrap()
+        };
+        missing_targets.retain(|candidate| *candidate != target_id);
+        let target = target_dependencies.get(&target_id).with_context(|| {
+            format!("authored StaticMesh import {target_id} has no proven current identity")
+        })?;
+        let object_name = Path::new(&target.path)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("StaticMesh import target has no filename")?
+            .to_owned();
         patches.push((
             package_index,
             object_index,
             ImportTarget {
-                package_id: targets[0].package_id,
-                package_path: game_package_path(&targets[0].path)?,
-                object_name: slot_name,
+                package_id: target.package_id,
+                package_path: game_package_path(&target.path)?,
+                object_name,
                 class_name: "MaterialInstanceConstant".to_owned(),
             },
         ));

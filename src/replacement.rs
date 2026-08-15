@@ -2910,6 +2910,54 @@ pub(crate) fn extract_composite_packages_exact(
     }
     Ok(())
 }
+/// Stages the only view a SOURCE-package extraction may read from: every
+/// container file in `input` except the current game's stock main store.
+///
+/// Retoc merges every container in its input directory into one package
+/// store. For any package ID the current game also carries, the current
+/// store wins that merge: it rebinds the package's path to the current
+/// spelling (so an exact source-spelling filter matches nothing) and its
+/// chunk is extracted last (so current-game bytes silently overwrite the
+/// source bytes). Source extraction must therefore never see the stock main
+/// store. The `global` script-object store is kept because zen-to-legacy
+/// conversion needs it; unresolved external package imports are preserved as
+/// explicit `/Engine/UnknownPackage` markers and repaired downstream against
+/// proven current identities.
+fn stage_exclusive_source_view(input: &Path) -> Result<tempfile::TempDir> {
+    let staged = tempfile::Builder::new()
+        .prefix("obr-source-only-extraction-")
+        .tempdir()?;
+    for entry in fs::read_dir(input)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+        if !matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "pak" | "ucas" | "utoc"
+        ) {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("source extraction view contains a non-UTF-8 filename")?;
+        if file_name
+            .to_ascii_lowercase()
+            .starts_with("oblivionremastered-windows.")
+        {
+            continue;
+        }
+        fs::copy(&path, staged.path().join(file_name))?;
+    }
+    Ok(staged)
+}
+
 pub(crate) fn extract_source_static_mesh_packages(
     retoc: &RetocTool,
     input: &Path,
@@ -2918,11 +2966,12 @@ pub(crate) fn extract_source_static_mesh_packages(
     label: &str,
 ) -> Result<()> {
     fs::create_dir_all(output)?;
+    let source_view = stage_exclusive_source_view(input)?;
     for source_package in source_packages {
         let filter = source_static_mesh_package_filter(source_package)?;
         let result = retoc.run([
             OsString::from("to-legacy"),
-            input.as_os_str().to_owned(),
+            source_view.path().as_os_str().to_owned(),
             output.as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
@@ -2955,6 +3004,7 @@ pub(crate) fn extract_source_packages_exact(
         .iter()
         .map(|package| Ok(canonical_additive_static_mesh_path(&package.path)?.to_ascii_lowercase()))
         .collect::<Result<BTreeSet<_>>>()?;
+    let source_view = stage_exclusive_source_view(input)?;
     let mut filtered_extraction_complete = true;
     for source_package in source_packages {
         let before = extracted_uasset_paths(output)?;
@@ -2962,7 +3012,8 @@ pub(crate) fn extract_source_packages_exact(
         let package_label = format!("{label} {}", source_package.path);
         let result = retoc.run([
             OsString::from("to-legacy"),
-            input.as_os_str().to_owned(),
+            source_view.path().as_os_str().to_owned(),
+
             output.as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
@@ -2995,43 +3046,14 @@ pub(crate) fn extract_source_packages_exact(
     // Some valid source containers keep dependency-free package payloads in the
     // PAK member even though their package-store row is in the UTOC. Retoc's
     // package filter can report zero for those rows. Fall back to one bounded
-    // full extraction in a source-only view, then prove that the exact expected
-    // UAsset set (and no other package) was produced.
-    let source_only = tempfile::Builder::new()
-        .prefix("obr-source-only-extraction-")
-        .tempdir()?;
-    for entry in fs::read_dir(input)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if !matches!(
-            extension.to_ascii_lowercase().as_str(),
-            "pak" | "ucas" | "utoc"
-        ) {
-            continue;
-        }
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .context("source extraction view contains a non-UTF-8 filename")?;
-        let lower = file_name.to_ascii_lowercase();
-        if lower.starts_with("oblivionremastered-windows.") {
-            continue;
-        }
-        fs::copy(&path, source_only.path().join(file_name))?;
-    }
+    // full extraction in the same exclusive source view, then prove that the
+    // exact expected UAsset set (and no other package) was produced.
     let fallback = tempfile::Builder::new()
         .prefix("obr-source-full-extraction-")
         .tempdir()?;
     let result = retoc.run([
         OsString::from("to-legacy"),
-        source_only.path().as_os_str().to_owned(),
+        source_view.path().as_os_str().to_owned(),
         fallback.path().as_os_str().to_owned(),
         OsString::from("--version"),
         OsString::from("UE5_3"),
@@ -4540,5 +4562,209 @@ mod tests {
         assert!(!is_texture_candidate(
             "OblivionRemastered/Content/Art/armor/Test/T_Test_NNRM.umap"
         ));
+    }
+
+    #[test]
+    fn exclusive_source_view_excludes_the_current_game_main_store() {
+        let input = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("OblivionRemastered-Windows.utoc", b"stock".as_slice()),
+            ("oblivionremastered-windows.UCAS", b"stock".as_slice()),
+            ("OblivionRemastered-Windows.pak", b"stock".as_slice()),
+            ("global.utoc", b"names".as_slice()),
+            ("global.ucas", b"names".as_slice()),
+            ("MyMod_p.utoc", b"source-utoc".as_slice()),
+            ("MyMod_p.ucas", b"source-ucas".as_slice()),
+            ("MyMod_p.pak", b"source-pak".as_slice()),
+            ("README.txt", b"documentation".as_slice()),
+        ] {
+            fs::write(input.path().join(name), bytes).unwrap();
+        }
+        let staged = stage_exclusive_source_view(input.path()).unwrap();
+        let mut names = fs::read_dir(staged.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort_by_key(|name| name.to_ascii_lowercase());
+        assert_eq!(
+            names,
+            [
+                "global.ucas",
+                "global.utoc",
+                "MyMod_p.pak",
+                "MyMod_p.ucas",
+                "MyMod_p.utoc",
+            ]
+        );
+        assert_eq!(
+            fs::read(staged.path().join("MyMod_p.ucas")).unwrap(),
+            b"source-ucas"
+        );
+    }
+
+    fn read_extracted_files(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (relative, fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    fn package_file_set(
+        files: &BTreeMap<String, Vec<u8>>,
+        package_path: &str,
+    ) -> BTreeMap<String, Vec<u8>> {
+        let stem = package_path.trim_end_matches(".uasset");
+        files
+            .iter()
+            .filter(|(path, _)| {
+                path.strip_prefix(stem).is_some_and(|suffix| {
+                    matches!(suffix, ".uasset" | ".uexp" | ".ubulk" | ".uptnl")
+                })
+            })
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect()
+    }
+
+    /// The audit-required fixture: one extraction input that contains BOTH the
+    /// source container and the current-game package store, where the two
+    /// stores spell a shared package path differently and carry different
+    /// bytes. Source extraction must return the source store's exact bytes and
+    /// exact path spelling for every package — never the current store's — and
+    /// extracting any single package must behave the same as the whole set.
+    #[test]
+    #[ignore = "requires an installed game and a local heterogeneous container fixture"]
+    fn source_extraction_returns_source_bytes_when_both_stores_are_present() {
+        let required = |name: &str| {
+            std::env::var_os(name)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+        };
+        let game_root = normalize_install_root(&required("OBR_TEST_GAME"));
+        let mod_input = required("OBR_TEST_HETEROGENEOUS_MOD");
+        let game_paks = game_root.join(r"OblivionRemastered\Content\Paks");
+        let stock_names = [
+            "global.utoc",
+            "global.ucas",
+            "OblivionRemastered-Windows.utoc",
+            "OblivionRemastered-Windows.ucas",
+            "OblivionRemastered-Windows.pak",
+        ];
+        let retoc = RetocTool::materialize().unwrap();
+        let work = tempfile::Builder::new()
+            .prefix("obr-source-byte-fixture-")
+            .tempdir()
+            .unwrap();
+        let staged = work.path().join("source");
+        stage_input(&mod_input, &staged).unwrap();
+        let containers =
+            discover_containers(&staged, &retoc, ReplacementScope::HeterogeneousReplacement)
+                .unwrap();
+        assert!(!containers.is_empty());
+        for container in &containers {
+            let root = work.path().join("containers").join(&container.name);
+            // Ground truth, independent of the helpers under test: a full
+            // unfiltered extraction that can only see the source container
+            // (plus the script-object store required for conversion).
+            let truth_view = root.join("truth-view");
+            fs::create_dir_all(&truth_view).unwrap();
+            for name in ["global.utoc", "global.ucas"] {
+                fs::copy(game_paks.join(name), truth_view.join(name)).unwrap();
+            }
+            for source in [&container.utoc, &container.ucas, &container.pak] {
+                fs::copy(source, truth_view.join(source.file_name().unwrap())).unwrap();
+            }
+            let truth_out = root.join("truth");
+            fs::create_dir_all(&truth_out).unwrap();
+            let result = retoc
+                .run([
+                    OsString::from("to-legacy"),
+                    truth_view.as_os_str().to_owned(),
+                    truth_out.as_os_str().to_owned(),
+                    OsString::from("--version"),
+                    OsString::from("UE5_3"),
+                    OsString::from("--no-shaders"),
+                    OsString::from("--no-script-objects"),
+                    OsString::from("--no-parallel"),
+                ])
+                .unwrap();
+            let (extracted, failed) =
+                RetocTool::extraction_summary(&result, "fixture ground truth").unwrap();
+            assert_eq!(failed, 0);
+            assert_eq!(extracted, container.packages.len());
+            let truth = read_extracted_files(&truth_out);
+            for package in &container.packages {
+                // The ground truth must materialize the exact source spelling.
+                assert!(
+                    truth.contains_key(&package.path),
+                    "ground truth is missing the exact source path {}",
+                    package.path
+                );
+            }
+
+            // The fixture input under test: both stores in one directory.
+            let merged = tempfile::Builder::new()
+                .prefix(".obr-test-merged-view-")
+                .tempdir_in(&game_root)
+                .unwrap();
+            for name in stock_names {
+                fs::hard_link(game_paks.join(name), merged.path().join(name)).unwrap();
+            }
+            for source in [&container.utoc, &container.ucas, &container.pak] {
+                fs::copy(source, merged.path().join(source.file_name().unwrap())).unwrap();
+            }
+
+            // 1) Whole-set extraction returns exactly the source bytes.
+            let whole = root.join("whole-set");
+            extract_source_packages_exact(
+                &retoc,
+                merged.path(),
+                &whole,
+                &container.packages,
+                "fixture whole-set source extraction",
+            )
+            .unwrap();
+            assert_eq!(read_extracted_files(&whole), truth);
+
+            // 2) Extracting any single package also returns its source bytes.
+            for package in &container.packages {
+                let single = root
+                    .join("single")
+                    .join(package.package_id.to_string());
+                extract_source_packages_exact(
+                    &retoc,
+                    merged.path(),
+                    &single,
+                    std::slice::from_ref(package),
+                    &format!("fixture single-package source extraction {}", package.path),
+                )
+                .unwrap();
+                let expected = package_file_set(&truth, &package.path);
+                assert!(!expected.is_empty());
+                assert_eq!(read_extracted_files(&single), expected);
+            }
+
+            // 3) The static-mesh-lane helper (no whole-container fallback)
+            //    must extract the same source bytes from the same input.
+            let static_mesh_lane = root.join("static-mesh-lane");
+            extract_source_static_mesh_packages(
+                &retoc,
+                merged.path(),
+                &static_mesh_lane,
+                &container.packages,
+                "fixture static-mesh-lane source extraction",
+            )
+            .unwrap();
+            assert_eq!(read_extracted_files(&static_mesh_lane), truth);
+        }
     }
 }

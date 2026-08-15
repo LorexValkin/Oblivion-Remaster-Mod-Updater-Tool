@@ -55,7 +55,7 @@ use crate::uasset::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::json;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -348,16 +348,51 @@ fn ensure_no_installed_replacement_collisions(
         })
         .collect::<HashSet<_>>();
     let mut collisions = Vec::new();
-    let mut utocs = WalkDir::new(&mods)
+    let mut container_members = BTreeMap::<PathBuf, (Option<PathBuf>, bool)>::new();
+    for path in WalkDir::new(&mods)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
-        .filter(|path| {
-            path.extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("utoc"))
+    {
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "ucas" | "utoc") {
+            continue;
+        }
+        let stem_key = PathBuf::from(
+            path.with_extension("")
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+        );
+        let row = container_members.entry(stem_key).or_default();
+        match extension.as_str() {
+            "utoc" => row.0 = Some(path),
+            _ => row.1 = true,
+        }
+    }
+    let incomplete = container_members
+        .values()
+        .filter_map(|(utoc, ucas_present)| match utoc {
+            Some(utoc) if !ucas_present => {
+                Some(format!("{} (missing: ucas)", utoc.display()))
+            }
+            _ => None,
         })
+        .collect::<Vec<_>>();
+    if !incomplete.is_empty() {
+        bail!(
+            "the game ~mods directory contains {} incomplete IoStore container group(s) whose installed package inventory cannot be read. Remove the leftover file(s) or restore the missing member(s), then run the update again:\n{}",
+            incomplete.len(),
+            incomplete.join("\n")
+        );
+    }
+    let mut utocs = container_members
+        .into_values()
+        .filter_map(|(utoc, _)| utoc)
         .collect::<Vec<_>>();
     utocs.sort();
     for utoc in utocs {
@@ -4808,6 +4843,24 @@ fn run_additive_static_mesh_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_collision_scan_names_incomplete_container_groups() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mods = temporary.path().join("~mods");
+        fs::create_dir_all(&mods).unwrap();
+        fs::write(mods.join("Leftover_P.utoc"), b"junk").unwrap();
+        let retoc = RetocTool::materialize().unwrap();
+        let error = ensure_no_installed_replacement_collisions(temporary.path(), &[], &retoc, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("incomplete IoStore container group"),
+            "{error}"
+        );
+        assert!(error.contains("Leftover_P.utoc"), "{error}");
+        assert!(error.contains("missing: ucas"), "{error}");
+    }
 
     #[test]
     fn resolves_sync_map_directory_alias_by_unique_object_leaf() {

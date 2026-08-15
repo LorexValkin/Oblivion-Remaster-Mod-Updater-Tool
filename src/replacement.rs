@@ -1837,6 +1837,65 @@ pub enum RecoveredDependencyRoute {
     CurrentDonorRebind(&'static str),
 }
 
+/// Proves a retired Unreal-editor sidecar identity by pure derivation: the
+/// editor auto-names a mesh's sidecars `<MeshPackage>_Skeleton` and
+/// `<MeshPackage>_PhysicsAsset`, so an unresolved import of consumer `P`
+/// whose package ID equals the exact CityHash64 derivation of `P`'s own
+/// mounted name plus one of those suffixes can only be that sidecar. This
+/// needs no raw NameMap scan and no historical archive; author-renamed
+/// sidecars that do not derive from the consumer name stay on the NameMap
+/// recovery route.
+pub(crate) fn derived_sidecar_route(
+    consumer_mounted_name: &str,
+    target_id: u64,
+) -> Option<(String, &'static str)> {
+    for (suffix, expected_class) in [("_Skeleton", "Skeleton"), ("_PhysicsAsset", "PhysicsAsset")] {
+        let candidate = format!("{consumer_mounted_name}{suffix}");
+        if unreal_package_id(&candidate).ok() == Some(target_id) {
+            return Some((candidate, expected_class));
+        }
+    }
+    None
+}
+
+/// Applies the current-donor gate for one stale sidecar edge and produces its
+/// disclosed rebind plan: the consumer must be an existing same-identity
+/// current-game package whose donor no longer imports the retired dependency.
+/// The plan itself authorizes nothing; the serialized-role import repair must
+/// still consume it or the lane fails.
+fn plan_donor_rebind(
+    inspection: &ReplacementInspection,
+    consumer_id: u64,
+    consumer_path: &str,
+    target_id: u64,
+    target_name: &str,
+    expected_class: &str,
+    evidence: &str,
+) -> Result<CompositeDonorRebindPlan> {
+    let current_imports = inspection
+        .target_package_imports
+        .get(&consumer_id)
+        .with_context(|| {
+            format!(
+                "recovered stale {expected_class} dependency {target_name} requires a same-identity current-game donor for its consumer"
+            )
+        })?;
+    if current_imports.contains(&target_id) {
+        bail!(
+            "current game still imports recovered dependency {target_name}; stale-dependency evidence is inconsistent"
+        );
+    }
+    Ok(CompositeDonorRebindPlan {
+        consumer_package_id: consumer_id,
+        consumer_package_path: consumer_path.to_owned(),
+        target_package_id: target_id,
+        target_package_name: target_name.to_owned(),
+        expected_class: expected_class.to_owned(),
+        evidence: evidence.to_owned(),
+        policy: "serialized-role-current-template-import-rebase-v1".to_owned(),
+    })
+}
+
 pub(crate) fn recovered_dependency_route(target_leaf: &str) -> Option<RecoveredDependencyRoute> {
     let lower = target_leaf.to_ascii_lowercase();
     if lower.starts_with("mic_") {
@@ -2060,6 +2119,30 @@ pub fn recover_composite_package_identities(
         let consumer = source_store
             .get(&consumer_id)
             .context("identity recovery lost its consumer package-store row")?;
+        // Derivation-first sidecar recognition: an unresolved import whose ID
+        // derives exactly from the consumer's own mounted name plus an
+        // Unreal-editor sidecar suffix is proven without raw NameMap
+        // evidence. Author-renamed sidecars fall through to name recovery.
+        let consumer_mounted = inspection
+            .target_dependencies
+            .get(&consumer_id)
+            .and_then(|current| mounted_game_package_name(&current.path).ok())
+            .or_else(|| mounted_game_package_name(&consumer.path).ok());
+        if let Some(consumer_name) = &consumer_mounted
+            && let Some((target_name, expected_class)) =
+                derived_sidecar_route(consumer_name, target_id)
+        {
+            donor_rebinds.push(plan_donor_rebind(
+                inspection,
+                consumer_id,
+                &consumer.path,
+                target_id,
+                &target_name,
+                expected_class,
+                "consumer-derived-sidecar-package-id",
+            )?);
+            continue;
+        }
         let container = inspection
             .containers
             .iter()
@@ -2098,29 +2181,15 @@ pub fn recover_composite_package_identities(
                 // donor's proven successor (or proves retirement) and the
                 // rebuilt container is verified against the donor-derived
                 // import set. Recovery only records the routing decision.
-                let current_imports =
-                    inspection
-                        .target_package_imports
-                        .get(&consumer_id)
-                        .with_context(|| {
-                            format!(
-                                "recovered stale {expected_class} dependency {target_name} requires a same-identity current-game donor for its consumer"
-                            )
-                        })?;
-                if current_imports.contains(&target_id) {
-                    bail!(
-                        "current game still imports recovered dependency {target_name}; stale-dependency evidence is inconsistent"
-                    );
-                }
-                donor_rebinds.push(CompositeDonorRebindPlan {
-                    consumer_package_id: consumer_id,
-                    consumer_package_path: consumer.path.clone(),
-                    target_package_id: target_id,
-                    target_package_name: target_name.clone(),
-                    expected_class: expected_class.to_owned(),
-                    evidence: "same-identity-current-donor-import-table".to_owned(),
-                    policy: "serialized-role-current-template-import-rebase-v1".to_owned(),
-                });
+                donor_rebinds.push(plan_donor_rebind(
+                    inspection,
+                    consumer_id,
+                    &consumer.path,
+                    target_id,
+                    &target_name,
+                    expected_class,
+                    "same-identity-current-donor-import-table",
+                )?);
                 continue;
             }
             Some(RecoveredDependencyRoute::BundledAlias(expected_class)) => expected_class,
@@ -3803,6 +3872,35 @@ mod tests {
             packed_texture_kind: None,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn derives_retired_sidecar_identities_from_the_consumer_package_name() {
+        // Witness (Shivering Isles Clothing Mesh Fixes, Nexus 3738): the
+        // bundled dress imports its author-project sidecars, whose package
+        // IDs derive exactly from the mesh's own mounted name.
+        let dress = "/Game/Art/Clothes/SpecialClass/SEDuchess/SK_SE_Duchess_Dress";
+        assert_eq!(
+            derived_sidecar_route(dress, 3_956_433_960_298_804_666),
+            Some((format!("{dress}_Skeleton"), "Skeleton"))
+        );
+        assert_eq!(
+            derived_sidecar_route(dress, 6_250_700_512_222_885_520),
+            Some((format!("{dress}_PhysicsAsset"), "PhysicsAsset"))
+        );
+        // Witness (CL_Blades, Nexus 3386): the author renamed the meshes but
+        // kept project sidecar names (SK_Iron_Boots_B_*), so derivation from
+        // the consumer name must NOT match; that class stays on the raw
+        // NameMap recovery route.
+        let boots = "/Game/Art/Armor/Blades/SK_Blades_Boots";
+        assert_eq!(
+            derived_sidecar_route(boots, 4_377_219_594_466_101_747),
+            None
+        );
+        assert_eq!(
+            derived_sidecar_route(boots, 14_019_482_699_950_780_448),
+            None
+        );
     }
 
     #[test]

@@ -2535,6 +2535,68 @@ fn find_extracted_asset(root: &Path, package_path: &str) -> Result<PathBuf> {
     Ok(matches[0].clone())
 }
 
+/// Derives one case-sensitive Retoc filter per current-game donor package.
+/// Each filter must keep the current package store's exact spelling; a source
+/// container spelling (including any project-root alias) is never a valid
+/// donor filter and fails closed here.
+pub(crate) fn current_donor_package_filters(
+    target_packages: &[PackageEntry],
+) -> Result<Vec<String>> {
+    target_packages
+        .iter()
+        .map(|package| {
+            Ok(canonical_package_path(&package.path)?
+                .trim_end_matches(".uasset")
+                .to_owned())
+        })
+        .collect()
+}
+
+/// Extracts every requested current-game donor package in one Retoc
+/// invocation instead of re-reading the complete current package store once
+/// per donor. The invocation carries one exact current-spelling filter per
+/// donor; the run fails closed unless exactly the requested number of assets
+/// extracts, and each donor is then individually resolved by its exact
+/// current path.
+pub(crate) fn extract_current_packages_batched(
+    retoc: &RetocTool,
+    input: &Path,
+    output: &Path,
+    target_packages: &[PackageEntry],
+    label: &str,
+) -> Result<Vec<PathBuf>> {
+    if target_packages.is_empty() {
+        return Ok(Vec::new());
+    }
+    fs::create_dir_all(output)?;
+    let mut arguments = vec![
+        OsString::from("to-legacy"),
+        input.as_os_str().to_owned(),
+        output.as_os_str().to_owned(),
+        OsString::from("--version"),
+        OsString::from("UE5_3"),
+        OsString::from("--no-shaders"),
+        OsString::from("--no-script-objects"),
+        OsString::from("--no-parallel"),
+    ];
+    for filter in current_donor_package_filters(target_packages)? {
+        arguments.push(OsString::from("--filter"));
+        arguments.push(OsString::from(filter));
+    }
+    let result = retoc.run(arguments)?;
+    let (extracted, failed) = RetocTool::extraction_summary(&result, label)?;
+    if failed != 0 || extracted != target_packages.len() {
+        bail!(
+            "{label} expected exactly {} current donor asset(s); extracted {extracted}, failed {failed}",
+            target_packages.len()
+        );
+    }
+    target_packages
+        .iter()
+        .map(|package| find_extracted_asset(output, &package.path))
+        .collect()
+}
+
 fn extract_current_texture_package(
     retoc: &RetocTool,
     input: &Path,
@@ -3148,9 +3210,10 @@ pub fn probe_heterogeneous_replacement_input(
             "heterogeneous source extraction",
         )?;
 
+        let mut pending = Vec::with_capacity(container.packages.len());
         for package in &container.packages {
             let asset = find_extracted_additive_static_mesh(&legacy, &package.path)?;
-            let (asset_kind, mut warnings) = match classify_heterogeneous_asset(&asset)? {
+            match classify_heterogeneous_asset(&asset)? {
                 ProvenHeterogeneousAsset::StaticMesh { imports } => {
                     if imports
                         .iter()
@@ -3172,24 +3235,44 @@ pub fn probe_heterogeneous_replacement_input(
                         }
                     }
                     static_mesh_count += 1;
-                    (HeterogeneousReplacementAssetKind::StaticMesh, Vec::new())
+                    pending.push((package, None));
                 }
                 ProvenHeterogeneousAsset::Texture2D(mut source) => {
                     source.asset = canonical_additive_static_mesh_path(&package.path)?;
-                    let current_package = current_packages_by_id
-                        .get(&package.package_id)
-                        .context("heterogeneous current package inventory lost an identity")?;
-                    let current_root = root.join("current").join(package.package_id.to_string());
-                    let current_asset = extract_current_texture_package(
-                        &retoc,
-                        current_view.path(),
-                        &current_root,
-                        current_package,
-                        "heterogeneous current Texture2D extraction",
-                    )?;
+                    pending.push((package, Some(Box::new(source))));
+                }
+            }
+        }
+        // One batched donor extraction per container reads the current package
+        // store once instead of once per Texture2D donor.
+        let donor_targets = pending
+            .iter()
+            .filter(|(_, texture_source)| texture_source.is_some())
+            .map(|(package, _)| {
+                Ok(current_packages_by_id
+                    .get(&package.package_id)
+                    .context("heterogeneous current package inventory lost an identity")?
+                    .clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut donor_assets = extract_current_packages_batched(
+            &retoc,
+            current_view.path(),
+            &root.join("current"),
+            &donor_targets,
+            "heterogeneous current Texture2D extraction",
+        )?
+        .into_iter();
+        for (package, texture_source) in pending {
+            let (asset_kind, mut warnings) = match texture_source {
+                None => (HeterogeneousReplacementAssetKind::StaticMesh, Vec::new()),
+                Some(source) => {
+                    let current_asset = donor_assets
+                        .next()
+                        .context("heterogeneous donor extraction lost a Texture2D asset")?;
                     let current = inspect_texture_asset(&current_asset)?;
                     let validated =
-                        validate_texture_replacement_pair(source, &current, &package.path)?;
+                        validate_texture_replacement_pair(*source, &current, &package.path)?;
                     texture_count += 1;
                     (
                         HeterogeneousReplacementAssetKind::Texture2D,
@@ -4263,6 +4346,41 @@ mod tests {
             source_static_mesh_package_filter(&additive).unwrap(),
             "OblivionRemastered/Content/Art/UI/Icons/Dynamic_Icons/menus/Icons/armor/Elven/T_custom"
         );
+    }
+
+    #[test]
+    fn current_donor_filters_keep_current_spelling_and_reject_source_alias_roots() {
+        // Donor extraction reads the current game's package store, so every
+        // batched Retoc filter must keep that store's exact spelling.
+        let donors = [
+            PackageEntry {
+                package_id: 42,
+                path: "../../../OblivionRemastered/Content/Art/armor/example/SM_Example_Helmet.uasset"
+                    .to_owned(),
+            },
+            PackageEntry {
+                package_id: 43,
+                path: "../../../OblivionRemastered/Content/Art/armor/example/T_Example_Boots_D.uasset"
+                    .to_owned(),
+            },
+        ];
+        assert_eq!(
+            current_donor_package_filters(&donors).unwrap(),
+            vec![
+                "OblivionRemastered/Content/Art/armor/example/SM_Example_Helmet".to_owned(),
+                "OblivionRemastered/Content/Art/armor/example/T_Example_Boots_D".to_owned(),
+            ]
+        );
+
+        // A source project-root alias is not a current-store path. Using it as
+        // a donor filter could never match the current container, so filter
+        // derivation must fail closed instead of extracting nothing.
+        let alias_leak = [PackageEntry {
+            package_id: 42,
+            path: "../../../SomeSourceProject/Content/Art/armor/example/SM_Example_Helmet.uasset"
+                .to_owned(),
+        }];
+        assert!(current_donor_package_filters(&alias_leak).is_err());
     }
 
     #[test]

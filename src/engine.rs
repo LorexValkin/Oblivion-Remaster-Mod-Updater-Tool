@@ -30,7 +30,7 @@ use crate::replacement::{
     ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, COMPOSITE_PACKAGE_REBASE_ADAPTER,
     HETEROGENEOUS_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER, ProvenHeterogeneousAsset,
     TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
-    classify_heterogeneous_asset, composite_effective_package_path,
+    classify_heterogeneous_asset, composite_effective_package_path, composite_roundtrip_requests,
     extract_composite_packages_exact, extract_current_packages_batched,
     extract_source_composite_packages_exact, extract_source_composite_packages_with_fallback,
     extract_source_packages_exact,
@@ -4928,30 +4928,32 @@ fn run_composite_package_update(
             .path()
             .join("roundtrip")
             .join(&container.container.name);
-        // The rebuilt container stores every package at its effective
-        // (current) identity, so the roundtrip must request exactly that
-        // identity; a source project-root alias spelling no longer exists in
-        // the rebuilt directory index.
-        let effective_packages = container
-            .container
-            .packages
+        // The rebuilt container's directory index inherits the legacy tree's
+        // on-disk casing, which platform directory-case pinning can mix
+        // between authored and current spellings. Retoc filters are
+        // case-sensitive, so the roundtrip must request every package by the
+        // rebuilt container's OWN materialized spelling, resolved by package
+        // ID and failing closed on any missing identity.
+        let (_, rebuilt_entries) = retoc.package_entries(&container.rebuilt_utoc)?;
+        let roundtrip_requests =
+            composite_roundtrip_requests(&rebuilt_entries, &container.container.packages)?;
+        // The roundtrip runs through the same byte-proven extraction as the
+        // source lane: the exclusive view (rebuilt containers, provider, and
+        // global only) is the byte truth — the layered stock store can hand
+        // back its own bulk chunks for package IDs the current game also
+        // carries — while the layered view only contributes proven
+        // import-name resolution and the guarded conversion fallback.
+        let rebuilt_utocs = built
             .iter()
-            .map(|package| {
-                let effective = composite_effective_package_path(package, &inspection)?;
-                Ok((
-                    PackageEntry {
-                        package_id: package.package_id,
-                        path: effective.clone(),
-                    },
-                    effective,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        extract_composite_packages_exact(
+            .map(|built_container| built_container.rebuilt_utoc.clone())
+            .collect::<Vec<_>>();
+        extract_source_composite_packages_with_fallback(
             &retoc,
             verify_view.path(),
+            current_view.path(),
+            &rebuilt_utocs,
             &verify_legacy,
-            &effective_packages,
+            &roundtrip_requests,
             &format!("composite roundtrip {}", container.container.name),
         )?;
         let payload = verify_preserved_export_payloads(

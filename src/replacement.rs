@@ -1842,6 +1842,47 @@ pub(crate) fn composite_effective_package_path(
     canonical_additive_static_mesh_path(&package.path)
 }
 
+/// Builds the roundtrip extraction requests for a rebuilt composite
+/// container. Retoc filters are case-sensitive and the rebuilt directory
+/// index inherits the legacy tree's on-disk casing — which platform
+/// directory-case pinning can mix between authored and current spellings —
+/// so every package must be requested by the rebuilt container's OWN
+/// materialized spelling. Identity is resolved by package ID: a duplicated
+/// rebuilt ID or a requested identity missing from the rebuilt inventory
+/// fails closed.
+pub(crate) fn composite_roundtrip_requests(
+    rebuilt_entries: &[PackageEntry],
+    requested: &[PackageEntry],
+) -> Result<Vec<(PackageEntry, String)>> {
+    let mut by_id = HashMap::new();
+    for entry in rebuilt_entries {
+        if by_id.insert(entry.package_id, entry).is_some() {
+            bail!(
+                "rebuilt composite container repeats package ID {}",
+                entry.package_id
+            );
+        }
+    }
+    requested
+        .iter()
+        .map(|package| {
+            let rebuilt = by_id.get(&package.package_id).with_context(|| {
+                format!(
+                    "rebuilt composite container is missing requested package {}",
+                    package.package_id
+                )
+            })?;
+            canonical_additive_static_mesh_path(&rebuilt.path).with_context(|| {
+                format!(
+                    "rebuilt composite package {} has no canonical content path",
+                    rebuilt.path
+                )
+            })?;
+            Ok(((*rebuilt).clone(), rebuilt.path.clone()))
+        })
+        .collect()
+}
+
 fn mounted_game_package_name(path: &str) -> Result<String> {
     let canonical = canonical_additive_static_mesh_path(path)?;
     let parts = canonical.split('/').collect::<Vec<_>>();
@@ -3154,9 +3195,10 @@ fn stage_exclusive_source_view(input: &Path) -> Result<tempfile::TempDir> {
 /// proving it carries the exclusive extraction's exact authored export
 /// payloads; any divergence means the layered view substituted foreign
 /// content and the extraction fails closed. Sidecars always keep the
-/// exclusive extraction's bytes. Donor and roundtrip extractions
-/// intentionally do NOT go through this wrapper: donors must read the pure
-/// current view, and the roundtrip must read the layered rebuilt view.
+/// exclusive extraction's bytes. The rebuilt-container roundtrip goes
+/// through the same discipline (with the rebuilt containers as the source
+/// side); only donor extractions stay off this wrapper, because donors must
+/// read the pure current view.
 /// Main-lane variant of [`extract_source_composite_packages_exact`] with a
 /// per-package layered fallback for packages retoc cannot convert from a
 /// source-only view at all (some Blueprint conversions require the imported
@@ -4942,6 +4984,48 @@ mod tests {
             resolve_bare_root_package_identity("../../../BP_RootAlias.uasset", 50, &duplicated),
             None
         );
+    }
+
+    #[test]
+    fn composite_roundtrip_requests_use_the_rebuilt_containers_own_spelling() {
+        let rebuilt = vec![
+            PackageEntry {
+                package_id: 42,
+                path: "../../../OblivionRemastered/Content/Art/Armor/Blades/SK_Blades_Boots.uasset"
+                    .to_owned(),
+            },
+            PackageEntry {
+                package_id: 43,
+                path: "../../../OblivionRemastered/Content/Art/Armor/Blades/CL_Belt.uasset"
+                    .to_owned(),
+            },
+        ];
+        let requested = vec![PackageEntry {
+            package_id: 42,
+            // The current game's spelling differs in directory case only; the
+            // request must still use the rebuilt container's spelling because
+            // Retoc filters are case-sensitive against that index.
+            path: "../../../OblivionRemastered/Content/Art/armor/blades/SK_Blades_Boots.uasset"
+                .to_owned(),
+        }];
+        let requests = composite_roundtrip_requests(&rebuilt, &requested).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0.package_id, 42);
+        assert_eq!(
+            requests[0].1,
+            "../../../OblivionRemastered/Content/Art/Armor/Blades/SK_Blades_Boots.uasset"
+        );
+
+        // A requested identity missing from the rebuilt inventory fails closed.
+        let missing = vec![PackageEntry {
+            package_id: 99,
+            path: "X.uasset".to_owned(),
+        }];
+        assert!(composite_roundtrip_requests(&rebuilt, &missing).is_err());
+
+        // A duplicated rebuilt package ID is ambiguous and fails closed.
+        let duplicated = vec![rebuilt[0].clone(), rebuilt[0].clone()];
+        assert!(composite_roundtrip_requests(&duplicated, &requested).is_err());
     }
 
     #[test]

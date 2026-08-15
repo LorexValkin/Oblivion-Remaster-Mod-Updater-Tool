@@ -45,7 +45,63 @@ pub struct Plugin {
     pub declared_record_count: u32,
     pub next_object_id: u32,
     pub group_count: usize,
+    /// GRUP headers that declared a zero byte size and were recovered as
+    /// header-only empty groups. Disclosed by structural analysis; the
+    /// byte-splicing rewrite path still refuses such plugins.
+    pub recovered_zero_size_group_count: usize,
     pub records: Vec<Record>,
+}
+
+pub const SELF_SLOT_BASIS_NO_SOURCE_RECORDS: &str = "no-source-records";
+pub const SELF_SLOT_BASIS_MASTER_COUNT: &str = "master-count";
+pub const SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE: &str = "preserved-out-of-range";
+
+/// Unique-only self-slot inference ported from the Unblivion TES lineage
+/// scanner: the slot that holds a plugin's own records is provable only when
+/// the record headers use at most one distinct FormID master-index at or
+/// beyond the declared master count. No such index means the conventional
+/// master-count slot; exactly one distinct value is the plugin's own slot
+/// (retail AltarDeluxe preserves slot 13 while declaring twelve masters);
+/// two or more distinct undeclared slots are ambiguous and fail closed with
+/// every candidate disclosed instead of guessing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelfSlotInference {
+    Inferred { self_index: u8, basis: &'static str },
+    Ambiguous { candidates: Vec<u8> },
+}
+
+impl SelfSlotInference {
+    pub fn self_index(&self) -> Option<u8> {
+        match self {
+            Self::Inferred { self_index, .. } => Some(*self_index),
+            Self::Ambiguous { .. } => None,
+        }
+    }
+}
+
+pub fn infer_self_slot(master_count: u8, records: &[Record]) -> SelfSlotInference {
+    let mut candidates = records
+        .iter()
+        .map(|record| (record.form_id >> 24) as u8)
+        .filter(|index| *index >= master_count)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [] => SelfSlotInference::Inferred {
+            self_index: master_count,
+            basis: SELF_SLOT_BASIS_NO_SOURCE_RECORDS,
+        },
+        [single] if *single == master_count => SelfSlotInference::Inferred {
+            self_index: *single,
+            basis: SELF_SLOT_BASIS_MASTER_COUNT,
+        },
+        [single] => SelfSlotInference::Inferred {
+            self_index: *single,
+            basis: SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE,
+        },
+        _ => SelfSlotInference::Ambiguous { candidates },
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -231,12 +287,23 @@ pub fn read_plugin_bytes(bytes: &[u8], source: &str) -> Result<Plugin> {
     let declared_record_count = u32::from_le_bytes(hedr.data[4..8].try_into().unwrap());
     let next_object_id = u32::from_le_bytes(hedr.data[8..12].try_into().unwrap());
     let mut group_count = 0_usize;
+    let mut recovered_zero_size_group_count = 0_usize;
     let mut records = Vec::new();
     while reader.position() as usize + 20 <= bytes.len() {
         let start = reader.position();
         let kind = read_fourcc(&mut reader)?;
         if kind == "GRUP" {
             let group_size = read_u32(&mut reader)? as u64;
+            if group_size == 0 {
+                // Some author tools write a zero byte size into an otherwise
+                // well-formed GRUP header. Every child that follows must still
+                // parse as complete records/groups, so the header is recovered
+                // as an empty group and the recovery is counted for disclosure.
+                recovered_zero_size_group_count += 1;
+                group_count += 1;
+                reader.seek(SeekFrom::Current(12))?;
+                continue;
+            }
             if group_size < 20 || start + group_size > bytes.len() as u64 {
                 bail!("invalid GRUP at 0x{start:X} in {source}");
             }
@@ -273,6 +340,7 @@ pub fn read_plugin_bytes(bytes: &[u8], source: &str) -> Result<Plugin> {
         declared_record_count,
         next_object_id,
         group_count,
+        recovered_zero_size_group_count,
         records,
     })
 }
@@ -855,6 +923,12 @@ fn collect_group_contexts(
         let kind = &header[..4];
         let declared_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         if kind == b"GRUP" {
+            if declared_size == 0 {
+                // Mirror the tolerant parse: a zero-size GRUP header is an
+                // empty group, so it contributes no placement context.
+                offset += 20;
+                continue;
+            }
             if declared_size < 20
                 || offset
                     .checked_add(declared_size)
@@ -1339,6 +1413,130 @@ mod tests {
         let mut raw = declared_size.to_le_bytes().to_vec();
         raw.extend_from_slice(&compressed);
         raw
+    }
+
+    fn bare_record(kind: &str, form_id: u32) -> Record {
+        Record {
+            kind: kind.to_owned(),
+            form_id,
+            flags: 0,
+            subrecords: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn infers_the_conventional_self_slot_without_source_records() {
+        let records = vec![bare_record("CONT", 0x0000_1000)];
+        assert_eq!(
+            infer_self_slot(1, &records),
+            SelfSlotInference::Inferred {
+                self_index: 1,
+                basis: SELF_SLOT_BASIS_NO_SOURCE_RECORDS
+            }
+        );
+    }
+
+    #[test]
+    fn infers_the_declared_master_count_self_slot() {
+        let records = vec![
+            bare_record("CONT", 0x0000_1000),
+            bare_record("WEAP", 0x0100_0800),
+        ];
+        assert_eq!(
+            infer_self_slot(1, &records),
+            SelfSlotInference::Inferred {
+                self_index: 1,
+                basis: SELF_SLOT_BASIS_MASTER_COUNT
+            }
+        );
+    }
+
+    #[test]
+    fn infers_a_unique_preserved_out_of_range_self_slot() {
+        let records = vec![
+            bare_record("CELL", 0x0004_9E28),
+            bare_record("WEAP", 0x0200_0ED4),
+            bare_record("REFR", 0x0200_30F7),
+        ];
+        assert_eq!(
+            infer_self_slot(1, &records),
+            SelfSlotInference::Inferred {
+                self_index: 2,
+                basis: SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE
+            }
+        );
+    }
+
+    #[test]
+    fn fails_closed_on_ambiguous_self_slot_candidates() {
+        let records = vec![
+            bare_record("WEAP", 0x0100_0800),
+            bare_record("REFR", 0x0200_0801),
+        ];
+        assert_eq!(
+            infer_self_slot(1, &records),
+            SelfSlotInference::Ambiguous {
+                candidates: vec![1, 2]
+            }
+        );
+    }
+
+    fn zero_size_group_plugin_bytes() -> Vec<u8> {
+        let mut hedr = 0.8_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&3_u32.to_le_bytes());
+        hedr.extend_from_slice(&0x0900_u32.to_le_bytes());
+        let mut header_data = Vec::new();
+        for (kind, data) in [
+            ("HEDR", hedr.as_slice()),
+            ("MAST", b"Oblivion.esm\0".as_slice()),
+            ("DATA", [0_u8; 8].as_slice()),
+        ] {
+            header_data.extend_from_slice(kind.as_bytes());
+            header_data.extend_from_slice(&(data.len() as u16).to_le_bytes());
+            header_data.extend_from_slice(data);
+        }
+        let mut bytes = b"TES4".to_vec();
+        bytes.extend_from_slice(&(header_data.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&[0; 12]);
+        bytes.extend_from_slice(&header_data);
+        // A zero-size top GRUP written by a buggy author tool, followed by a
+        // well-formed WEAP top group holding one record.
+        bytes.extend_from_slice(b"GRUP");
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(b"CELL");
+        bytes.extend_from_slice(&[0; 8]);
+        let record_payload = {
+            let mut payload = b"EDID".to_vec();
+            payload.extend_from_slice(&8_u16.to_le_bytes());
+            payload.extend_from_slice(b"Fixture\0");
+            payload
+        };
+        bytes.extend_from_slice(b"GRUP");
+        bytes.extend_from_slice(&((20 + 20 + record_payload.len()) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WEAP");
+        bytes.extend_from_slice(&[0; 8]);
+        bytes.extend_from_slice(b"WEAP");
+        bytes.extend_from_slice(&(record_payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0100_0800_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&record_payload);
+        bytes
+    }
+
+    #[test]
+    fn recovers_a_zero_size_group_header_and_discloses_the_recovery() {
+        let bytes = zero_size_group_plugin_bytes();
+        let plugin = read_plugin_bytes(&bytes, "fixture.esp").unwrap();
+        assert_eq!(plugin.group_count, 2);
+        assert_eq!(plugin.recovered_zero_size_group_count, 1);
+        assert_eq!(plugin.records.len(), 1);
+        assert_eq!(plugin.records[0].kind, "WEAP");
+        // The byte-splicing rewrite path must still refuse the recovered shape.
+        let mut replacements = HashMap::new();
+        replacements.insert(0x0100_0800, plugin.records[0].clone());
+        let error = rewrite_plugin_records(&bytes, &replacements, "fixture.esp").unwrap_err();
+        assert!(error.to_string().contains("invalid GRUP"));
     }
 
     #[test]

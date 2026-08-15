@@ -1,9 +1,9 @@
 use crate::archive::{MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions, sha256_bytes};
 use crate::tes4::{
     COMPRESSED_RECORD, DELETED_RECORD, GROUP_CELL_TEMPORARY_CHILDREN, LIGHT_PLUGIN, MASTER_FILE,
-    Plugin, Record, UndeleteDisableEvidence, merge_inventory_addition, package_to_game_path,
-    read_plugin_bytes, read_sync_map_bytes, record_group_contexts,
-    supports_additive_inventory_record, undelete_and_disable_refr,
+    Plugin, Record, SelfSlotInference, UndeleteDisableEvidence, infer_self_slot,
+    merge_inventory_addition, package_to_game_path, read_plugin_bytes, read_sync_map_bytes,
+    record_group_contexts, supports_additive_inventory_record, undelete_and_disable_refr,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -345,6 +345,13 @@ fn analyze_parsed_plugin(
     let plugin_index = plugin.masters.len();
     let light_semantics = kind == "esl" || plugin.header_flags & LIGHT_PLUGIN != 0;
     let ordinary_form_ids = !light_semantics && plugin_index <= u8::MAX as usize;
+    let self_slot = ordinary_form_ids
+        .then(|| crate::tes4::infer_self_slot(plugin_index as u8, &plugin.records));
+    let owned_index = self_slot
+        .as_ref()
+        .and_then(SelfSlotInference::self_index)
+        .map(usize::from)
+        .unwrap_or(plugin_index);
 
     for record in &plugin.records {
         *record_type_counts.entry(record.kind.clone()).or_default() += 1;
@@ -367,7 +374,7 @@ fn analyze_parsed_plugin(
             *master_override_type_counts
                 .entry(record.kind.clone())
                 .or_default() += 1;
-        } else if source_index == plugin_index {
+        } else if source_index == owned_index {
             plugin_owned_record_count += 1;
             let local_id = record.form_id & 0x00ff_ffff;
             max_owned_local_id =
@@ -393,6 +400,26 @@ fn analyze_parsed_plugin(
     } else if plugin_index > u8::MAX as usize {
         structural_blockers.push("master-count-exceeds-full-plugin-index-space".to_owned());
     } else {
+        match self_slot.as_ref() {
+            Some(SelfSlotInference::Inferred { self_index, basis })
+                if *basis == crate::tes4::SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE =>
+            {
+                warnings.push(format!(
+                    "Record FormIDs use preserved self slot {self_index} beyond the {plugin_index} declared master(s); unique-only inference keeps those records plugin-owned without rewriting their authored identities"
+                ));
+            }
+            Some(SelfSlotInference::Ambiguous { candidates }) => {
+                structural_blockers.push(format!(
+                    "self-slot-inference-ambiguous:candidates-{}",
+                    candidates
+                        .iter()
+                        .map(|index| format!("0x{index:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            _ => {}
+        }
         if out_of_range_record_count > 0 {
             structural_blockers.push("record-form-ids-exceed-master-plugin-index-range".to_owned());
         }
@@ -427,6 +454,12 @@ fn analyze_parsed_plugin(
             "Plugin contains deleted records; semantic update requires a dedicated record adapter"
                 .to_owned(),
         );
+    }
+    if plugin.recovered_zero_size_group_count > 0 {
+        warnings.push(format!(
+            "{} zero-size GRUP header(s) were recovered as empty groups during parsing; the plugin bytes stay untouched and any record-rewriting transform refuses this shape",
+            plugin.recovered_zero_size_group_count
+        ));
     }
     structural_blockers.sort();
     structural_blockers.dedup();
@@ -636,11 +669,17 @@ pub fn inspect_magicloader_syncmap_gate(
     let esp_relative = normalize_relative(esp_path.strip_prefix(&root).unwrap_or(esp_path));
     let payload = bounded_plugin_payload(esp_path, &esp_relative)?;
     let plugin = read_plugin_bytes(&payload, &esp_relative)?;
-    let plugin_index = plugin.masters.len() as u8;
+    let plugin_index = u8::try_from(plugin.masters.len())
+        .map_err(|_| anyhow::anyhow!("master count exceeds the full-plugin FormID index space"))?;
+    let Some(owned_index) = infer_self_slot(plugin_index, &plugin.records).self_index() else {
+        gate.blockers
+            .push("self-slot-inference-ambiguous".to_owned());
+        return Ok(gate);
+    };
     let owned_local_ids = plugin
         .records
         .iter()
-        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
         .map(|record| record.form_id & 0x00ff_ffff)
         .collect::<HashSet<_>>();
     let ini_relative = normalize_relative(ini_path.strip_prefix(&root).unwrap_or(ini_path));
@@ -2221,6 +2260,24 @@ fn worldspace_master_probe_from_staged(
         return finish_worldspace_master_probe(report);
     }
 
+    let probe_self_slot = u8::try_from(plugin.masters.len())
+        .ok()
+        .map(|master_count| infer_self_slot(master_count, &plugin.records));
+    let probe_owned_index = probe_self_slot
+        .as_ref()
+        .and_then(SelfSlotInference::self_index)
+        .map(usize::from)
+        .unwrap_or(plugin.masters.len());
+    if let Some(SelfSlotInference::Ambiguous { candidates }) = probe_self_slot.as_ref() {
+        report.blockers.push(format!(
+            "self-slot-inference-ambiguous:candidates-{}",
+            candidates
+                .iter()
+                .map(|index| format!("0x{index:02X}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     let mut overrides = Vec::new();
     let mut wanted = BTreeSet::new();
     for record in &plugin.records {
@@ -2242,7 +2299,7 @@ fn worldspace_master_probe_from_staged(
             if record.flags & DELETED_RECORD != 0 {
                 report.deleted_master_override_count += 1;
             }
-        } else if source_index > plugin.masters.len() {
+        } else if source_index != probe_owned_index {
             report.blockers.push(format!(
                 "staged-plugin-record-index-out-of-range:0x{:08X}",
                 record.form_id
@@ -2490,16 +2547,19 @@ fn additive_contract_from_staged(
                     let payload = bounded_plugin_payload(&paths[0], &relative)?;
                     let plugin = read_plugin_bytes(&payload, &relative)?;
                     let plugin_index = u8::try_from(plugin.masters.len())?;
+                    let owned_index = infer_self_slot(plugin_index, &plugin.records)
+                        .self_index()
+                        .context("self-slot inference is ambiguous")?;
                     let owned_ids = plugin
                         .records
                         .iter()
-                        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+                        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
                         .map(|record| record.form_id)
                         .collect::<HashSet<_>>();
                     for entry in &sync_entries {
                         let local_id =
                             u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
-                        let full_id = ((plugin_index as u32) << 24) | local_id;
+                        let full_id = ((owned_index as u32) << 24) | local_id;
                         if !owned_ids.contains(&full_id) {
                             bail!(
                                 "SyncMap local FormID {} has no plugin-owned record",
@@ -2873,6 +2933,64 @@ mod tests {
         assert_eq!(report.status, "complete");
         assert!(report.additive_syncmap_v1.compatible);
         assert_eq!(report.artifacts[0].plugin_owned_record_count, 1);
+    }
+
+    #[test]
+    fn treats_a_unique_preserved_self_slot_as_plugin_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[
+                    ("CELL", 0x0004_9E28),
+                    ("WEAP", 0x0200_0ED4),
+                    ("REFR", 0x0200_30F7),
+                ],
+                0x4C48,
+            ),
+        );
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.parse_status, "parsed");
+        assert_eq!(artifact.plugin_owned_record_count, 2);
+        assert_eq!(artifact.master_override_record_count, 1);
+        assert_eq!(artifact.out_of_range_record_count, 0);
+        assert!(artifact.structural_blockers.is_empty());
+        assert!(
+            artifact
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("preserved self slot 2"))
+        );
+    }
+
+    #[test]
+    fn fails_closed_and_names_ambiguous_self_slot_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("WEAP", 0x0100_0800), ("REFR", 0x0200_0801)],
+                0x802,
+            ),
+        );
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.out_of_range_record_count, 1);
+        assert!(
+            artifact
+                .structural_blockers
+                .contains(&"record-form-ids-exceed-master-plugin-index-range".to_owned())
+        );
+        assert!(
+            artifact
+                .structural_blockers
+                .contains(&"self-slot-inference-ambiguous:candidates-0x01,0x02".to_owned())
+        );
     }
 
     #[test]

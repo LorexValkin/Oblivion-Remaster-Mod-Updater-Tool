@@ -1,12 +1,15 @@
-use crate::archive::{MAX_ARCHIVE_ENTRIES, copy_tree, extract_archive};
+use crate::archive::{MAX_ARCHIVE_ENTRIES, copy_tree, extract_archive, sha256_bytes};
 use crate::fixes::{DependencyDiagnosticReport, diagnose_package_dependencies};
 use crate::game::normalize_install_root;
-use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
+use crate::retoc::{
+    PackageEntry, PackageStoreEntry, RetocTool, game_package_names_for_ids, unreal_package_id,
+};
 use crate::uasset::{
-    CompositePackageAssetKind, TextureAssetDiagnostic, classify_composite_package_asset,
-    inspect_static_mesh_asset, inspect_texture_asset, repair_composite_skeletal_mesh_imports,
-    repair_current_template_imports, repair_legacy_body_setups, repair_single_external_import,
-    repair_static_mesh_imports,
+    BlueprintAliasRoleEvidence, CompositePackageAssetKind, PackageIdentityAlias,
+    TextureAssetDiagnostic, classify_composite_package_asset, create_package_identity_alias,
+    inspect_static_mesh_asset, inspect_texture_asset, prove_blueprint_alias_role,
+    repair_composite_skeletal_mesh_imports, repair_current_template_imports,
+    repair_legacy_body_setups, repair_single_external_import, repair_static_mesh_imports,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -21,7 +24,7 @@ pub const MIXED_ARMOR_REPLACEMENT_ADAPTER: &str = "native-mixed-armor-expansion-
 pub const TEXTURE_REPLACEMENT_ADAPTER: &str = "native-texture-replacement-v1";
 pub const ADDITIVE_STATIC_MESH_ADAPTER: &str = "native-static-mesh-v2";
 pub const HETEROGENEOUS_REPLACEMENT_ADAPTER: &str = "native-heterogeneous-static-mesh-texture-v1";
-pub const COMPOSITE_PACKAGE_REBASE_ADAPTER: &str = "native-composite-package-rebase-v1";
+pub const COMPOSITE_PACKAGE_REBASE_ADAPTER: &str = "native-composite-package-rebase-v2";
 pub const MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API: &str =
     "zen-mixed-replacement-package-diagnostic-v1";
 const MAX_REPLACEMENT_PACKAGES: usize = 4096;
@@ -58,6 +61,29 @@ pub struct ReplacementInspection {
     pub target_utoc: PathBuf,
     pub target_dependencies: HashMap<u64, PackageEntry>,
     pub target_package_imports: HashMap<u64, Vec<u64>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositeIdentityAliasPlan {
+    pub consumer_package_id: u64,
+    pub consumer_package_path: String,
+    pub source_package: PackageEntry,
+    pub target_package: PackageEntry,
+    pub expected_class: String,
+    pub identity: PackageIdentityAlias,
+    pub role: BlueprintAliasRoleEvidence,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompositeIdentityRecovery {
+    pub provider_name: String,
+    pub provider_utoc: PathBuf,
+    pub provider_ucas: PathBuf,
+    pub provider_pak: PathBuf,
+    pub legacy_root: PathBuf,
+    pub relative_utoc: PathBuf,
+    pub aliases: Vec<CompositeIdentityAliasPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -1561,6 +1587,481 @@ pub(crate) fn composite_effective_package_path(
     }
     canonical_additive_static_mesh_path(&package.path)
 }
+
+fn mounted_game_package_name(path: &str) -> Result<String> {
+    let canonical = canonical_additive_static_mesh_path(path)?;
+    let content = canonical
+        .get("OblivionRemastered/Content/".len()..)
+        .context("canonical package path has no game Content suffix")?;
+    Ok(format!(
+        "/Game/{}",
+        content
+            .strip_suffix(".uasset")
+            .or_else(|| content.strip_suffix(".umap"))
+            .unwrap_or(content)
+    ))
+}
+
+fn mounted_game_legacy_path(package_name: &str) -> Result<String> {
+    if !package_name
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Game/"))
+    {
+        bail!("recovered dependency is not a mounted /Game package name");
+    }
+    Ok(format!(
+        "../../../OblivionRemastered/Content/{}.uasset",
+        package_name.trim_start_matches("/Game/")
+    ))
+}
+
+fn package_leaf_without_extension(path: &str) -> String {
+    path.replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".uasset")
+        .trim_end_matches(".umap")
+        .to_owned()
+}
+
+fn differs_by_at_most_one_ascii_edit(left: &str, right: &str) -> bool {
+    let left = left.to_ascii_lowercase().into_bytes();
+    let right = right.to_ascii_lowercase().into_bytes();
+    if left.len().abs_diff(right.len()) > 1 {
+        return false;
+    }
+    if left.len() == right.len() {
+        return left
+            .iter()
+            .zip(&right)
+            .filter(|(left, right)| left != right)
+            .count()
+            <= 1;
+    }
+    let (shorter, longer) = if left.len() < right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    let mut short_index = 0_usize;
+    let mut long_index = 0_usize;
+    let mut skipped = false;
+    while short_index < shorter.len() && long_index < longer.len() {
+        if shorter[short_index] == longer[long_index] {
+            short_index += 1;
+            long_index += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            long_index += 1;
+        }
+    }
+    true
+}
+
+fn composite_alias_candidate(
+    consumer: &PackageStoreEntry,
+    target_package_name: &str,
+    expected_class: &str,
+    source_store: &HashMap<u64, PackageStoreEntry>,
+    source_packages: &HashMap<u64, PackageEntry>,
+) -> Result<PackageEntry> {
+    let direct_meshes = consumer
+        .imported_package_ids
+        .iter()
+        .filter_map(|package_id| source_store.get(package_id))
+        .filter(|entry| {
+            package_leaf_without_extension(&entry.path)
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
+        })
+        .collect::<Vec<_>>();
+    if direct_meshes.len() != 1 {
+        bail!(
+            "identity recovery requires exactly one bundled primary StaticMesh dependency; found {}",
+            direct_meshes.len()
+        );
+    }
+    let main_dependencies = direct_meshes[0]
+        .imported_package_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let target_leaf = package_leaf_without_extension(target_package_name);
+    let target_parent = target_package_name
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .context("recovered package name has no parent")?;
+    let candidates = if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
+        main_dependencies
+            .iter()
+            .filter_map(|package_id| source_packages.get(package_id))
+            .filter(|package| {
+                mounted_game_package_name(&package.path)
+                    .ok()
+                    .and_then(|name| name.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
+                    .is_some_and(|parent| parent.eq_ignore_ascii_case(target_parent))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else if expected_class.eq_ignore_ascii_case("StaticMesh") {
+        source_packages
+            .values()
+            .filter(|package| {
+                differs_by_at_most_one_ascii_edit(
+                    &package_leaf_without_extension(&package.path),
+                    &target_leaf,
+                )
+            })
+            .filter(|package| {
+                source_store
+                    .get(&package.package_id)
+                    .is_some_and(|candidate| {
+                        candidate
+                            .imported_package_ids
+                            .iter()
+                            .any(|dependency| main_dependencies.contains(dependency))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        bail!("unsupported recovered dependency class {expected_class}");
+    };
+    if candidates.len() != 1 {
+        bail!(
+            "recovered {expected_class} dependency requires one structurally related bundled candidate; found {}",
+            candidates.len()
+        );
+    }
+    Ok(candidates.into_iter().next().unwrap())
+}
+
+fn authoritative_alias_source_identity(
+    source_candidate: &PackageEntry,
+    inspection: &ReplacementInspection,
+    retoc: &RetocTool,
+    work: &Path,
+) -> Result<PackageEntry> {
+    if unreal_package_id(&source_candidate.path)
+        .is_ok_and(|package_id| package_id == source_candidate.package_id)
+    {
+        return Ok(source_candidate.clone());
+    }
+    let container = inspection
+        .containers
+        .iter()
+        .find(|container| {
+            container
+                .packages
+                .iter()
+                .any(|package| package.package_id == source_candidate.package_id)
+        })
+        .context("alias source identity lost its container")?;
+    let raw = retoc.package_raw_chunk(
+        &container.utoc,
+        source_candidate.package_id,
+        &work.join(source_candidate.package_id.to_string()),
+    )?;
+    let source_ids = [source_candidate.package_id]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let names = game_package_names_for_ids(&raw, &source_ids)?
+        .remove(&source_candidate.package_id)
+        .unwrap_or_default();
+    if names.len() != 1 {
+        bail!(
+            "package-store alias source {} must expose one authoritative mounted identity in its raw NameMap; found {}",
+            source_candidate.path,
+            names.len()
+        );
+    }
+    Ok(PackageEntry {
+        package_id: source_candidate.package_id,
+        path: mounted_game_legacy_path(&names[0])?,
+    })
+}
+
+pub fn recover_composite_package_identities(
+    inspection: &ReplacementInspection,
+    retoc: &RetocTool,
+    source_view: &Path,
+    work: &Path,
+) -> Result<Option<CompositeIdentityRecovery>> {
+    let source_packages = inspection
+        .packages
+        .iter()
+        .map(|package| (package.package_id, package.clone()))
+        .collect::<HashMap<_, _>>();
+    let source_store = inspection
+        .containers
+        .iter()
+        .flat_map(|container| container.package_store.iter().cloned())
+        .map(|entry| (entry.package_id, entry))
+        .collect::<HashMap<_, _>>();
+    let source_ids = source_packages.keys().copied().collect::<HashSet<_>>();
+    let missing_edges = source_store
+        .values()
+        .flat_map(|consumer| {
+            consumer
+                .imported_package_ids
+                .iter()
+                .filter(|dependency| {
+                    !source_ids.contains(dependency)
+                        && !inspection.target_dependencies.contains_key(dependency)
+                })
+                .map(|dependency| (consumer.package_id, *dependency))
+                .collect::<Vec<_>>()
+        })
+        .collect::<BTreeSet<_>>();
+    if missing_edges.is_empty() {
+        return Ok(None);
+    }
+    fs::create_dir_all(work)?;
+    let alias_legacy = work.join("legacy");
+    fs::create_dir_all(&alias_legacy)?;
+    let mut recovered_targets =
+        HashMap::<u64, (String, String, PackageEntry, PackageIdentityAlias)>::new();
+    let mut pending = Vec::<(u64, u64, String, String, PackageEntry)>::new();
+    for (consumer_id, target_id) in missing_edges {
+        let consumer = source_store
+            .get(&consumer_id)
+            .context("identity recovery lost its consumer package-store row")?;
+        let container = inspection
+            .containers
+            .iter()
+            .find(|container| {
+                container
+                    .packages
+                    .iter()
+                    .any(|package| package.package_id == consumer_id)
+            })
+            .context("identity recovery lost its consumer container")?;
+        let raw = retoc.package_raw_chunk(
+            &container.utoc,
+            consumer_id,
+            &work.join("raw").join(consumer_id.to_string()),
+        )?;
+        let target_ids = [target_id].into_iter().collect::<BTreeSet<_>>();
+        let recovered = game_package_names_for_ids(&raw, &target_ids)?;
+        let names = recovered.get(&target_id).cloned().unwrap_or_default();
+        if names.len() != 1 {
+            bail!(
+                "unresolved dependency {target_id} must resolve to one exact mounted package name in consumer raw data; found {}",
+                names.len()
+            );
+        }
+        let target_name = names[0].clone();
+        let target_leaf = package_leaf_without_extension(&target_name);
+        let expected_class = if target_leaf
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MIC_"))
+        {
+            "MaterialInstanceConstant"
+        } else if target_leaf
+            .get(..3)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
+        {
+            "StaticMesh"
+        } else {
+            bail!("recovered dependency {target_name} has no supported structural alias class");
+        };
+        let source_candidate = composite_alias_candidate(
+            consumer,
+            &target_name,
+            expected_class,
+            &source_store,
+            &source_packages,
+        )?;
+        if let Some((known_name, known_class, known_source, _)) = recovered_targets.get(&target_id)
+        {
+            if !known_name.eq_ignore_ascii_case(&target_name)
+                || !known_class.eq_ignore_ascii_case(expected_class)
+                || known_source.package_id != source_candidate.package_id
+            {
+                bail!("multiple consumers disagree on recovered package identity {target_id}");
+            }
+        } else {
+            let candidate_root = work
+                .join("candidates")
+                .join(source_candidate.package_id.to_string());
+            extract_composite_packages_exact(
+                retoc,
+                source_view,
+                &candidate_root,
+                &[(source_candidate.clone(), source_candidate.path.clone())],
+                "identity alias source extraction",
+            )?;
+            let source_asset =
+                find_extracted_additive_static_mesh(&candidate_root, &source_candidate.path)?;
+            let (kind, _) = classify_composite_package_asset(
+                &source_asset,
+                false,
+                &work
+                    .join("candidate-classification")
+                    .join(source_candidate.package_id.to_string()),
+            )?;
+            let class_matches = matches!(
+                (kind, expected_class),
+                (
+                    CompositePackageAssetKind::MaterialInstanceConstant,
+                    "MaterialInstanceConstant"
+                ) | (CompositePackageAssetKind::StaticMesh, "StaticMesh")
+            );
+            if !class_matches {
+                bail!(
+                    "structurally related alias candidate {} does not decode as {expected_class}",
+                    source_candidate.path
+                );
+            }
+            let (_, identity) = create_package_identity_alias(
+                &source_asset,
+                &authoritative_alias_source_identity(
+                    &source_candidate,
+                    inspection,
+                    retoc,
+                    &work.join("source-identities"),
+                )?,
+                &target_name,
+                target_id,
+                expected_class,
+                &alias_legacy,
+                &work.join("aliases").join(target_id.to_string()),
+            )?;
+            recovered_targets.insert(
+                target_id,
+                (
+                    target_name.clone(),
+                    expected_class.to_owned(),
+                    source_candidate.clone(),
+                    identity,
+                ),
+            );
+        }
+        pending.push((
+            consumer_id,
+            target_id,
+            target_name,
+            expected_class.to_owned(),
+            source_candidate,
+        ));
+    }
+
+    let mut target_ids = recovered_targets.keys().copied().collect::<Vec<_>>();
+    target_ids.sort_unstable();
+    let provider_hash = sha256_bytes(
+        target_ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("|")
+            .as_bytes(),
+    );
+    let provider_name = format!("OBR_IdentityAliases_{}_P", &provider_hash[..12]);
+    let provider_root = work.join("provider");
+    fs::create_dir_all(&provider_root)?;
+    let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
+    let result = retoc.run([
+        OsString::from("to-zen"),
+        OsString::from("--version"),
+        OsString::from("UE5_3"),
+        alias_legacy.as_os_str().to_owned(),
+        provider_utoc.as_os_str().to_owned(),
+    ])?;
+    RetocTool::assert_success(&result, "identity alias provider rebuild")?;
+    let provider_ucas = provider_utoc.with_extension("ucas");
+    let provider_pak = provider_utoc.with_extension("pak");
+    for path in [&provider_utoc, &provider_ucas, &provider_pak] {
+        if !path.is_file() {
+            bail!("identity alias provider is incomplete: {}", path.display());
+        }
+        copy_probe_file(
+            path,
+            &source_view.join(
+                path.file_name()
+                    .context("identity alias provider has no filename")?,
+            ),
+        )?;
+    }
+    retoc.verify(&provider_utoc, "identity alias provider")?;
+    let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
+    if provider_packages
+        .iter()
+        .map(|package| package.package_id)
+        .collect::<BTreeSet<_>>()
+        != target_ids.iter().copied().collect::<BTreeSet<_>>()
+    {
+        bail!("identity alias provider inventory does not match recovered target IDs");
+    }
+
+    let mut aliases = Vec::new();
+    for (consumer_id, target_id, target_name, expected_class, source_candidate) in pending {
+        let consumer_package = source_packages
+            .get(&consumer_id)
+            .context("identity recovery lost its consumer package")?;
+        let consumer_root = work.join("consumers").join(consumer_id.to_string());
+        extract_composite_packages_exact(
+            retoc,
+            source_view,
+            &consumer_root,
+            &[(consumer_package.clone(), consumer_package.path.clone())],
+            "resolved identity consumer extraction",
+        )?;
+        let consumer_asset =
+            find_extracted_additive_static_mesh(&consumer_root, &consumer_package.path)?;
+        let mut role = prove_blueprint_alias_role(
+            &consumer_asset,
+            &target_name,
+            target_id,
+            &expected_class,
+            &work.join("roles").join(consumer_id.to_string()),
+        )?;
+        role.consumer = consumer_package.path.clone();
+        let identity = recovered_targets
+            .get(&target_id)
+            .context("identity recovery lost its alias report")?
+            .3
+            .clone();
+        aliases.push(CompositeIdentityAliasPlan {
+            consumer_package_id: consumer_id,
+            consumer_package_path: consumer_package.path.clone(),
+            source_package: source_candidate,
+            target_package: PackageEntry {
+                package_id: target_id,
+                path: mounted_game_legacy_path(&target_name)?,
+            },
+            expected_class,
+            identity,
+            role,
+        });
+    }
+    aliases.sort_by(|left, right| {
+        left.target_package
+            .package_id
+            .cmp(&right.target_package.package_id)
+            .then(left.consumer_package_id.cmp(&right.consumer_package_id))
+    });
+    let first_container = inspection
+        .containers
+        .first()
+        .context("identity recovery has no source container")?;
+    let relative_utoc = first_container
+        .relative_utoc
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{provider_name}.utoc"));
+    Ok(Some(CompositeIdentityRecovery {
+        provider_name,
+        provider_utoc,
+        provider_ucas,
+        provider_pak,
+        legacy_root: alias_legacy,
+        relative_utoc,
+        aliases,
+    }))
+}
 pub fn probe_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
     let work = tempfile::Builder::new()
         .prefix("obr-armor-replacement-probe-")
@@ -1860,6 +2361,9 @@ pub(crate) fn extract_composite_packages_exact(
         if before.contains(&expected_path) {
             continue;
         }
+        let single = tempfile::Builder::new()
+            .prefix("obr-composite-package-exact-")
+            .tempdir()?;
         let filter = if canonical_additive_static_mesh_path(&source.path).is_ok() {
             source_package_store_filter(source)?
         } else {
@@ -1875,7 +2379,7 @@ pub(crate) fn extract_composite_packages_exact(
         let result = retoc.run([
             OsString::from("to-legacy"),
             input.as_os_str().to_owned(),
-            output.as_os_str().to_owned(),
+            single.path().as_os_str().to_owned(),
             OsString::from("--version"),
             OsString::from("UE5_3"),
             OsString::from("--no-shaders"),
@@ -1899,8 +2403,10 @@ pub(crate) fn extract_composite_packages_exact(
                 .next()
                 .context("package-root alias has no filename")?
                 .to_owned();
-            let source_asset = output.join(&source_leaf);
-            let destination = output.join(canonical_additive_static_mesh_path(effective_path)?);
+            let source_asset = single.path().join(&source_leaf);
+            let destination = single
+                .path()
+                .join(canonical_additive_static_mesh_path(effective_path)?);
             if source_asset.is_file() {
                 if destination.exists() {
                     bail!("package-root alias extraction collided with its canonical destination");
@@ -1910,7 +2416,7 @@ pub(crate) fn extract_composite_packages_exact(
                         .parent()
                         .context("canonical alias destination has no parent")?,
                 )?;
-                for extension in ["uasset", "uexp", "ubulk"] {
+                for extension in ["uasset", "uexp", "ubulk", "uptnl"] {
                     let source_sidecar = source_asset.with_extension(extension);
                     if source_sidecar.is_file() {
                         fs::rename(&source_sidecar, destination.with_extension(extension))?;
@@ -1918,16 +2424,29 @@ pub(crate) fn extract_composite_packages_exact(
                 }
             }
         }
-        let after = extracted_uasset_paths(output)?;
-        let added = after.difference(&before).cloned().collect::<Vec<_>>();
-        if !after.contains(&expected_path)
-            || added.is_empty()
-            || added.iter().any(|path| !expected.contains(path))
-        {
+        let extracted_paths = extracted_uasset_paths(single.path())?;
+        if !extracted_paths.contains(&expected_path) {
             bail!(
-                "{package_label} changed an unexpected UAsset set while resolving {expected_path}; found {}",
-                added.join(", ")
+                "{package_label} did not materialize the exact requested package {expected_path}; Retoc returned {}",
+                extracted_paths.into_iter().collect::<Vec<_>>().join(", ")
             );
+        }
+        let extracted_asset = find_extracted_additive_static_mesh(single.path(), effective_path)?;
+        let destination = output.join(canonical_additive_static_mesh_path(effective_path)?);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("exact composite destination has no parent")?,
+        )?;
+        for extension in ["uasset", "uexp", "ubulk", "uptnl"] {
+            let source_sidecar = extracted_asset.with_extension(extension);
+            if source_sidecar.is_file() {
+                let destination_sidecar = destination.with_extension(extension);
+                if destination_sidecar.exists() {
+                    bail!("{package_label} would overwrite an extracted package sidecar");
+                }
+                fs::copy(&source_sidecar, &destination_sidecar)?;
+            }
         }
     }
     let final_paths = extracted_uasset_paths(output)?;
@@ -2387,6 +2906,12 @@ pub fn probe_composite_package_input(
             )?;
         }
     }
+    let identity_recovery = recover_composite_package_identities(
+        &inspection,
+        &retoc,
+        source_view.path(),
+        &work.path().join("identity-recovery"),
+    )?;
     for container in &inspection.containers {
         let packages = container
             .packages
@@ -2411,6 +2936,13 @@ pub fn probe_composite_package_input(
         available_dependencies
             .entry(package.package_id)
             .or_insert_with(|| package.clone());
+    }
+    if let Some(recovery) = &identity_recovery {
+        for alias in &recovery.aliases {
+            available_dependencies
+                .entry(alias.target_package.package_id)
+                .or_insert_with(|| alias.target_package.clone());
+        }
     }
     let source_ids = inspection
         .packages
@@ -2438,7 +2970,8 @@ pub fn probe_composite_package_input(
             &asset,
             existing,
             &package_work.join("classification"),
-        )?;
+        )
+        .with_context(|| format!("classifying composite package {}", package.path))?;
         let store = source_store
             .get(&package.package_id)
             .context("composite source package store lost a package")?;
@@ -2591,6 +3124,12 @@ pub fn probe_composite_package_input(
                     bail!(
                         "resolved material instance retains unresolved package-store dependencies"
                     );
+                }
+            }
+            CompositePackageAssetKind::ResolvedAuthoredPackage => {
+                *kinds.entry("resolved-authored-package").or_default() += 1;
+                if missing_store_dependencies != 0 {
+                    bail!("authored package retains unresolved package-store dependencies");
                 }
             }
             CompositePackageAssetKind::CurrentTemplatePackage => {

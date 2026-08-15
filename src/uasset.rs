@@ -1,5 +1,5 @@
 use crate::archive::{sha256_bytes, sha256_file};
-use crate::retoc::{PackageEntry, PackageStoreEntry};
+use crate::retoc::{PackageEntry, PackageStoreEntry, unreal_package_id};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -138,13 +138,73 @@ pub struct CompositePackageImportRepair {
     pub policy: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageIdentityAlias {
+    pub source_package_id: u64,
+    pub source_package_path: String,
+    pub target_package_id: u64,
+    pub target_package_path: String,
+    pub source_object_name: String,
+    pub target_object_name: String,
+    pub asset_class: String,
+    pub export_payloads_preserved: bool,
+    pub uexp_byte_identical: bool,
+    pub provenance: String,
+    pub policy: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlueprintAliasRoleEvidence {
+    pub consumer: String,
+    pub target_package_id: u64,
+    pub target_package_path: String,
+    pub target_object_name: String,
+    pub target_class: String,
+    pub role: String,
+    pub export_name: String,
+    pub export_index: usize,
+    pub serialized_reference_offset: usize,
+    pub provenance: String,
+    pub policy: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompositePackageAssetKind {
     SkeletalMesh,
     StaticMesh,
     Texture2D,
     MaterialInstanceConstant,
+    ResolvedAuthoredPackage,
     CurrentTemplatePackage,
+}
+
+fn package_name_leaf(package_name: &str) -> Result<&str> {
+    let normalized = package_name.trim_end_matches('/');
+    let leaf = normalized
+        .rsplit('/')
+        .next()
+        .context("package name has no leaf")?;
+    if leaf.is_empty()
+        || !normalized
+            .get(..6)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Game/"))
+        || normalized
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        bail!("package name is not a canonical /Game path: {package_name}");
+    }
+    Ok(leaf)
+}
+
+fn legacy_path_for_package_name(package_name: &str) -> Result<PathBuf> {
+    let _ = package_name_leaf(package_name)?;
+    Ok(PathBuf::from("OblivionRemastered")
+        .join("Content")
+        .join(package_name.trim_start_matches("/Game/"))
+        .with_extension("uasset"))
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1766,6 +1826,55 @@ fn unresolved_import_pairs(document: &Value) -> Result<Vec<(usize, usize)>> {
     Ok(pairs)
 }
 
+pub fn unresolved_package_store_dependencies(
+    asset: &Path,
+    source_store: &PackageStoreEntry,
+    available_dependencies: &HashMap<u64, PackageEntry>,
+    work: &Path,
+) -> Result<Vec<PackageEntry>> {
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let json_path = work.join("source.json");
+    tool.to_json(asset, &json_path)?;
+    let document: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
+    let pairs = unresolved_import_pairs(&document)?;
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("authored package has no Imports")?;
+    let resolved_ids = imports
+        .iter()
+        .filter(|import| import.get("ClassName").and_then(Value::as_str) == Some("Package"))
+        .filter_map(|import| import.get("ObjectName").and_then(Value::as_str))
+        .filter(|name| {
+            name.get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Game/"))
+        })
+        .map(unreal_package_id)
+        .collect::<Result<HashSet<_>>>()?;
+    let missing = source_store
+        .imported_package_ids
+        .iter()
+        .filter(|package_id| !resolved_ids.contains(package_id))
+        .map(|package_id| {
+            available_dependencies
+                .get(package_id)
+                .cloned()
+                .with_context(|| {
+                    format!("authored package store references unavailable package {package_id}")
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if pairs.len() != missing.len() {
+        bail!(
+            "decoder exposes {} unresolved object import(s), but package-store comparison identifies {} missing resolved package identity/identities",
+            pairs.len(),
+            missing.len()
+        );
+    }
+    Ok(missing)
+}
+
 fn serialized_resolved_material_slots(document: &Value) -> Result<SerializedMaterialArray> {
     const MATERIAL_BYTES: usize = 40;
     const MAX_MATERIALS: i32 = 64;
@@ -2138,6 +2247,353 @@ fn export_class_name(document: &Value, export: &Value) -> Result<String> {
         .context("UAsset export class import has no ObjectName")
 }
 
+fn rewrite_root_identity(
+    document: &mut Value,
+    source_package_name: &str,
+    target_package_name: &str,
+    source_object_name: &str,
+    target_object_name: &str,
+) -> Result<()> {
+    let folder = document
+        .get_mut("FolderName")
+        .context("UAsset JSON has no FolderName")?;
+    if !folder
+        .as_str()
+        .is_some_and(|value| value.eq_ignore_ascii_case(source_package_name))
+    {
+        bail!("package FolderName does not match its source identity");
+    }
+    *folder = Value::String(target_package_name.to_owned());
+
+    let names = document
+        .get_mut("NameMap")
+        .and_then(Value::as_array_mut)
+        .context("UAsset JSON has no NameMap")?;
+    let mut package_name_count = 0;
+    let mut object_name_count = 0;
+    for name in names {
+        if name
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(source_package_name))
+        {
+            *name = Value::String(target_package_name.to_owned());
+            package_name_count += 1;
+        } else if name
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(source_object_name))
+        {
+            *name = Value::String(target_object_name.to_owned());
+            object_name_count += 1;
+        }
+    }
+    if package_name_count != 1 || object_name_count != 1 {
+        bail!(
+            "package identity alias requires one root package name and one root object name in the NameMap; found {package_name_count}/{object_name_count}"
+        );
+    }
+
+    let exports = document
+        .get_mut("Exports")
+        .and_then(Value::as_array_mut)
+        .context("UAsset JSON has no Exports")?;
+    let roots = exports
+        .iter_mut()
+        .filter(|export| export.get("OuterIndex").and_then(Value::as_i64) == Some(0))
+        .filter(|export| {
+            export
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(source_object_name))
+        })
+        .collect::<Vec<_>>();
+    if roots.len() != 1 {
+        bail!(
+            "package identity alias requires exactly one matching top-level public export; found {}",
+            roots.len()
+        );
+    }
+    roots.into_iter().next().unwrap()["ObjectName"] = Value::String(target_object_name.to_owned());
+    Ok(())
+}
+
+pub fn create_package_identity_alias(
+    source_asset: &Path,
+    source_package: &PackageEntry,
+    target_package_name: &str,
+    target_package_id: u64,
+    expected_class: &str,
+    output_root: &Path,
+    work: &Path,
+) -> Result<(PathBuf, PackageIdentityAlias)> {
+    let calculated_target = unreal_package_id(target_package_name)?;
+    if calculated_target != target_package_id {
+        bail!(
+            "recovered package name {target_package_name} hashes to {calculated_target}, not unresolved package ID {target_package_id}"
+        );
+    }
+    let source_package_name = game_package_path(&source_package.path)?;
+    if unreal_package_id(&source_package_name)? != source_package.package_id {
+        bail!("source package path and package ID disagree");
+    }
+    if source_package.package_id == target_package_id
+        || source_package_name.eq_ignore_ascii_case(target_package_name)
+    {
+        bail!("identity alias target must differ from its source package");
+    }
+    let source_object_name = package_name_leaf(&source_package_name)?.to_owned();
+    let target_object_name = package_name_leaf(target_package_name)?.to_owned();
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work.join("source.json");
+    let patched_json = work.join("patched.json");
+    let verify_json = work.join("verify.json");
+    tool.to_json(source_asset, &source_json)?;
+    let original: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    let original_exports = validated_export_data(&original)?;
+    let source_root = original
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("source package has no Exports")?
+        .iter()
+        .filter(|export| export.get("OuterIndex").and_then(Value::as_i64) == Some(0))
+        .filter(|export| {
+            export
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(&source_object_name))
+        })
+        .collect::<Vec<_>>();
+    if source_root.len() != 1 {
+        bail!("source alias candidate has no unique top-level public export");
+    }
+    let asset_class = export_class_name(&original, source_root[0])?;
+    if !asset_class.eq_ignore_ascii_case(expected_class) {
+        bail!("identity alias candidate class is {asset_class}, expected {expected_class}");
+    }
+
+    let mut patched = original.clone();
+    rewrite_root_identity(
+        &mut patched,
+        &source_package_name,
+        target_package_name,
+        &source_object_name,
+        &target_object_name,
+    )?;
+    let mut normalized = patched.clone();
+    rewrite_root_identity(
+        &mut normalized,
+        target_package_name,
+        &source_package_name,
+        &target_object_name,
+        &source_object_name,
+    )?;
+    if normalized != original {
+        bail!("identity alias changed package metadata outside the approved root identity fields");
+    }
+    fs::write(&patched_json, serde_json::to_vec(&patched)?)?;
+
+    let rebuilt_root = work.join("rebuilt");
+    let rebuilt_asset = rebuilt_root.join(legacy_path_for_package_name(target_package_name)?);
+    fs::create_dir_all(
+        rebuilt_asset
+            .parent()
+            .context("identity alias output has no parent")?,
+    )?;
+    tool.import_json(&patched_json, &rebuilt_asset)?;
+    let source_uexp = source_asset.with_extension("uexp");
+    let rebuilt_uexp = rebuilt_asset.with_extension("uexp");
+    if source_uexp.is_file() != rebuilt_uexp.is_file() {
+        bail!("identity alias changed UEXP presence");
+    }
+    let uexp_byte_identical =
+        !source_uexp.is_file() || sha256_file(&source_uexp)? == sha256_file(&rebuilt_uexp)?;
+    if !uexp_byte_identical {
+        bail!("identity alias changed authored UEXP bytes");
+    }
+    for extension in ["ubulk", "uptnl"] {
+        let source_sidecar = source_asset.with_extension(extension);
+        if source_sidecar.is_file() {
+            fs::copy(&source_sidecar, rebuilt_asset.with_extension(extension))?;
+        }
+    }
+    tool.to_json(&rebuilt_asset, &verify_json)?;
+    let mut verified: Value = serde_json::from_slice(&fs::read(&verify_json)?)?;
+    rewrite_root_identity(
+        &mut verified,
+        target_package_name,
+        &source_package_name,
+        &target_object_name,
+        &source_object_name,
+    )?;
+    if validated_export_data(&verified)? != original_exports {
+        bail!("identity alias did not preserve normalized export payloads");
+    }
+
+    let relative = legacy_path_for_package_name(target_package_name)?;
+    let destination = output_root.join(&relative);
+    if destination.exists() {
+        bail!(
+            "identity alias destination already exists: {}",
+            destination.display()
+        );
+    }
+    fs::create_dir_all(
+        destination
+            .parent()
+            .context("identity alias destination has no parent")?,
+    )?;
+    for extension in ["uasset", "uexp", "ubulk", "uptnl"] {
+        let source = rebuilt_asset.with_extension(extension);
+        if source.is_file() {
+            fs::copy(&source, destination.with_extension(extension))?;
+        }
+    }
+    Ok((
+        destination,
+        PackageIdentityAlias {
+            source_package_id: source_package.package_id,
+            source_package_path: source_package_name,
+            target_package_id,
+            target_package_path: target_package_name.to_owned(),
+            source_object_name,
+            target_object_name,
+            asset_class,
+            export_payloads_preserved: true,
+            uexp_byte_identical,
+            provenance: "deterministically_inferred".to_owned(),
+            policy: "package-root-public-export-identity-alias-v1".to_owned(),
+        },
+    ))
+}
+
+pub fn prove_blueprint_alias_role(
+    consumer_asset: &Path,
+    target_package_name: &str,
+    target_package_id: u64,
+    expected_class: &str,
+    work: &Path,
+) -> Result<BlueprintAliasRoleEvidence> {
+    if unreal_package_id(target_package_name)? != target_package_id {
+        bail!("Blueprint role target path and package ID disagree");
+    }
+    let target_object_name = package_name_leaf(target_package_name)?.to_owned();
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let json_path = work.join("consumer.json");
+    tool.to_json(consumer_asset, &json_path)?;
+    let document: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
+    validated_export_data(&document)?;
+    if !unresolved_import_pairs(&document)?.is_empty() {
+        bail!("Blueprint alias role proof requires a fully resolved consumer import table");
+    }
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("Blueprint consumer has no Imports")?;
+    let package_indices = imports
+        .iter()
+        .enumerate()
+        .filter(|(_, import)| import.get("ClassName").and_then(Value::as_str) == Some("Package"))
+        .filter(|(_, import)| {
+            import
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(target_package_name))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if package_indices.len() != 1 {
+        bail!(
+            "Blueprint consumer must import the recovered package identity exactly once; found {}",
+            package_indices.len()
+        );
+    }
+    let package_outer = -i64::try_from(package_indices[0])? - 1;
+    let object_indices = imports
+        .iter()
+        .enumerate()
+        .filter(|(_, import)| {
+            import.get("OuterIndex").and_then(Value::as_i64) == Some(package_outer)
+        })
+        .filter(|(_, import)| {
+            import
+                .get("ClassName")
+                .and_then(Value::as_str)
+                .is_some_and(|class| class.eq_ignore_ascii_case(expected_class))
+        })
+        .filter(|(_, import)| {
+            import
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(&target_object_name))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if object_indices.len() != 1 {
+        bail!(
+            "Blueprint consumer must import one {expected_class} public export from the recovered package; found {}",
+            object_indices.len()
+        );
+    }
+    let reference = (-i32::try_from(object_indices[0])? - 1).to_le_bytes();
+    let (role, required_export_name) =
+        if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
+            ("blood-splatter-material", "bloodsplatter")
+        } else if expected_class.eq_ignore_ascii_case("StaticMesh") {
+            ("scabbard-static-mesh", "scabbard")
+        } else {
+            bail!("Blueprint identity aliases do not support role proof for {expected_class}");
+        };
+    let exports = document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("Blueprint consumer has no Exports")?;
+    let mut matches = Vec::new();
+    let mut all_reference_count = 0_usize;
+    for (export_index, export) in exports.iter().enumerate() {
+        let Some(encoded) = export.get("Data").and_then(Value::as_str) else {
+            continue;
+        };
+        let bytes = BASE64.decode(encoded)?;
+        for offset in 0..bytes.len().saturating_sub(3) {
+            if bytes[offset..offset + 4] != reference {
+                continue;
+            }
+            all_reference_count += 1;
+            let export_name = export
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if export_name
+                .to_ascii_lowercase()
+                .contains(required_export_name)
+            {
+                matches.push((export_index, export_name.to_owned(), offset));
+            }
+        }
+    }
+    if all_reference_count != 1 || matches.len() != 1 {
+        bail!(
+            "recovered {expected_class} import must occur exactly once in its serialized Blueprint role export; found {all_reference_count} total and {} role match(es)",
+            matches.len()
+        );
+    }
+    let (export_index, export_name, serialized_reference_offset) = matches.remove(0);
+    Ok(BlueprintAliasRoleEvidence {
+        consumer: consumer_asset.display().to_string(),
+        target_package_id,
+        target_package_path: target_package_name.to_owned(),
+        target_object_name,
+        target_class: expected_class.to_owned(),
+        role: role.to_owned(),
+        export_name,
+        export_index,
+        serialized_reference_offset,
+        provenance: "serialized-consumer-reference".to_owned(),
+        policy: "blueprint-serialized-alias-role-proof-v1".to_owned(),
+    })
+}
+
 pub fn classify_composite_package_asset(
     asset: &Path,
     allow_current_template: bool,
@@ -2186,6 +2642,59 @@ pub fn classify_composite_package_asset(
     }
     if main.len() > 1 {
         bail!("composite package contains multiple primary supported asset classes");
+    }
+    let root_classes = exports
+        .iter()
+        .filter(|export| export.get("OuterIndex").and_then(Value::as_i64) == Some(0))
+        .filter(|export| {
+            export
+                .get("ClassIndex")
+                .and_then(Value::as_i64)
+                .is_some_and(|index| index < 0)
+        })
+        .map(|export| export_class_name(&document, export))
+        .collect::<Result<Vec<_>>>()?;
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("composite package has no Imports")?;
+    let altar_tes_root = exports
+        .iter()
+        .filter(|export| export.get("OuterIndex").and_then(Value::as_i64) == Some(0))
+        .filter_map(|export| export.get("ClassIndex").and_then(Value::as_i64))
+        .filter(|index| *index < 0)
+        .filter_map(|index| imports.get(usize::try_from(-index - 1).ok()?))
+        .filter(|class| {
+            class
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| {
+                    name.get(..3)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("TES"))
+                })
+        })
+        .filter(|class| {
+            class
+                .get("OuterIndex")
+                .and_then(Value::as_i64)
+                .filter(|outer| *outer < 0)
+                .and_then(|outer| imports.get(usize::try_from(-outer - 1).ok()?))
+                .and_then(|package| package.get("ObjectName"))
+                .and_then(Value::as_str)
+                .is_some_and(|package| package.eq_ignore_ascii_case("/Script/Altar"))
+        })
+        .count()
+        == 1;
+    let blueprint_generated_root = root_classes.len() == 1
+        && root_classes[0]
+            .to_ascii_lowercase()
+            .ends_with("blueprintgeneratedclass");
+    if root_classes.len() == 1 && (blueprint_generated_root || (unresolved == 0 && altar_tes_root))
+    {
+        return Ok((
+            CompositePackageAssetKind::ResolvedAuthoredPackage,
+            unresolved,
+        ));
     }
     if allow_current_template {
         return Ok((
@@ -2441,17 +2950,32 @@ pub fn repair_single_external_import(
         .get("Exports")
         .and_then(Value::as_array)
         .context("current dependency has no Exports")?;
-    if dependency_exports.len() != 1 {
-        bail!("single external import target must contain exactly one export");
+    let dependency_package_name = game_package_path(&dependency.path)?;
+    let expected_object_name = package_name_leaf(&dependency_package_name)?;
+    let public_roots = dependency_exports
+        .iter()
+        .filter(|export| export.get("OuterIndex").and_then(Value::as_i64) == Some(0))
+        .filter(|export| {
+            export
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case(expected_object_name))
+        })
+        .collect::<Vec<_>>();
+    if public_roots.len() != 1 {
+        bail!(
+            "single external import target must expose one package-named top-level public export; found {}",
+            public_roots.len()
+        );
     }
-    let object_name = dependency_exports[0]
+    let object_name = public_roots[0]
         .get("ObjectName")
         .and_then(Value::as_str)
         .context("current dependency export has no ObjectName")?;
-    let class_name = export_class_name(&dependency_document, &dependency_exports[0])?;
+    let class_name = export_class_name(&dependency_document, public_roots[0])?;
     let target = ImportTarget {
         package_id: dependency.package_id,
-        package_path: game_package_path(&dependency.path)?,
+        package_path: dependency_package_name,
         object_name: object_name.to_owned(),
         class_name,
     };

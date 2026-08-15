@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.2 - 2026-08-14
+
+- Add `native-composite-package-rebase-v2`, which recovers missing Unreal package names from raw Zen NameMap data by verifying them against Unreal package IDs. Recovery is bounded, class-driven, and refuses ambiguous names or source candidates.
+- Add deterministic package-root/public-export identity aliases for role-proven Blueprint dependencies. Material aliases require a serialized blood-splatter component reference; StaticMesh aliases require a serialized scabbard component reference. Authored export payloads and sidecars remain preserved.
+- Resolve package-store paths that disagree with their internal Unreal identity from the package's own NameMap instead of trusting either source alone.
+- Isolate Retoc prefix-filter results and publish only the exact requested package and sidecars, preventing similarly named sibling packages from entering a candidate.
+- Support resolved generated-Blueprint and `/Script/Altar` TES form packages in composite containers. Decoder placeholders may be repaired only when the source package-store delta identifies one available dependency and that dependency exposes one package-named top-level public export.
+- Generalize multi-master worldspace master-resolution and risk classification beyond MagicLoader layouts. Complex TES plugin planes remain byte-preserved and report-only; deletion-bearing plugins are classified separately from broad override sets without deletions.
+- Keep automatic installation disabled for complex multi-plane mods until the complete archive has passed conversion and shipping-game validation.
+- Structurally tested Tribal Minotaur Camps 1.4 as 12 source packages plus two recovered material aliases, and Farmer's Revenge 1.2 as 74 source packages plus two recovered aliases. Both Unreal planes passed rebuild, import-set equality, Retoc verification, current-stock roundtrip, and payload-equivalence checks. In-game behavior remains unverified.
+
 ## 0.6.1 - 2026-08-14
 
 - Add `native-composite-package-rebase-v1`, a system-wide package adapter that classifies decoded exports across content domains instead of matching mod or asset names. It supports guarded StaticMesh, Texture2D, material-instance, SkeletalMesh, and exact current-template package repairs.

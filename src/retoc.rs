@@ -2,6 +2,7 @@ use crate::archive::sha256_bytes;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,6 +51,87 @@ pub struct PackageStoreEntry {
     pub package_id: u64,
     pub path: String,
     pub imported_package_ids: Vec<u64>,
+}
+
+/// Derives Unreal's IoStore package ID from a mounted `/Game/...` package
+/// name or a package-store path below `Content`. The filename extension is not
+/// part of the identity.
+pub fn unreal_package_id(path: &str) -> Result<u64> {
+    let normalized = path.replace('\\', "/");
+    let without_extension = normalized
+        .strip_suffix(".uasset")
+        .or_else(|| normalized.strip_suffix(".umap"))
+        .unwrap_or(&normalized);
+    let package_name = if without_extension
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Game/"))
+    {
+        without_extension.to_owned()
+    } else {
+        let lower = without_extension.to_ascii_lowercase();
+        let marker = "/content/";
+        let offset = lower
+            .find(marker)
+            .with_context(|| format!("package path is outside a mounted Content root: {path}"))?;
+        format!("/Game/{}", &without_extension[offset + marker.len()..])
+    };
+    if package_name.contains("//")
+        || package_name
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        || package_name
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case("/Game")
+    {
+        bail!("package path is not a canonical mounted package name: {path}");
+    }
+    let lowered = package_name.to_lowercase();
+    let utf16le = lowered
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    Ok(cityhasher::hash::<u64>(&utf16le))
+}
+
+/// Recovers exact mounted package names from a raw Zen package chunk by
+/// matching their authoritative package IDs. NameMap strings are length
+/// encoded and may be adjacent in the raw byte stream, so every bounded path
+/// prefix is checked instead of relying on string terminators.
+pub fn game_package_names_for_ids(
+    raw: &[u8],
+    target_ids: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, Vec<String>>> {
+    const PREFIX: &[u8] = b"/Game/";
+    const MAX_PACKAGE_NAME_BYTES: usize = 512;
+    let mut matches = BTreeMap::<u64, Vec<String>>::new();
+    for start in 0..raw.len().saturating_sub(PREFIX.len() - 1) {
+        if !raw[start..start + PREFIX.len()].eq_ignore_ascii_case(PREFIX) {
+            continue;
+        }
+        let limit = raw.len().min(start + MAX_PACKAGE_NAME_BYTES);
+        for end in start + PREFIX.len()..limit {
+            let byte = raw[end];
+            if !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')) {
+                break;
+            }
+            if byte == b'/' {
+                continue;
+            }
+            let candidate = std::str::from_utf8(&raw[start..=end])?;
+            let package_id = unreal_package_id(candidate)?;
+            if target_ids.contains(&package_id) {
+                matches
+                    .entry(package_id)
+                    .or_default()
+                    .push(candidate.to_owned());
+            }
+        }
+    }
+    for names in matches.values_mut() {
+        names.sort_by_key(|name| name.to_ascii_lowercase());
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    }
+    Ok(matches)
 }
 
 pub struct RetocTool {
@@ -178,6 +260,62 @@ impl RetocTool {
         Ok((result, entries))
     }
 
+    pub fn package_raw_chunk(&self, utoc: &Path, package_id: u64, work: &Path) -> Result<Vec<u8>> {
+        fs::create_dir_all(work)?;
+        let list = self.run([
+            "list".into(),
+            "--path".into(),
+            "--package".into(),
+            utoc.as_os_str().to_owned(),
+        ])?;
+        Self::assert_success(&list, &format!("retoc list {}", utoc.display()))?;
+        let row = Regex::new(
+            r"\s([0-9a-fA-F]{24})\s+(\d+)\s+ExportBundleData\s+.+?\.(?:uasset|umap)\s*$",
+        )?;
+        let mut chunk_ids = list
+            .output
+            .iter()
+            .filter_map(|line| row.captures(line))
+            .filter_map(|captures| {
+                captures[2]
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value == package_id)
+                    .map(|_| captures[1].to_owned())
+            })
+            .collect::<Vec<_>>();
+        chunk_ids.sort();
+        chunk_ids.dedup();
+        if chunk_ids.len() != 1 {
+            bail!(
+                "package ID {package_id} resolved to {} raw chunks in {}",
+                chunk_ids.len(),
+                utoc.display()
+            );
+        }
+        let output = work.join(format!("{package_id}.raw"));
+        let get = self.run([
+            "get".into(),
+            utoc.as_os_str().to_owned(),
+            chunk_ids[0].clone().into(),
+            output.as_os_str().to_owned(),
+        ])?;
+        Self::assert_success(
+            &get,
+            &format!("retoc get package {package_id} from {}", utoc.display()),
+        )?;
+        let bytes = fs::read(&output).with_context(|| {
+            format!(
+                "retoc did not materialize package {package_id} from {}",
+                utoc.display()
+            )
+        })?;
+        if bytes.is_empty() {
+            bail!("retoc returned an empty raw package chunk for {package_id}");
+        }
+        Ok(bytes)
+    }
+
     pub fn package_store_entries(
         &self,
         utoc: &Path,
@@ -268,6 +406,59 @@ fn parse_package_store_entries(lines: &[String]) -> Result<Vec<PackageStoreEntry
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derives_known_unreal_package_ids_from_mounted_paths() {
+        assert_eq!(
+            unreal_package_id("/Game/Art/Equipment/weapons/hobbe/Axe").unwrap(),
+            8_701_199_859_740_594_400
+        );
+        assert_eq!(
+            unreal_package_id(
+                "../../../OblivionRemastered/Content/Art/Equipment/weapons/hobbe/MIC_Hobbe_BattleAxe.uasset"
+            )
+            .unwrap(),
+            5_732_066_850_256_223_462
+        );
+        assert_eq!(
+            unreal_package_id(
+                "OblivionRemastered\\Content\\Art\\Equipment\\weapons\\tree\\MIC_Tree.uasset"
+            )
+            .unwrap(),
+            10_073_860_005_690_711_876
+        );
+        assert_eq!(
+            unreal_package_id("/Game/Art/Equipment/weapons/farm/MIC_FarmWeap").unwrap(),
+            9_474_204_866_130_920_484
+        );
+        assert_eq!(
+            unreal_package_id("/Game/Art/Equipment/weapons/farm/SM_FarmWeapShears_Scabbard")
+                .unwrap(),
+            17_956_857_782_308_804_478
+        );
+    }
+
+    #[test]
+    fn rejects_paths_outside_a_mounted_game_root() {
+        assert!(unreal_package_id("relative/package.uasset").is_err());
+        assert!(unreal_package_id("/Game/../Engine/Thing.uasset").is_err());
+    }
+
+    #[test]
+    fn recovers_adjacent_raw_name_map_paths_by_authoritative_id() {
+        let hobbe = 5_732_066_850_256_223_462;
+        let tree = 10_073_860_005_690_711_876;
+        let raw = b"prefix/Game/Art/Equipment/weapons/hobbe/MIC_Hobbe_BattleAxe/Game/Dev/Weapons/BPC_WeapBloodSplatter\0/Game/Art/Equipment/weapons/tree/MIC_TreeSuffix";
+        let found = game_package_names_for_ids(raw, &BTreeSet::from([hobbe, tree])).unwrap();
+        assert_eq!(
+            found[&hobbe],
+            vec!["/Game/Art/Equipment/weapons/hobbe/MIC_Hobbe_BattleAxe"]
+        );
+        assert_eq!(
+            found[&tree],
+            vec!["/Game/Art/Equipment/weapons/tree/MIC_Tree"]
+        );
+    }
 
     #[test]
     fn parses_package_ids_and_paths_from_list_output() {

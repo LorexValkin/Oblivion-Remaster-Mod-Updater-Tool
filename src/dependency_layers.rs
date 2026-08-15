@@ -1,5 +1,5 @@
 use crate::archive::{
-    MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions, sha256_bytes, sha256_file,
+    MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions_bounded, sha256_bytes, sha256_file,
 };
 use crate::game::normalize_install_root;
 use crate::retoc::{PackageStoreEntry, RetocTool};
@@ -610,10 +610,11 @@ fn stage_mod_source(input: &Path, prefix: &str) -> Result<StagedSource> {
         bail!("layered package source is not a file or directory");
     }
     let temporary = tempfile::Builder::new().prefix(prefix).tempdir()?;
-    let selected = extract_archive_files_with_extensions(
+    let selected = extract_archive_files_with_extensions_bounded(
         input,
         temporary.path(),
         &["pak", "ucas", "utoc"],
+        MAX_STAGED_IOSTORE_BYTES,
         MAX_STAGED_IOSTORE_BYTES,
     )?;
     if selected == 0 {
@@ -636,10 +637,11 @@ fn stage_optional_dependency_source(input: &Path, prefix: &str) -> Result<Option
         bail!("connected dependency source is not a file or directory");
     }
     let temporary = tempfile::Builder::new().prefix(prefix).tempdir()?;
-    let selected = extract_archive_files_with_extensions(
+    let selected = extract_archive_files_with_extensions_bounded(
         input,
         temporary.path(),
         &["pak", "ucas", "utoc"],
+        MAX_STAGED_IOSTORE_BYTES,
         MAX_STAGED_IOSTORE_BYTES,
     )?;
     if selected == 0 {

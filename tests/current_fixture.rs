@@ -1,4 +1,5 @@
 use obr_mod_updater::engine::{UpdateRequest, run_update};
+use obr_mod_updater::replacement::probe_composite_package_input;
 use std::path::PathBuf;
 
 #[test]
@@ -92,6 +93,71 @@ fn updates_current_offhand_staves_fixture() {
         repairs
             .iter()
             .all(|repair| repair["collisionRemoved"] == true)
+    );
+}
+
+#[test]
+#[ignore = "requires an installed game and a local composite-package fixture"]
+fn probes_current_composite_package_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let summary = probe_composite_package_input(
+        &required("OBR_TEST_COMPOSITE_MOD"),
+        &required("OBR_TEST_GAME"),
+    )
+    .unwrap();
+    assert!(summary.container_count > 0);
+    assert!(summary.package_count > 0);
+    assert!(summary.asset_kind.starts_with("composite-package-rebase"));
+}
+
+#[test]
+#[ignore = "requires an installed game and a local composite-package fixture"]
+fn updates_current_composite_package_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let mut log = Vec::new();
+    let collision_exclusions = std::env::var_os("OBR_TEST_COMPOSITE_COLLISION_EXCLUSIONS")
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .split(';')
+                .filter(|path| !path.trim().is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-composite-package-rebase-v1".to_owned(),
+            mod_input: required("OBR_TEST_COMPOSITE_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: collision_exclusions,
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| panic!("composite update failed:\n{error:#}\n{}", log.join("\n")));
+    assert_eq!(outcome.adapter, "native-composite-package-rebase-v1");
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["structurallyVerified"], true);
+    assert_eq!(report["runtimeVerified"], false);
+    assert_eq!(report["identity"]["classDrivenSystemWideRules"], true);
+    assert_eq!(report["identity"]["modSpecificWhitelistUsed"], false);
+    assert_eq!(
+        report["verification"]["approvedExportPayloadMigrationPreserved"],
+        true
     );
 }
 

@@ -24,11 +24,12 @@ use crate::plugin::{
     inspect_plugin_input_at_root, inspect_worldspace_master_probe_input,
 };
 use crate::replacement::{
-    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, HETEROGENEOUS_REPLACEMENT_ADAPTER,
-    HeterogeneousReplacementProbeSummary, MIXED_ARMOR_REPLACEMENT_ADAPTER,
-    MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API, MixedReplacementPackageDiagnosticReport,
-    ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER, diagnose_mixed_replacement_input,
-    probe_additive_static_mesh_input, probe_heterogeneous_replacement_input, probe_input,
+    ADDITIVE_STATIC_MESH_ADAPTER, ARMOR_REPLACEMENT_ADAPTER, COMPOSITE_PACKAGE_REBASE_ADAPTER,
+    HETEROGENEOUS_REPLACEMENT_ADAPTER, HeterogeneousReplacementProbeSummary,
+    MIXED_ARMOR_REPLACEMENT_ADAPTER, MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API,
+    MixedReplacementPackageDiagnosticReport, ReplacementProbeSummary, TEXTURE_REPLACEMENT_ADAPTER,
+    diagnose_mixed_replacement_input, probe_additive_static_mesh_input,
+    probe_composite_package_input, probe_heterogeneous_replacement_input, probe_input,
     probe_mixed_armor_input, probe_texture_input, stage_input,
 };
 use anyhow::{Context, Result, bail};
@@ -352,7 +353,11 @@ impl InventoryBuilder {
         if let Some(root) = root_before(&path, "/content/dev/obvdata/data/") {
             self.data_roots.insert(root);
         }
-        if let Some(root) = root_before(&path, "/content/paks/~mods/") {
+        // A mod's IoStore triples may live in `Paks/~mods`, `Paks/mods`, or an
+        // author-named subdirectory. The candidate root is the stable
+        // `Content/Paks` boundary; later inventory and adapter checks still
+        // require complete triples and reject loose functional payloads.
+        if let Some(root) = root_before(&path, "/content/paks/") {
             self.pak_roots.insert(root);
         }
         if matches!(extension.as_str(), "pak" | "ucas" | "utoc") {
@@ -577,6 +582,17 @@ fn scan_input(path: &Path) -> Result<ModInventory> {
         "rar" => scan_rar(path),
         extension => bail!("unsupported mod input extension: {extension}"),
     }
+}
+
+fn is_replacement_shape(inventory: &ModInventory) -> bool {
+    inventory.classification == "unreal-container-only"
+        && inventory.complete_container_triple_count > 0
+        && inventory.incomplete_container_count == 0
+        && inventory.link_count == 0
+        && !inventory.scan_truncated
+        && inventory.functional_or_unknown_loose_file_count == 0
+        && inventory.file_count
+            == inventory.complete_container_triple_count * 3 + inventory.loose_file_count
 }
 
 fn inspect_logical_install_input(
@@ -1009,15 +1025,7 @@ fn analyze_internal(
         && additive_contract
             .as_ref()
             .is_some_and(|value| value.compatible);
-    let replacement_shape = inventory.as_ref().is_some_and(|value| {
-        value.classification == "unreal-container-only"
-            && value.complete_container_triple_count > 0
-            && value.incomplete_container_count == 0
-            && value.link_count == 0
-            && !value.scan_truncated
-            && value.loose_file_count == 0
-            && value.file_count == value.complete_container_triple_count * 3
-    });
+    let replacement_shape = inventory.as_ref().is_some_and(is_replacement_shape);
     let selected_active_game_mods = selects_active_game_mods(request);
     let logical_selected_adapter = logical_install_analysis
         .as_ref()
@@ -1132,12 +1140,16 @@ fn analyze_internal(
         additive_static_mesh_probe_error,
         heterogeneous_replacement_probe,
         heterogeneous_replacement_probe_error,
+        composite_package_probe,
+        composite_package_probe_error,
     ) = if replacement_shape && !selected_active_game_mods {
         progress("Classifying replacement assets and comparing them with the current game");
         if let Some(game) = game.as_ref().filter(|value| value.valid) {
             match probe_input(&request.mod_input, &game.root) {
                 Ok(summary) => (
                     Some(summary),
+                    None,
+                    None,
                     None,
                     None,
                     None,
@@ -1160,6 +1172,8 @@ fn analyze_internal(
                         None,
                         None,
                         None,
+                        None,
+                        None,
                     ),
                     Err(mixed_error) => match probe_texture_input(&request.mod_input, &game.root) {
                         Ok(summary) => (
@@ -1168,6 +1182,8 @@ fn analyze_internal(
                             None,
                             Some(redact_preflight_error(&mixed_error, request)),
                             Some(summary),
+                            None,
+                            None,
                             None,
                             None,
                             None,
@@ -1187,6 +1203,8 @@ fn analyze_internal(
                                     None,
                                     None,
                                     None,
+                                    None,
+                                    None,
                                 ),
                                 Err(static_error) => match probe_heterogeneous_replacement_input(
                                     &request.mod_input,
@@ -1203,19 +1221,65 @@ fn analyze_internal(
                                         Some(redact_preflight_error(&static_error, request)),
                                         Some(summary),
                                         None,
+                                        None,
+                                        None,
                                     ),
-                                    Err(heterogeneous_error) => (
-                                        None,
-                                        Some(redact_preflight_error(&armor_error, request)),
-                                        None,
-                                        Some(redact_preflight_error(&mixed_error, request)),
-                                        None,
-                                        Some(redact_preflight_error(&texture_error, request)),
-                                        None,
-                                        Some(redact_preflight_error(&static_error, request)),
-                                        None,
-                                        Some(redact_preflight_error(&heterogeneous_error, request)),
-                                    ),
+                                    Err(heterogeneous_error) => {
+                                        match probe_composite_package_input(
+                                            &request.mod_input,
+                                            &game.root,
+                                        ) {
+                                            Ok(summary) => (
+                                                None,
+                                                Some(redact_preflight_error(&armor_error, request)),
+                                                None,
+                                                Some(redact_preflight_error(&mixed_error, request)),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &texture_error,
+                                                    request,
+                                                )),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &static_error,
+                                                    request,
+                                                )),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &heterogeneous_error,
+                                                    request,
+                                                )),
+                                                Some(summary),
+                                                None,
+                                            ),
+                                            Err(composite_error) => (
+                                                None,
+                                                Some(redact_preflight_error(&armor_error, request)),
+                                                None,
+                                                Some(redact_preflight_error(&mixed_error, request)),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &texture_error,
+                                                    request,
+                                                )),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &static_error,
+                                                    request,
+                                                )),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &heterogeneous_error,
+                                                    request,
+                                                )),
+                                                None,
+                                                Some(redact_preflight_error(
+                                                    &composite_error,
+                                                    request,
+                                                )),
+                                            ),
+                                        }
+                                    }
                                 },
                             }
                         }
@@ -1238,6 +1302,11 @@ fn analyze_internal(
                     "A complete target game is required for heterogeneous package classification."
                         .to_owned(),
                 ),
+                None,
+                Some(
+                    "A complete target game is required for composite package classification."
+                        .to_owned(),
+                ),
             )
         }
     } else if replacement_shape {
@@ -1256,15 +1325,23 @@ fn analyze_internal(
                 "Heterogeneous package probes are not run against the active game ~mods directory."
                     .to_owned(),
             ),
+            None,
+            Some(
+                "Composite package probes are not run against the active game ~mods directory."
+                    .to_owned(),
+            ),
         )
     } else {
-        (None, None, None, None, None, None, None, None, None, None)
+        (
+            None, None, None, None, None, None, None, None, None, None, None, None,
+        )
     };
     let replacement_probe = armor_probe
         .as_ref()
         .or(mixed_armor_probe.as_ref())
         .or(texture_probe.as_ref())
         .or(additive_static_mesh_probe.as_ref())
+        .or(composite_package_probe.as_ref())
         .cloned();
     progress("Checking embedded engines and connected runtime tools");
     let candidates = if exists {
@@ -1944,7 +2021,9 @@ fn analyze_internal(
         });
     }
     if replacement_shape {
-        let passed = replacement_probe.is_some() || heterogeneous_replacement_probe.is_some();
+        let passed = replacement_probe.is_some()
+            || heterogeneous_replacement_probe.is_some()
+            || composite_package_probe.is_some();
         let success = armor_probe
             .as_ref()
             .map(|summary| {
@@ -1992,7 +2071,7 @@ fn analyze_internal(
                         .map(|package| package.warnings.len())
                         .sum::<usize>();
                     format!(
-                        "The input contains {} independently proven package(s) in {} complete container(s): {} StaticMesh and {} Texture2D package(s), with exact current identities, matching import sets, complete dependency closure, and {} disclosed diagnostic warning(s).",
+                        "The input contains {} independently proven package(s) in {} complete container(s): {} StaticMesh and {} Texture2D package(s), with current package-ID/path-or-content-alias evidence, complete dependency closure, and {} disclosed diagnostic warning(s).",
                         summary.package_count,
                         summary.container_count,
                         summary.static_mesh_count,
@@ -2000,9 +2079,17 @@ fn analyze_internal(
                         warning_count,
                     )
                 })
+            })
+            .or_else(|| {
+                composite_package_probe.as_ref().map(|summary| {
+                    format!(
+                        "The input contains {} package(s) in {} complete container(s) accepted by the system-wide composite rebase contract: {}. Every decoded package class, identity, stale import repair, and authored export payload passed its guarded probe.",
+                        summary.package_count, summary.container_count, summary.asset_kind
+                    )
+                })
             });
         let failure = format!(
-            "No proven content adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} StaticMesh: {} Heterogeneous StaticMesh/Texture2D: {}",
+            "No proven content adapter accepted every package. Armor: {} Mixed armor: {} Texture2D: {} StaticMesh: {} Heterogeneous StaticMesh/Texture2D: {} Composite package rebase: {}",
             armor_probe_error
                 .as_deref()
                 .unwrap_or("not evaluated as armor."),
@@ -2017,7 +2104,10 @@ fn analyze_internal(
                 .unwrap_or("not evaluated as a StaticMesh container."),
             heterogeneous_replacement_probe_error
                 .as_deref()
-                .unwrap_or("not evaluated as a heterogeneous replacement container.")
+                .unwrap_or("not evaluated as a heterogeneous replacement container."),
+            composite_package_probe_error
+                .as_deref()
+                .unwrap_or("not evaluated by the composite package contract.")
         );
         checks.push(check(
             "replacement-contract",
@@ -2053,12 +2143,15 @@ fn analyze_internal(
     let heterogeneous_replacement_can_update = replacement_shape
         && heterogeneous_replacement_probe.is_some()
         && adapter_blockers.is_empty();
+    let composite_package_can_update =
+        replacement_shape && composite_package_probe.is_some() && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
         || armor_can_update
         || mixed_armor_can_update
         || texture_can_update
         || additive_static_mesh_can_update
-        || heterogeneous_replacement_can_update;
+        || heterogeneous_replacement_can_update
+        || composite_package_can_update;
     let logical_publication_adapter = install_plan
         .as_ref()
         .filter(|plan| supports_logical_install_publication(plan))
@@ -2251,7 +2344,7 @@ fn analyze_internal(
         id: ARMOR_REPLACEMENT_ADAPTER.to_owned(),
         available: armor_can_update,
         evidence_level: "guarded-payload-preserving-rebase".to_owned(),
-        description: "Pure existing SK_ armor replacements resolve serialized FSkeletalMaterial slots by name, migrate the skeleton separately, and null a retired PhysicsAsset only when current-donor and serialized-property evidence prove that role. Unknown auxiliary imports stop instead of becoming materials. The approved payload migration is roundtripped through current Zen metadata, and output remains a runtime-test candidate.".to_owned(),
+        description: "Pure existing SK_ skeletal-mesh replacements under /Content/Art, including armor and clothing, resolve serialized FSkeletalMaterial slots by name, migrate the skeleton separately, and null a retired PhysicsAsset only when current-donor and serialized-property evidence prove that role. Unknown auxiliary imports stop instead of becoming materials. The approved payload migration is roundtripped through current Zen metadata, and output remains a runtime-test candidate.".to_owned(),
         blockers: if armor_probe.is_some() {
             adapter_blockers.clone()
         } else {
@@ -2295,11 +2388,23 @@ fn analyze_internal(
         id: HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned(),
         available: heterogeneous_replacement_can_update,
         evidence_level: "guarded-per-package-static-mesh-texture-rebase".to_owned(),
-        description: "Classifies every package independently and accepts only containers composed entirely of structurally proven StaticMesh and Texture2D assets. Each package must have one exact current-game path and ID, matching source/current imports, complete dependency closure, exact source-case extraction, and verified inventory, imports, class, and payload preservation after one container rebuild.".to_owned(),
+        description: "Classifies every package independently and accepts only containers composed entirely of structurally proven StaticMesh and Texture2D assets. Each package must have one current-game package ID plus either an exact path or a project-root-only content alias, complete source dependency closure, exact source-case extraction, and verified inventory, imports, class, and payload preservation after one container rebuild. Authored source import changes are preserved and disclosed.".to_owned(),
         blockers: if heterogeneous_replacement_probe.is_some() {
             adapter_blockers.clone()
         } else {
             vec!["packages-did-not-pass-the-heterogeneous-static-mesh-texture-contract".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
+        id: COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned(),
+        available: composite_package_can_update,
+        evidence_level: "guarded-system-wide-current-template-and-serialized-role-rebase"
+            .to_owned(),
+        description: "Classifies packages by decoded export structure across content domains. Existing packages may reuse the current import table only when package identity, cooked flags, and export topology match and every authored export/sidecar byte is preserved. Skeletal references require serialized skeleton/physics role proof; additive single-parent repairs require one exact current dependency. StaticMesh, Texture2D, material-instance, and current-template packages share the same fail-closed container rebuild and roundtrip checks.".to_owned(),
+        blockers: if composite_package_probe.is_some() {
+            adapter_blockers.clone()
+        } else {
+            vec!["packages-did-not-pass-the-system-wide-composite-rebase-contract".to_owned()]
         },
     });
     capabilities.push(Capability {
@@ -2312,6 +2417,7 @@ fn analyze_internal(
     if !additive_shape
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
+        && composite_package_probe.is_none()
         && !logical_adapter_matched
         && inventory.is_some()
     {
@@ -2337,6 +2443,8 @@ fn analyze_internal(
         Some(ADDITIVE_STATIC_MESH_ADAPTER.to_owned())
     } else if heterogeneous_replacement_can_update {
         Some(HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned())
+    } else if composite_package_can_update {
+        Some(COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned())
     } else if logical_install_can_update {
         logical_publication_adapter.clone()
     } else {
@@ -2892,6 +3000,61 @@ mod tests {
     }
 
     #[test]
+    fn classifies_additive_layout_in_named_paks_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp
+            .path()
+            .join(r"Wrapped\OblivionRemastered\Content\Dev\ObvData\Data");
+        let paks = temp
+            .path()
+            .join(r"Wrapped\OblivionRemastered\Content\Paks\Author Name");
+        fs::create_dir_all(data.join("SyncMap")).unwrap();
+        fs::create_dir_all(&paks).unwrap();
+        fs::write(data.join("Fixture.esp"), valid_plugin_bytes()).unwrap();
+        fs::write(
+            data.join(r"SyncMap\Fixture.ini"),
+            b"[Meshes]\n000800=../../../OblivionRemastered/Content/Fixture/SM_Fixture.SM_Fixture\n",
+        )
+        .unwrap();
+        for stem in ["Fixture_Forms_P", "Fixture_Assets_P"] {
+            for extension in ["pak", "ucas", "utoc"] {
+                fs::write(paks.join(format!("{stem}.{extension}")), extension).unwrap();
+            }
+        }
+
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.classification, "additive-syncmap-iostore");
+        assert_eq!(inventory.complete_container_triple_count, 2);
+        assert_eq!(inventory.candidate_mod_root_count, 1);
+        assert_eq!(
+            inventory.candidate_mod_root.as_deref(),
+            Some("Wrapped/OblivionRemastered")
+        );
+    }
+
+    #[test]
+    fn replacement_shape_allows_docs_but_blocks_unknown_loose_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        for extension in ["pak", "ucas", "utoc"] {
+            fs::write(
+                temp.path().join(format!("Fixture_P.{extension}")),
+                extension,
+            )
+            .unwrap();
+        }
+        fs::write(temp.path().join("README.txt"), b"installation notes").unwrap();
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.loose_file_count, 1);
+        assert_eq!(inventory.functional_or_unknown_loose_file_count, 0);
+        assert!(is_replacement_shape(&inventory));
+
+        fs::write(temp.path().join("settings.ini"), b"[Runtime]").unwrap();
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.functional_or_unknown_loose_file_count, 1);
+        assert!(!is_replacement_shape(&inventory));
+    }
+
+    #[test]
     fn additive_layout_does_not_run_mixed_replacement_diagnostic() {
         let temp = tempfile::tempdir().unwrap();
         additive_fixture(temp.path());
@@ -3263,8 +3426,8 @@ mod tests {
     fn logical_install_analysis_stops_after_one_derived_view() {
         let temp = tempfile::tempdir().unwrap();
         let input = temp.path().join("input");
-        let data = input.join(r"Wrapper\Content\Dev\ObvData\Data");
-        let containers = input.join(r"Wrapper\Content\Paks\Mods\Nested");
+        let data = input.join(r"Wrapper\Place in Data");
+        let containers = input.join(r"Wrapper\Place in Paks");
         fs::create_dir_all(data.join("SyncMap")).unwrap();
         fs::create_dir_all(&containers).unwrap();
         fs::write(data.join("Fixture.esp"), b"plugin").unwrap();
@@ -3288,7 +3451,7 @@ mod tests {
         let logical = report.logical_install_analysis.as_ref().unwrap();
         assert_eq!(
             logical.inventory.as_ref().unwrap().classification,
-            "mixed-mod"
+            "additive-syncmap-iostore"
         );
         assert!(!logical.can_update);
         assert!(!report.can_update);

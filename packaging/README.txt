@@ -1,4 +1,4 @@
-OBLIVION REMASTER MOD UPDATER v0.5.3
+OBLIVION REMASTER MOD UPDATER v0.6.1
 EXPERIMENTAL TEST RELEASE
 
 Made by Lorex_
@@ -11,16 +11,12 @@ Unsupported or unrecognized mods receive a diagnostic report and are left
 unchanged. A generated candidate is structurally verified, but it still needs
 to be tested in the game.
 
-Current guarded lanes include selected additive SyncMap equipment mods, pure
-existing SK_ armor replacements, separated mixed armor/form replacements, and
-pure existing Texture2D replacement containers. Custom-project SM_ StaticMesh
-containers can also be updated when their dependencies and material slots
-resolve uniquely against the current game. Mixed body-dependent armor can use
-one installed or connected custom body archive to rebind its current body
-material and skeleton automatically. The body replacer stays external and is
-never bundled into the result. Texture packages must match the current game's
-package identity and pixel format and may not include material, blueprint,
-cloth, or shader dependencies.
+Current guarded lanes include selected additive SyncMap equipment mods, armor
+and clothing replacements, StaticMesh and Texture2D replacements, mixed armor
+sets, and composite package sets whose decoded classes, identities, current
+templates, serialized reference roles, and dependency closure can all be
+proven. Unsupported Blueprints, missing authored packages, ambiguous imports,
+plugin semantics, cloth, and shader closures remain report-only.
 
 BEFORE YOU START
 
@@ -53,6 +49,9 @@ HOW TO UPDATE A MOD
    selected and copied. Use Copy log to copy the complete diagnostic.
 10. When processing finishes, use Open report to view the JSON report. If an
     updated candidate was created, use Open output to locate it.
+11. After successful publication, choose Yes in the separate install prompt to
+    install the candidate, or choose No to leave the game unchanged. The same
+    action remains available through Install to game beside Open output.
 
 HOW TO FIX THE INSTALLED MODLIST (HIGH RISK)
 
@@ -87,9 +86,10 @@ tested.
 
 HOW TO INSTALL AND TEST THE CANDIDATE
 
-The updater does not install the converted mod automatically. Install the
-generated candidate with your mod manager, or place its .pak/.ucas/.utoc files
-in:
+The updater never installs a failed or report-only conversion. After a verified
+candidate is published, it offers a separate Yes/No confirmation. You can also
+install the generated candidate with your mod manager, or place its
+.pak/.ucas/.utoc files in:
 
   OblivionRemastered\Content\Paks\~mods
 

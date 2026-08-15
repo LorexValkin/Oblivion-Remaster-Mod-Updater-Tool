@@ -2,6 +2,12 @@
 
 Fix APIs are reusable, fail-closed building blocks for asset migrations. They exist so a verified lesson from one mod becomes a structural capability instead of a filename- or mod-specific exception.
 
+## Project rule: generalize fixes first
+
+Every compatibility fix must first be expressed as a reusable rule based on package identity, decoded export class, serialized schema or reference role, dependency closure, or current-template equivalence. Apply that rule system-wide wherever the same evidence holds. Do not key automatic behavior to a mod name, download ID, author, archive name, or hand-picked asset filename when a structural contract is possible.
+
+Mod-specific exceptions are a last resort. They require a documented reason that a reusable contract is unsafe or impossible, an explicit bounded scope, and the same fail-closed rebuild and runtime-test gates as every other adapter.
+
 ## Required workflow
 
 1. Trace the source package graph and classify every dependency edge as bundled with the mod or present in the selected current game.
@@ -31,11 +37,13 @@ Fix APIs are reusable, fail-closed building blocks for asset migrations. They ex
 - `magicloader-config-sidecar-v1` recognizes direct JSON sidecars only under the selected mod root's `Content/Dev/ObvData/Data/MagicLoader` folder and reports the separate MagicLoader runtime requirement. It never turns an otherwise unsupported mixed mod into an additive update.
 - `archive-selected-metadata-extraction-v1` validates the complete ZIP/7Z/RAR inventory and collision rules but materializes only bounded ESP/ESM/ESL/INI files for preflight. Multi-gigabyte IoStore payloads are not expanded just to inspect plugin metadata.
 - `runtime-dependency-transaction-v1` expands, validates, backs up, and stages every required runtime dependency before changing an active game file. Commit failure rolls every changed destination back. The verified candidate ZIP is published before this transaction begins.
-- `native-heterogeneous-static-mesh-texture-v1` accepts only existing-game replacement containers made entirely of independently proven StaticMesh and Texture2D packages. Paths, IDs, imports, dependency closure, exact extraction, rebuilt inventory/classes, and payload preservation are all verified; source texture format or bulk-layout differences are disclosed and still require runtime testing.
+- `native-heterogeneous-static-mesh-texture-v1` accepts only existing-game replacement containers made entirely of independently proven StaticMesh and Texture2D packages. Each source package ID must resolve to either its exact current path or a path that differs only by the project root while preserving the complete `/Content` suffix. Authored source import changes are accepted only when every import resolves, and those source imports are preserved through rebuild. Source extraction must produce the exact expected package set, rebuilt inventory/imports/classes must match, StaticMesh exports and all sidecars must be preserved, and Texture2D packages additionally pass normalized metadata comparison. Format or bulk-layout differences are disclosed and still require runtime testing.
+- `native-composite-package-rebase-v1` classifies decoded package exports across content domains. Existing current-template packages may adopt the current import table only when path/ID identity, cooked flags, import semantics, and export topology match. SkeletalMesh repair requires serialized skeleton and PhysicsAsset role evidence; additive material repair requires one exact current public-export dependency. StaticMesh, Texture2D, material-instance, SkeletalMesh, and current-template outputs share exact inventory, import-set, authored-payload, sidecar, and roundtrip verification.
+- Composite directory extraction is transactional. A batched directory filter is accepted only when its isolated result equals the exact requested package set; otherwise it is discarded and exact per-package filters are used. Unrelated stock siblings can never enter the candidate through the optimization.
 
 These APIs prevented a previously accepted rebuild from replacing valid material and sibling-container imports with `/Engine/UnknownPackage`.
 
-Retoc path filters are case-sensitive. For a package ID already present in the connected game, extraction must use the exact current-game package path casing; only genuinely additive packages use source path casing. A case-insensitive identity match is not enough to construct the filter.
+Retoc path filters are case-sensitive. Current donor extraction uses the exact current-game package path casing. Source extraction uses the source package-store spelling and an extensionless filter; if Retoc cannot filter a valid PAK-backed package, the updater may perform one source-only extraction only when the result is exactly the expected package set. A case-insensitive identity match alone is never enough to authorize a donor or output. Read-only mixed-IoStore discovery recognizes complete bounded container sets below any `Content/Paks` subdirectory while retaining their exact relative paths.
 
 The active game `Content/Paks/~mods` directory is an installed-state boundary, not a complete source-mod boundary. Selecting it directly fails closed because it can combine unrelated containers and omit an archive's ESP, SyncMap, MagicLoader sidecars, or wrapper root. Preflight requires the original archive or complete extracted mod root; installed-state work belongs to the separate installed-mod scan.
 

@@ -5,7 +5,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -118,6 +118,33 @@ pub struct MaterialImportRepair {
     pub exports_byte_identical: bool,
     pub uexp_byte_identical: bool,
     pub policy: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositePackageImportRepair {
+    pub asset: String,
+    pub package_id: u64,
+    pub asset_kind: String,
+    pub repaired_import_count: usize,
+    pub repaired_targets: Vec<String>,
+    pub retired_physics_asset: bool,
+    pub stale_create_dependencies_removed: usize,
+    pub source_imported_package_ids: Vec<u64>,
+    pub missing_source_imported_package_ids: Vec<u64>,
+    pub target_imported_package_ids: Vec<u64>,
+    pub exports_byte_identical: bool,
+    pub uexp_byte_identical: bool,
+    pub policy: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompositePackageAssetKind {
+    SkeletalMesh,
+    StaticMesh,
+    Texture2D,
+    MaterialInstanceConstant,
+    CurrentTemplatePackage,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1699,6 +1726,797 @@ fn ignored_material_dependencies(
     ignored
 }
 
+fn unresolved_import_pairs(document: &Value) -> Result<Vec<(usize, usize)>> {
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("source UAsset JSON has no Imports")?;
+    let mut pairs = Vec::new();
+    for (package_index, package) in imports.iter().enumerate() {
+        if package.get("ClassName").and_then(Value::as_str) != Some("Package")
+            || !package
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case("/Engine/UnknownPackage"))
+        {
+            continue;
+        }
+        let outer = -i64::try_from(package_index)? - 1;
+        let children = imports
+            .iter()
+            .enumerate()
+            .filter(|(_, import)| import.get("OuterIndex").and_then(Value::as_i64) == Some(outer))
+            .collect::<Vec<_>>();
+        if children.is_empty() {
+            continue;
+        }
+        if children.iter().any(|(_, import)| {
+            import.get("ObjectName").and_then(Value::as_str) != Some("UnknownExport")
+        }) {
+            bail!(
+                "unresolved package import {package_index} does not contain only unresolved object children"
+            );
+        }
+        pairs.extend(
+            children
+                .into_iter()
+                .map(|(object_index, _)| (package_index, object_index)),
+        );
+    }
+    Ok(pairs)
+}
+
+fn serialized_resolved_material_slots(document: &Value) -> Result<SerializedMaterialArray> {
+    const MATERIAL_BYTES: usize = 40;
+    const MAX_MATERIALS: i32 = 64;
+    let names = document
+        .get("NameMap")
+        .and_then(Value::as_array)
+        .context("source UAsset JSON has no NameMap")?;
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("source UAsset JSON has no Imports")?;
+    let bytes = skeletal_mesh_export_bytes(document)?;
+    let mut matches = Vec::new();
+    for offset in 4..bytes.len().saturating_sub(MATERIAL_BYTES) {
+        let Some(count) = little_i32(&bytes, offset - 4) else {
+            continue;
+        };
+        if count < 1 || count > MAX_MATERIALS {
+            continue;
+        }
+        let Some(end) = offset.checked_add(count as usize * MATERIAL_BYTES) else {
+            continue;
+        };
+        if end > bytes.len() {
+            continue;
+        }
+        let mut slots = Vec::new();
+        for slot in 0..count as usize {
+            let entry = offset + slot * MATERIAL_BYTES;
+            let Some(reference) = little_i32(&bytes, entry) else {
+                slots.clear();
+                break;
+            };
+            let Some(name_index) = little_i32(&bytes, entry + 4) else {
+                slots.clear();
+                break;
+            };
+            let Some(name_number) = little_i32(&bytes, entry + 8) else {
+                slots.clear();
+                break;
+            };
+            let Some(slot_name) = usize::try_from(name_index)
+                .ok()
+                .and_then(|index| names.get(index))
+                .and_then(Value::as_str)
+            else {
+                slots.clear();
+                break;
+            };
+            if !(0..=16).contains(&name_number) {
+                slots.clear();
+                break;
+            }
+            if reference == 0 {
+                continue;
+            }
+            let Some(object_index) = reference
+                .checked_neg()
+                .and_then(|value| value.checked_sub(1))
+            else {
+                slots.clear();
+                break;
+            };
+            let Ok(object_index) = usize::try_from(object_index) else {
+                slots.clear();
+                break;
+            };
+            let Some(import) = imports.get(object_index) else {
+                slots.clear();
+                break;
+            };
+            if import.get("ClassName").and_then(Value::as_str) != Some("MaterialInstanceConstant") {
+                slots.clear();
+                break;
+            }
+            slots.push(MaterialSlotEvidence {
+                object_import_index: object_index,
+                slot_name: slot_name.to_owned(),
+            });
+        }
+        if !slots.is_empty() {
+            matches.push(SerializedMaterialArray { offset, slots });
+        }
+    }
+    matches.sort_by(|left, right| {
+        left.slots
+            .iter()
+            .map(|slot| (slot.object_import_index, slot.slot_name.as_str()))
+            .cmp(
+                right
+                    .slots
+                    .iter()
+                    .map(|slot| (slot.object_import_index, slot.slot_name.as_str())),
+            )
+            .then(left.offset.cmp(&right.offset))
+    });
+    matches.dedup();
+    if matches.len() != 1 {
+        bail!(
+            "replacement skeletal mesh must contain exactly one proven resolved material array; found {}",
+            matches.len()
+        );
+    }
+    Ok(matches.remove(0))
+}
+
+fn prove_serialized_object_property(
+    document: &Value,
+    property_name: &str,
+    schema_index: usize,
+    object_import_index: usize,
+    serialized_property_end: usize,
+) -> Result<()> {
+    if let Some(index) = structured_object_property_index(document, property_name)? {
+        if index != object_import_index {
+            bail!(
+                "structured {property_name} property does not reference the proven unresolved import"
+            );
+        }
+        return Ok(());
+    }
+    let bytes = skeletal_mesh_export_bytes(document)?;
+    let (header_size, nonzero_properties) = unversioned_nonzero_property_indices(&bytes)?;
+    if !nonzero_properties.contains(&schema_index) {
+        bail!(
+            "unresolved import is not backed by serialized {property_name} property slot {schema_index}"
+        );
+    }
+    let reference = -i32::try_from(object_import_index)? - 1;
+    let offsets = (header_size..serialized_property_end.min(bytes.len()).saturating_sub(3))
+        .filter(|offset| little_i32(&bytes, *offset) == Some(reference))
+        .collect::<Vec<_>>();
+    if offsets.len() != 1 {
+        bail!(
+            "serialized {property_name} import {object_import_index} must occur exactly once in its property region; found {}",
+            offsets.len()
+        );
+    }
+    Ok(())
+}
+
+fn add_import_names(document: &mut Value, targets: &[ImportTarget]) -> Result<()> {
+    let names = document
+        .get_mut("NameMap")
+        .and_then(Value::as_array_mut)
+        .context("source UAsset JSON has no NameMap")?;
+    for name in targets.iter().flat_map(|target| {
+        [
+            target.package_path.as_str(),
+            target.object_name.as_str(),
+            target.class_name.as_str(),
+        ]
+    }) {
+        if !names.iter().any(|value| value.as_str() == Some(name)) {
+            names.push(Value::String(name.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn replacement_dependency_sets(
+    source_store: &PackageStoreEntry,
+    available_dependencies: &HashMap<u64, PackageEntry>,
+    repaired_targets: &[ImportTarget],
+) -> (Vec<u64>, Vec<u64>) {
+    let missing = source_store
+        .imported_package_ids
+        .iter()
+        .filter(|package_id| !available_dependencies.contains_key(package_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let mut target = source_store
+        .imported_package_ids
+        .iter()
+        .filter(|package_id| available_dependencies.contains_key(package_id))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    target.extend(repaired_targets.iter().map(|value| value.package_id));
+    (missing, target.into_iter().collect())
+}
+
+pub fn repair_composite_skeletal_mesh_imports(
+    asset: &Path,
+    donor_asset: &Path,
+    source_store: &PackageStoreEntry,
+    available_dependencies: &HashMap<u64, PackageEntry>,
+    work: &Path,
+) -> Result<CompositePackageImportRepair> {
+    const SKELETAL_MESH_PHYSICS_ASSET_SCHEMA_INDEX: usize = 16;
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work.join("source.json");
+    let donor_json = work.join("donor.json");
+    let patched_json = work.join("patched.json");
+    let verify_json = work.join("verify.json");
+    let rebuilt_asset = work.join(
+        asset
+            .file_name()
+            .context("replacement UAsset has no filename")?,
+    );
+    tool.to_json(asset, &source_json)?;
+    tool.to_json(donor_asset, &donor_json)?;
+    let mut document: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    let donor: Value = serde_json::from_slice(&fs::read(&donor_json)?)?;
+    let original_exports = validated_export_data(&document)?;
+    let pairs = unresolved_import_pairs(&document)?;
+    if pairs.len() != 2 {
+        bail!(
+            "composite skeletal-mesh repair requires exactly two unresolved object imports (skeleton and physics); found {}",
+            pairs.len()
+        );
+    }
+    let material_array = serialized_resolved_material_slots(&document)?;
+    let material_objects = material_array
+        .slots
+        .iter()
+        .map(|slot| slot.object_import_index)
+        .collect::<BTreeSet<_>>();
+    let skeleton_object_index =
+        serialized_skeleton_import_index(&document, &pairs, &material_objects)?;
+    let auxiliary = pairs
+        .iter()
+        .map(|(_, object)| *object)
+        .filter(|object| *object != skeleton_object_index)
+        .collect::<Vec<_>>();
+    if auxiliary.len() != 1 {
+        bail!("composite skeletal mesh does not expose exactly one physics candidate");
+    }
+    let (skeleton_package, skeleton_object) = resolved_import(&donor, "Skeleton")?;
+    let skeleton = target_for_path(
+        &skeleton_package,
+        &skeleton_object,
+        "Skeleton",
+        available_dependencies,
+    )?;
+    let donor_physics = resolved_imports(&donor, "PhysicsAsset")?;
+    if donor_physics.len() > 1 {
+        bail!("current stock donor has more than one PhysicsAsset import");
+    }
+    let active_physics = donor_physics
+        .first()
+        .map(|(package, object)| {
+            prove_serialized_object_property(
+                &document,
+                "PhysicsAsset",
+                SKELETAL_MESH_PHYSICS_ASSET_SCHEMA_INDEX,
+                auxiliary[0],
+                material_array.offset,
+            )?;
+            target_for_path(package, object, "PhysicsAsset", available_dependencies)
+        })
+        .transpose()?;
+    let retired = if active_physics.is_none() {
+        retire_obsolete_physics_asset(
+            &mut document,
+            &donor,
+            &pairs,
+            &material_array,
+            &material_objects,
+            skeleton_object_index,
+            0,
+        )?
+    } else {
+        Vec::new()
+    };
+    let mut patches = pairs
+        .iter()
+        .map(|(package, object)| {
+            let target = if *object == skeleton_object_index {
+                skeleton.clone()
+            } else {
+                active_physics.clone().unwrap_or_else(|| skeleton.clone())
+            };
+            ((*package, *object), target)
+        })
+        .collect::<Vec<_>>();
+    patches.sort_by_key(|((package, object), _)| (*package, *object));
+    {
+        let imports = document
+            .get_mut("Imports")
+            .and_then(Value::as_array_mut)
+            .context("source UAsset JSON Imports is not an array")?;
+        for ((package_index, object_index), target) in &patches {
+            imports[*package_index]["ObjectName"] = Value::String(target.package_path.clone());
+            imports[*object_index]["ObjectName"] = Value::String(target.object_name.clone());
+            imports[*object_index]["ClassPackage"] = Value::String("/Script/Engine".to_owned());
+            imports[*object_index]["ClassName"] = Value::String(target.class_name.clone());
+        }
+    }
+    let targets = patches
+        .iter()
+        .map(|(_, target)| target.clone())
+        .collect::<Vec<_>>();
+    add_import_names(&mut document, &targets)?;
+    let intended_exports = validated_export_data(&document)?;
+    let exports_byte_identical = original_exports == intended_exports;
+    fs::write(&patched_json, serde_json::to_vec(&document)?)?;
+    tool.import_json(&patched_json, &rebuilt_asset)?;
+    let source_uexp = asset.with_extension("uexp");
+    let rebuilt_uexp = rebuilt_asset.with_extension("uexp");
+    if source_uexp.is_file() != rebuilt_uexp.is_file() {
+        bail!("composite skeletal repair changed UEXP presence");
+    }
+    let uexp_byte_identical =
+        !source_uexp.is_file() || sha256_file(&source_uexp)? == sha256_file(&rebuilt_uexp)?;
+    if retired.is_empty() && !uexp_byte_identical {
+        bail!("reference-only skeletal repair changed authored UEXP bytes");
+    }
+    if retired.iter().any(|evidence| !evidence.already_retired) && uexp_byte_identical {
+        bail!("retired PhysicsAsset repair did not change its serialized reference");
+    }
+    tool.to_json(&rebuilt_asset, &verify_json)?;
+    let verified: Value = serde_json::from_slice(&fs::read(&verify_json)?)?;
+    if validated_export_data(&verified)? != intended_exports {
+        bail!("composite skeletal repair did not preserve its approved export migration");
+    }
+    if !unresolved_import_pairs(&verified)?.is_empty() {
+        bail!("composite skeletal repair retained unresolved imports");
+    }
+    fs::copy(&rebuilt_asset, asset)?;
+    if rebuilt_uexp.is_file() {
+        fs::copy(&rebuilt_uexp, &source_uexp)?;
+    }
+    let (missing, target_imported_package_ids) =
+        replacement_dependency_sets(source_store, available_dependencies, &targets);
+    let stale_create_dependencies_removed = retired
+        .iter()
+        .map(|evidence| evidence.removed_dependency_count)
+        .sum();
+    let mut repaired_targets = targets
+        .iter()
+        .map(|target| target.package_path.clone())
+        .collect::<Vec<_>>();
+    repaired_targets.sort_by_key(|path| path.to_ascii_lowercase());
+    repaired_targets.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    Ok(CompositePackageImportRepair {
+        asset: asset.to_string_lossy().replace('\\', "/"),
+        package_id: source_store.package_id,
+        asset_kind: "skeletal-mesh".to_owned(),
+        repaired_import_count: patches.len(),
+        repaired_targets,
+        retired_physics_asset: retired.iter().any(|evidence| !evidence.already_retired),
+        stale_create_dependencies_removed,
+        source_imported_package_ids: source_store.imported_package_ids.clone(),
+        missing_source_imported_package_ids: missing,
+        target_imported_package_ids,
+        exports_byte_identical,
+        uexp_byte_identical,
+        policy: "serialized-role-current-template-import-rebase-v1".to_owned(),
+    })
+}
+
+fn export_class_name(document: &Value, export: &Value) -> Result<String> {
+    let class_index = export
+        .get("ClassIndex")
+        .and_then(Value::as_i64)
+        .context("UAsset export has no ClassIndex")?;
+    let import_index = class_index
+        .checked_neg()
+        .and_then(|value| value.checked_sub(1))
+        .and_then(|value| usize::try_from(value).ok())
+        .context("UAsset export ClassIndex is not an import reference")?;
+    document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .and_then(|imports| imports.get(import_index))
+        .and_then(|import| import.get("ObjectName"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("UAsset export class import has no ObjectName")
+}
+
+pub fn classify_composite_package_asset(
+    asset: &Path,
+    allow_current_template: bool,
+    work: &Path,
+) -> Result<(CompositePackageAssetKind, usize)> {
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let json_path = work.join("classify.json");
+    tool.to_json(asset, &json_path)?;
+    let document: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
+    let exports = document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("composite package has no Exports")?;
+    validated_export_data(&document)?;
+    let classes = exports
+        .iter()
+        .filter(|export| {
+            export
+                .get("ClassIndex")
+                .and_then(Value::as_i64)
+                .is_some_and(|index| index < 0)
+        })
+        .map(|export| export_class_name(&document, export))
+        .collect::<Result<HashSet<_>>>()?;
+    let main = [
+        ("SkeletalMesh", CompositePackageAssetKind::SkeletalMesh),
+        ("StaticMesh", CompositePackageAssetKind::StaticMesh),
+        ("Texture2D", CompositePackageAssetKind::Texture2D),
+        (
+            "MaterialInstanceConstant",
+            CompositePackageAssetKind::MaterialInstanceConstant,
+        ),
+    ]
+    .into_iter()
+    .filter(|(class, _)| {
+        classes
+            .iter()
+            .any(|value| value.eq_ignore_ascii_case(class))
+    })
+    .map(|(_, kind)| kind)
+    .collect::<Vec<_>>();
+    let unresolved = unresolved_import_pairs(&document)?.len();
+    if main.len() == 1 {
+        return Ok((main[0], unresolved));
+    }
+    if main.len() > 1 {
+        bail!("composite package contains multiple primary supported asset classes");
+    }
+    if allow_current_template {
+        return Ok((
+            CompositePackageAssetKind::CurrentTemplatePackage,
+            unresolved,
+        ));
+    }
+    bail!(
+        "additive composite package has no independently supported primary export class; current-template repair is available only to existing package identities"
+    )
+}
+
+fn resolved_import_semantics(document: &Value) -> Result<BTreeSet<String>> {
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("UAsset JSON has no Imports")?;
+    imports
+        .iter()
+        .filter(|import| import.get("ClassName").and_then(Value::as_str) != Some("Package"))
+        .filter(|import| import.get("ObjectName").and_then(Value::as_str) != Some("UnknownExport"))
+        .map(|import| {
+            let outer = import
+                .get("OuterIndex")
+                .and_then(Value::as_i64)
+                .context("resolved import has no OuterIndex")?;
+            if outer >= 0 {
+                bail!("resolved object import does not reference a package import");
+            }
+            let package = imports
+                .get(usize::try_from(-outer - 1)?)
+                .context("resolved import package index is out of bounds")?;
+            let package_name = package
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .context("resolved import package has no ObjectName")?;
+            if package_name.eq_ignore_ascii_case("/Engine/UnknownPackage") {
+                bail!("resolved object import unexpectedly references an unknown package");
+            }
+            Ok(format!(
+                "{}|{}|{}|{}",
+                import
+                    .get("ClassPackage")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                import
+                    .get("ClassName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                import
+                    .get("ObjectName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                package_name.to_ascii_lowercase()
+            ))
+        })
+        .collect()
+}
+
+fn export_topology(document: &Value) -> Result<Vec<Value>> {
+    document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("UAsset JSON has no Exports")?
+        .iter()
+        .map(|export| {
+            Ok(serde_json::json!({
+                "type": export.get("$type").and_then(Value::as_str),
+                "objectName": export.get("ObjectName").and_then(Value::as_str),
+                "classIndex": export.get("ClassIndex").and_then(Value::as_i64),
+                "superIndex": export.get("SuperIndex").and_then(Value::as_i64),
+                "templateIndex": export.get("TemplateIndex").and_then(Value::as_i64),
+                "outerIndex": export.get("OuterIndex").and_then(Value::as_i64),
+            }))
+        })
+        .collect()
+}
+
+fn merge_name_map_from_donor(document: &mut Value, donor: &Value) -> Result<()> {
+    let donor_names = donor
+        .get("NameMap")
+        .and_then(Value::as_array)
+        .context("current template has no NameMap")?;
+    let names = document
+        .get_mut("NameMap")
+        .and_then(Value::as_array_mut)
+        .context("source package has no NameMap")?;
+    for name in donor_names {
+        if !names.iter().any(|value| value == name) {
+            names.push(name.clone());
+        }
+    }
+    Ok(())
+}
+
+pub fn repair_current_template_imports(
+    asset: &Path,
+    donor_asset: &Path,
+    source_store: &PackageStoreEntry,
+    available_dependencies: &HashMap<u64, PackageEntry>,
+    work: &Path,
+) -> Result<CompositePackageImportRepair> {
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work.join("source.json");
+    let donor_json = work.join("donor.json");
+    let patched_json = work.join("patched.json");
+    let verify_json = work.join("verify.json");
+    let rebuilt_asset = work.join(
+        asset
+            .file_name()
+            .context("source package has no filename")?,
+    );
+    tool.to_json(asset, &source_json)?;
+    tool.to_json(donor_asset, &donor_json)?;
+    let mut document: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    let donor: Value = serde_json::from_slice(&fs::read(&donor_json)?)?;
+    let original_exports = validated_export_data(&document)?;
+    validated_export_data(&donor)?;
+    let source_folder = document.get("FolderName").and_then(Value::as_str);
+    let donor_folder = donor.get("FolderName").and_then(Value::as_str);
+    if !matches!((source_folder, donor_folder), (Some(source), Some(current)) if source.eq_ignore_ascii_case(current))
+    {
+        bail!("source and current-template package paths do not match");
+    }
+    for field in ["IsUnversioned", "IsCooked", "FilterEditorOnly"] {
+        if document.get(field) != donor.get(field) {
+            bail!("source and current template disagree on {field}");
+        }
+    }
+    if export_topology(&document)? != export_topology(&donor)? {
+        bail!("source and current template export topology does not match");
+    }
+    let source_imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("source package has no Imports")?;
+    let donor_imports = donor
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("current template has no Imports")?;
+    if source_imports.len() != donor_imports.len() {
+        bail!("source and current template import table lengths do not match");
+    }
+    let pairs = unresolved_import_pairs(&document)?;
+    if !unresolved_import_pairs(&donor)?.is_empty() {
+        bail!("current template contains unresolved imports");
+    }
+    let source_semantics = resolved_import_semantics(&document)?;
+    let donor_semantics = resolved_import_semantics(&donor)?;
+    if !source_semantics.is_subset(&donor_semantics) {
+        bail!("source contains authored resolved imports absent from the current template");
+    }
+    let donor_only = donor_semantics.difference(&source_semantics).count();
+    if donor_only != pairs.len() {
+        bail!(
+            "current template contributes {donor_only} semantic imports but the source exposes {} unresolved imports",
+            pairs.len()
+        );
+    }
+    if pairs.is_empty() && source_imports != donor_imports {
+        bail!("current-template import tables differ without unresolved source evidence");
+    }
+    if !pairs.is_empty() {
+        document["Imports"] = donor["Imports"].clone();
+        merge_name_map_from_donor(&mut document, &donor)?;
+    }
+    let intended_exports = validated_export_data(&document)?;
+    let exports_byte_identical = original_exports == intended_exports;
+    if !exports_byte_identical {
+        bail!("current-template import repair changed authored export data");
+    }
+    fs::write(&patched_json, serde_json::to_vec(&document)?)?;
+    tool.import_json(&patched_json, &rebuilt_asset)?;
+    let source_uexp = asset.with_extension("uexp");
+    let rebuilt_uexp = rebuilt_asset.with_extension("uexp");
+    if source_uexp.is_file() != rebuilt_uexp.is_file() {
+        bail!("current-template repair changed UEXP presence");
+    }
+    let uexp_byte_identical =
+        !source_uexp.is_file() || sha256_file(&source_uexp)? == sha256_file(&rebuilt_uexp)?;
+    if !uexp_byte_identical {
+        bail!("current-template import repair changed authored UEXP bytes");
+    }
+    tool.to_json(&rebuilt_asset, &verify_json)?;
+    let verified: Value = serde_json::from_slice(&fs::read(&verify_json)?)?;
+    if validated_export_data(&verified)? != intended_exports
+        || !unresolved_import_pairs(&verified)?.is_empty()
+    {
+        bail!("current-template import repair did not survive UAsset rebuild");
+    }
+    fs::copy(&rebuilt_asset, asset)?;
+    if rebuilt_uexp.is_file() {
+        fs::copy(&rebuilt_uexp, &source_uexp)?;
+    }
+    let (missing, target_imported_package_ids) =
+        replacement_dependency_sets(source_store, available_dependencies, &[]);
+    if !missing.is_empty() {
+        bail!("current-template repair retained unresolved package IDs");
+    }
+    Ok(CompositePackageImportRepair {
+        asset: asset.to_string_lossy().replace('\\', "/"),
+        package_id: source_store.package_id,
+        asset_kind: "current-template-package".to_owned(),
+        repaired_import_count: pairs.len(),
+        repaired_targets: donor_semantics
+            .difference(&source_semantics)
+            .cloned()
+            .collect(),
+        retired_physics_asset: false,
+        stale_create_dependencies_removed: 0,
+        source_imported_package_ids: source_store.imported_package_ids.clone(),
+        missing_source_imported_package_ids: missing,
+        target_imported_package_ids,
+        exports_byte_identical,
+        uexp_byte_identical,
+        policy: "identity-and-export-topology-current-template-import-rebase-v1".to_owned(),
+    })
+}
+
+pub fn repair_single_external_import(
+    asset: &Path,
+    dependency_asset: &Path,
+    dependency: &PackageEntry,
+    source_store: &PackageStoreEntry,
+    available_dependencies: &HashMap<u64, PackageEntry>,
+    work: &Path,
+) -> Result<CompositePackageImportRepair> {
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work.join("source.json");
+    let dependency_json = work.join("dependency.json");
+    let patched_json = work.join("patched.json");
+    let verify_json = work.join("verify.json");
+    let rebuilt_asset = work.join(
+        asset
+            .file_name()
+            .context("source package has no filename")?,
+    );
+    tool.to_json(asset, &source_json)?;
+    tool.to_json(dependency_asset, &dependency_json)?;
+    let mut document: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    let dependency_document: Value = serde_json::from_slice(&fs::read(&dependency_json)?)?;
+    let original_exports = validated_export_data(&document)?;
+    let pairs = unresolved_import_pairs(&document)?;
+    if pairs.len() != 1 {
+        bail!("single external import repair requires exactly one unresolved object import");
+    }
+    let dependency_exports = dependency_document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("current dependency has no Exports")?;
+    if dependency_exports.len() != 1 {
+        bail!("single external import target must contain exactly one export");
+    }
+    let object_name = dependency_exports[0]
+        .get("ObjectName")
+        .and_then(Value::as_str)
+        .context("current dependency export has no ObjectName")?;
+    let class_name = export_class_name(&dependency_document, &dependency_exports[0])?;
+    let target = ImportTarget {
+        package_id: dependency.package_id,
+        package_path: game_package_path(&dependency.path)?,
+        object_name: object_name.to_owned(),
+        class_name,
+    };
+    {
+        let imports = document
+            .get_mut("Imports")
+            .and_then(Value::as_array_mut)
+            .context("source package Imports is not an array")?;
+        let (package_index, object_index) = pairs[0];
+        imports[package_index]["ObjectName"] = Value::String(target.package_path.clone());
+        imports[object_index]["ObjectName"] = Value::String(target.object_name.clone());
+        imports[object_index]["ClassPackage"] = Value::String("/Script/Engine".to_owned());
+        imports[object_index]["ClassName"] = Value::String(target.class_name.clone());
+    }
+    add_import_names(&mut document, std::slice::from_ref(&target))?;
+    let intended_exports = validated_export_data(&document)?;
+    let exports_byte_identical = original_exports == intended_exports;
+    if !exports_byte_identical {
+        bail!("single external import repair changed authored export data");
+    }
+    fs::write(&patched_json, serde_json::to_vec(&document)?)?;
+    tool.import_json(&patched_json, &rebuilt_asset)?;
+    let source_uexp = asset.with_extension("uexp");
+    let rebuilt_uexp = rebuilt_asset.with_extension("uexp");
+    if source_uexp.is_file() != rebuilt_uexp.is_file() {
+        bail!("single external import repair changed UEXP presence");
+    }
+    let uexp_byte_identical =
+        !source_uexp.is_file() || sha256_file(&source_uexp)? == sha256_file(&rebuilt_uexp)?;
+    if !uexp_byte_identical {
+        bail!("single external import repair changed authored UEXP bytes");
+    }
+    tool.to_json(&rebuilt_asset, &verify_json)?;
+    let verified: Value = serde_json::from_slice(&fs::read(&verify_json)?)?;
+    if validated_export_data(&verified)? != intended_exports
+        || !unresolved_import_pairs(&verified)?.is_empty()
+    {
+        bail!("single external import repair did not survive UAsset rebuild");
+    }
+    fs::copy(&rebuilt_asset, asset)?;
+    if rebuilt_uexp.is_file() {
+        fs::copy(&rebuilt_uexp, &source_uexp)?;
+    }
+    let (missing, target_imported_package_ids) = replacement_dependency_sets(
+        source_store,
+        available_dependencies,
+        std::slice::from_ref(&target),
+    );
+    Ok(CompositePackageImportRepair {
+        asset: asset.to_string_lossy().replace('\\', "/"),
+        package_id: source_store.package_id,
+        asset_kind: "single-external-import".to_owned(),
+        repaired_import_count: 1,
+        repaired_targets: vec![target.package_path],
+        retired_physics_asset: false,
+        stale_create_dependencies_removed: 0,
+        source_imported_package_ids: source_store.imported_package_ids.clone(),
+        missing_source_imported_package_ids: missing,
+        target_imported_package_ids,
+        exports_byte_identical,
+        uexp_byte_identical,
+        policy: "single-resolved-current-dependency-public-export-rebase-v1".to_owned(),
+    })
+}
+
 pub fn derive_skeletal_compatibility_profile(
     source: &str,
     body_asset_path: &str,
@@ -2537,6 +3355,30 @@ pub fn verify_rebased_payloads(
             .chain(std::iter::once("Imports[].OuterIndex"))
             .collect(),
     })
+}
+
+pub fn verify_rebased_asset_metadata(
+    source: &Path,
+    roundtrip: &Path,
+    work_root: &Path,
+) -> Result<bool> {
+    fs::create_dir_all(work_root)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work_root.join("source.json");
+    let roundtrip_json = work_root.join("roundtrip.json");
+    tool.to_json(source, &source_json)?;
+    tool.to_json(roundtrip, &roundtrip_json)?;
+    let mut source_document: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    let mut roundtrip_document: Value = serde_json::from_slice(&fs::read(&roundtrip_json)?)?;
+    let source_export_count = normalize_rebased_metadata(&mut source_document)?;
+    let roundtrip_export_count = normalize_rebased_metadata(&mut roundtrip_document)?;
+    if source_export_count != roundtrip_export_count || source_document != roundtrip_document {
+        bail!(
+            "Retoc roundtrip changed Texture2D content outside the allowed linkage metadata: {}",
+            source.display()
+        );
+    }
+    Ok(sha256_file(source)? != sha256_file(roundtrip)?)
 }
 
 pub fn verify_preserved_export_payloads(

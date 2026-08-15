@@ -135,7 +135,7 @@ fn updates_current_composite_package_fixture() {
         .unwrap_or_default();
     let outcome = run_update(
         UpdateRequest {
-            adapter: "native-composite-package-rebase-v1".to_owned(),
+            adapter: "native-composite-package-rebase-v2".to_owned(),
             mod_input: required("OBR_TEST_COMPOSITE_MOD"),
             game_root: required("OBR_TEST_GAME"),
             output_parent: required("OBR_TEST_OUTPUT"),
@@ -146,7 +146,7 @@ fn updates_current_composite_package_fixture() {
         &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
     )
     .unwrap_or_else(|error| panic!("composite update failed:\n{error:#}\n{}", log.join("\n")));
-    assert_eq!(outcome.adapter, "native-composite-package-rebase-v1");
+    assert_eq!(outcome.adapter, "native-composite-package-rebase-v2");
     assert!(outcome.output_archive.is_file());
     assert!(outcome.report_path.is_file());
     let report: serde_json::Value =

@@ -975,22 +975,31 @@ fn analyze_internal(
                     candidate_mod_root,
                     current_esm.as_deref(),
                 ) {
-                    Ok((plugin_set, contract)) => (Some(plugin_set), Some(contract), None),
-                    Err(_) => (
-                        Some(PluginSetReport::unavailable(expected_plugin_count)),
-                        None,
-                        None,
-                    ),
-                }
-            } else if magic_loader_layout
-                && current_game_data.as_ref().is_some_and(|path| path.is_dir())
-            {
-                match inspect_worldspace_master_probe_input(
-                    &request.mod_input,
-                    candidate_mod_root,
-                    current_game_data.as_deref().unwrap(),
-                ) {
-                    Ok((plugin_set, probe)) => (Some(plugin_set), None, Some(probe)),
+                    Ok((plugin_set, contract)) => {
+                        let complex_worldspace = plugin_set.artifacts.iter().any(|artifact| {
+                            artifact.masters.len() > 1
+                                && artifact
+                                    .master_override_type_counts
+                                    .keys()
+                                    .any(|kind| matches!(kind.as_str(), "CELL" | "REFR" | "WRLD"))
+                        });
+                        if complex_worldspace
+                            && current_game_data.as_ref().is_some_and(|path| path.is_dir())
+                        {
+                            match inspect_worldspace_master_probe_input(
+                                &request.mod_input,
+                                candidate_mod_root,
+                                current_game_data.as_deref().unwrap(),
+                            ) {
+                                Ok((plugin_set, probe)) => {
+                                    (Some(plugin_set), Some(contract), Some(probe))
+                                }
+                                Err(_) => (Some(plugin_set), Some(contract), None),
+                            }
+                        } else {
+                            (Some(plugin_set), Some(contract), None)
+                        }
+                    }
                     Err(_) => (
                         Some(PluginSetReport::unavailable(expected_plugin_count)),
                         None,
@@ -998,16 +1007,30 @@ fn analyze_internal(
                     ),
                 }
             } else {
-                (
-                    Some(
-                        inspect_plugin_input_at_root(&request.mod_input, candidate_mod_root)
-                            .unwrap_or_else(|_| {
-                                PluginSetReport::unavailable(expected_plugin_count)
-                            }),
-                    ),
-                    None,
-                    None,
-                )
+                let plugin_set =
+                    inspect_plugin_input_at_root(&request.mod_input, candidate_mod_root)
+                        .unwrap_or_else(|_| PluginSetReport::unavailable(expected_plugin_count));
+                let complex_worldspace = plugin_set.artifacts.iter().any(|artifact| {
+                    artifact.masters.len() > 1
+                        && artifact
+                            .master_override_type_counts
+                            .keys()
+                            .any(|kind| matches!(kind.as_str(), "CELL" | "REFR" | "WRLD"))
+                });
+                if (magic_loader_layout || complex_worldspace)
+                    && current_game_data.as_ref().is_some_and(|path| path.is_dir())
+                {
+                    match inspect_worldspace_master_probe_input(
+                        &request.mod_input,
+                        candidate_mod_root,
+                        current_game_data.as_deref().unwrap(),
+                    ) {
+                        Ok((plugin_set, probe)) => (Some(plugin_set), None, Some(probe)),
+                        Err(_) => (Some(plugin_set), None, None),
+                    }
+                } else {
+                    (Some(plugin_set), None, None)
+                }
             }
         } else if expected_plugin_count > 0 {
             (
@@ -1018,6 +1041,16 @@ fn analyze_internal(
         } else {
             (None, None, None)
         };
+    let complex_worldspace_plugin = magic_loader_layout
+        || plugin_compatibility.as_ref().is_some_and(|report| {
+            report.artifacts.iter().any(|artifact| {
+                artifact.masters.len() > 1
+                    && artifact
+                        .master_override_type_counts
+                        .keys()
+                        .any(|kind| matches!(kind.as_str(), "CELL" | "REFR" | "WRLD"))
+            })
+        });
     let additive_shape = additive_layout
         && plugin_compatibility
             .as_ref()
@@ -1705,7 +1738,7 @@ fn analyze_internal(
                 Some("Use a non-empty SyncMap whose local IDs exist in the ESP, and rebase CONT overrides against the current Oblivion.esm without changing or removing existing content."),
             ));
         }
-        if magic_loader_layout {
+        if complex_worldspace_plugin {
             let declared_master_count = plugin_report
                 .artifacts
                 .iter()
@@ -1821,7 +1854,7 @@ fn analyze_internal(
             }
         }
     }
-    if magic_loader_layout {
+    if complex_worldspace_plugin {
         if let Some(probe) = worldspace_master_probe.as_ref() {
             let identity_resolved = probe.found_master_count == probe.declared_master_count
                 && probe.parsed_master_count == probe.declared_master_count
@@ -1846,6 +1879,24 @@ fn analyze_internal(
                     "Install the exact declared masters and keep this mod report-only until every override target resolves to the same current record type."
                         .to_owned()
                 }),
+            });
+            let risk_tier = if probe.deleted_master_override_count > 0 {
+                "high-deletion-semantics"
+            } else {
+                "elevated-broad-override-semantics"
+            };
+            checks.push(CheckResult {
+                id: "complex-worldspace-plugin-risk".to_owned(),
+                status: "warning".to_owned(),
+                blocking: false,
+                message: format!(
+                    "Classified the immutable TES plugin plane as {risk_tier}. Master identity/type resolution is {}, but CELL/REFR/WRLD field behavior and save/runtime semantics are not automatically rewritten or claimed.",
+                    if identity_resolved { "complete" } else { "incomplete" }
+                ),
+                remediation: Some(
+                    "Keep automatic installation disabled and test the byte-preserved plugin with its exact declared masters in the shipping game."
+                        .to_owned(),
+                ),
             });
         } else {
             checks.push(CheckResult {
@@ -2244,6 +2295,17 @@ fn analyze_internal(
             .as_ref()
             .map(|probe| probe.blockers.clone())
             .unwrap_or_else(|| vec!["worldspace-master-probe-not-run".to_owned()]),
+    });
+    capabilities.push(Capability {
+        id: "tes4-complex-worldspace-risk-classification-v1".to_owned(),
+        available: complex_worldspace_plugin,
+        evidence_level: "immutable-plugin-master-resolution-and-record-domain-risk".to_owned(),
+        description: "Classifies multi-master CELL/REFR/WRLD plugin planes separately from Unreal conversion, preserves plugin bytes, resolves current master identities and record types when possible, and keeps automatic installation disabled because field, deletion, save, and runtime semantics are not rewritten or claimed.".to_owned(),
+        blockers: if complex_worldspace_plugin {
+            vec!["shipping-game-runtime-validation-required".to_owned()]
+        } else {
+            vec!["no-complex-worldspace-plugin-plane".to_owned()]
+        },
     });
     capabilities.push(Capability {
         id: MIXED_IOSTORE_DEPENDENCY_PROBE_API.to_owned(),

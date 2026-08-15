@@ -31,7 +31,8 @@ use crate::replacement::{
     extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
     inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
-    inspect_texture_staged, stage_input, validate_texture_replacement_pair,
+    inspect_texture_staged, recover_composite_package_identities, stage_input,
+    validate_texture_replacement_pair,
 };
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
@@ -45,7 +46,8 @@ use crate::uasset::{
     classify_composite_package_asset, derive_skeletal_compatibility_profile,
     inspect_static_mesh_asset, inspect_texture_asset, repair_composite_skeletal_mesh_imports,
     repair_current_template_imports, repair_legacy_body_setups, repair_single_external_import,
-    repair_skeletal_mesh_imports, repair_static_mesh_imports, verify_preserved_export_payloads,
+    repair_skeletal_mesh_imports, repair_static_mesh_imports,
+    unresolved_package_store_dependencies, verify_preserved_export_payloads,
     verify_rebased_asset_metadata, verify_rebased_payloads,
 };
 use anyhow::{Context, Result, bail};
@@ -1050,7 +1052,7 @@ fn run_logical_install_update(
     };
     let mut report = json!({
         "schema": "obr-logical-install-update-report",
-        "version": 1,
+        "version": 2,
         "implementation": "native-rust",
         "adapter": outer_adapter,
         "nestedAdapter": nested_adapter,
@@ -3404,6 +3406,7 @@ fn run_heterogeneous_replacement_update(
 
 struct CompositePackageMigration {
     kind: &'static str,
+    decoder_unresolved_import_count: usize,
     import_repair: Option<CompositePackageImportRepair>,
     static_mesh_repair: Option<serde_json::Value>,
     expected_imports: Vec<u64>,
@@ -3426,6 +3429,7 @@ fn extract_current_composite_asset(
     find_extracted_additive_static_mesh(output, &current.path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn migrate_composite_package(
     package: &PackageEntry,
     asset: &Path,
@@ -3434,6 +3438,7 @@ fn migrate_composite_package(
     target_dependencies: &HashMap<u64, PackageEntry>,
     target_package_imports: &HashMap<u64, Vec<u64>>,
     available_dependencies: &HashMap<u64, PackageEntry>,
+    source_view: &Path,
     current_view: &Path,
     retoc: &RetocTool,
     work: &Path,
@@ -3599,6 +3604,46 @@ fn migrate_composite_package(
             }
             "material-instance"
         }
+        CompositePackageAssetKind::ResolvedAuthoredPackage => {
+            if missing != 0 {
+                bail!("authored package retains unresolved package-store dependencies");
+            }
+            if unresolved != 0 {
+                let targets = unresolved_package_store_dependencies(
+                    asset,
+                    source_store,
+                    available_dependencies,
+                    &work.join("unresolved-package-store"),
+                )?;
+                if targets.len() != 1 {
+                    bail!(
+                        "authored package decoder repair requires exactly one package-store-proven target; found {}",
+                        targets.len()
+                    );
+                }
+                let target = &targets[0];
+                let donor_root = work.join("resolved-dependency");
+                extract_composite_packages_exact(
+                    retoc,
+                    source_view,
+                    &donor_root,
+                    &[(target.clone(), target.path.clone())],
+                    "authored package dependency extraction",
+                )?;
+                let donor = find_extracted_additive_static_mesh(&donor_root, &target.path)?;
+                let repair = repair_single_external_import(
+                    asset,
+                    &donor,
+                    target,
+                    source_store,
+                    available_dependencies,
+                    &work.join("repair"),
+                )?;
+                expected = repair.target_imported_package_ids.iter().copied().collect();
+                import_repair = Some(repair);
+            }
+            "resolved-authored-package"
+        }
         CompositePackageAssetKind::CurrentTemplatePackage => {
             let current = target_dependencies
                 .get(&package.package_id)
@@ -3628,6 +3673,7 @@ fn migrate_composite_package(
     };
     Ok(CompositePackageMigration {
         kind: kind_name,
+        decoder_unresolved_import_count: unresolved,
         import_repair,
         static_mesh_repair,
         expected_imports: expected.into_iter().collect(),
@@ -3709,11 +3755,24 @@ fn run_composite_package_update(
             )?;
         }
     }
+    let identity_recovery = recover_composite_package_identities(
+        &inspection,
+        &retoc,
+        source_view.path(),
+        &work.path().join("identity-recovery"),
+    )?;
     let mut available_dependencies = inspection.target_dependencies.clone();
     for package in &inspection.packages {
         available_dependencies
             .entry(package.package_id)
             .or_insert_with(|| package.clone());
+    }
+    if let Some(recovery) = &identity_recovery {
+        for alias in &recovery.aliases {
+            available_dependencies
+                .entry(alias.target_package.package_id)
+                .or_insert_with(|| alias.target_package.clone());
+        }
     }
     let source_ids = inspection
         .packages
@@ -3781,6 +3840,7 @@ fn run_composite_package_update(
                 &inspection.target_dependencies,
                 &inspection.target_package_imports,
                 &available_dependencies,
+                source_view.path(),
                 current_view.path(),
                 &retoc,
                 &root.join("packages").join(package.package_id.to_string()),
@@ -3792,6 +3852,7 @@ fn run_composite_package_update(
                 "sourcePath": package.path,
                 "outputPath": effective,
                 "assetKind": migration.kind,
+                "decoderUnresolvedImportCount": migration.decoder_unresolved_import_count,
                 "importRepair": migration.import_repair,
                 "staticMeshRepair": migration.static_mesh_repair,
             }));
@@ -3894,6 +3955,22 @@ fn run_composite_package_update(
             )?;
         }
     }
+    if let Some(recovery) = &identity_recovery {
+        for source in [
+            &recovery.provider_utoc,
+            &recovery.provider_ucas,
+            &recovery.provider_pak,
+        ] {
+            copy_file(
+                source,
+                &verify_view.path().join(
+                    source
+                        .file_name()
+                        .context("identity alias provider has no filename")?,
+                ),
+            )?;
+        }
+    }
     let mut container_reports = Vec::new();
     for container in &built {
         let verify_legacy = work
@@ -3949,6 +4026,59 @@ fn run_composite_package_update(
         }));
     }
 
+    let identity_alias_report = if let Some(recovery) = &identity_recovery {
+        let mut alias_packages = recovery
+            .aliases
+            .iter()
+            .map(|alias| {
+                (
+                    alias.target_package.clone(),
+                    alias.target_package.path.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        alias_packages.sort_by_key(|(package, _)| package.package_id);
+        alias_packages.dedup_by_key(|(package, _)| package.package_id);
+        let alias_roundtrip = work.path().join("roundtrip").join(&recovery.provider_name);
+        extract_composite_packages_exact(
+            &retoc,
+            verify_view.path(),
+            &alias_roundtrip,
+            &alias_packages,
+            "identity alias provider roundtrip",
+        )?;
+        let payload = verify_preserved_export_payloads(
+            &recovery.legacy_root,
+            &alias_roundtrip,
+            &work
+                .path()
+                .join("payload-verification")
+                .join(&recovery.provider_name),
+        )?;
+        let candidate_utoc = output_directory.join(&recovery.relative_utoc);
+        let candidate_ucas = candidate_utoc.with_extension("ucas");
+        let candidate_pak = candidate_utoc.with_extension("pak");
+        copy_file(&recovery.provider_utoc, &candidate_utoc)?;
+        copy_file(&recovery.provider_ucas, &candidate_ucas)?;
+        copy_file(&recovery.provider_pak, &candidate_pak)?;
+        Some(json!({
+            "name": recovery.provider_name,
+            "relativeUtoc": recovery.relative_utoc,
+            "packageCount": alias_packages.len(),
+            "aliases": recovery.aliases,
+            "payloadEquivalence": payload,
+            "rebuilt": {
+                "utocSha256": sha256_file(&candidate_utoc)?,
+                "ucasSha256": sha256_file(&candidate_ucas)?,
+                "pakSha256": sha256_file(&candidate_pak)?,
+                "retocVerified": true,
+                "inventoryPreserved": true,
+            }
+        }))
+    } else {
+        None
+    };
+
     let report_path = output_directory.join("composite-package-update-report.json");
     let report = json!({
         "schema": "obr-composite-package-update-report",
@@ -3963,6 +4093,10 @@ fn run_composite_package_update(
         "identity": {
             "containerCount": inspection.containers.len(),
             "packageCount": inspection.packages.len(),
+            "recoveredAliasPackageCount": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.aliases.iter().map(|alias| alias.target_package.package_id).collect::<BTreeSet<_>>().len())
+                .unwrap_or(0),
             "classDrivenSystemWideRules": true,
             "modSpecificWhitelistUsed": false,
             "packagePathsAndIdsVerified": true,
@@ -3974,9 +4108,15 @@ fn run_composite_package_update(
             "zen-dependency-preservation-v1",
             "identity-and-export-topology-current-template-import-rebase-v1",
             "serialized-role-current-template-import-rebase-v1",
-            "single-resolved-current-dependency-public-export-rebase-v1"
+            "single-resolved-current-dependency-public-export-rebase-v1",
+            "package-store-decoder-placeholder-repair-v1",
+            "package-root-public-export-identity-alias-v1",
+            "blueprint-serialized-alias-role-proof-v1"
         ],
-        "unreal": {"containers": container_reports},
+        "unreal": {
+            "containers": container_reports,
+            "identityAliasProvider": identity_alias_report,
+        },
         "output": {"directory": output_directory, "archive": output_archive},
         "verification": {
             "sourceContainersVerified": true,
@@ -4012,7 +4152,18 @@ fn run_composite_package_update(
         output_directory,
         output_archive,
         report_path,
-        package_count: inspection.packages.len(),
+        package_count: inspection.packages.len()
+            + identity_recovery
+                .as_ref()
+                .map(|recovery| {
+                    recovery
+                        .aliases
+                        .iter()
+                        .map(|alias| alias.target_package.package_id)
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                })
+                .unwrap_or(0),
     })
 }
 

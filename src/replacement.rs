@@ -299,6 +299,13 @@ fn discover_diagnostic_containers(
             .unwrap_or_default()
             .to_ascii_lowercase();
         if !matches!(extension.as_str(), "pak" | "ucas" | "utoc") {
+            // The replacement shape deliberately admits passive documentation
+            // next to its container triples, and the contract-side container
+            // discovery skips those files. This diagnostic must apply the same
+            // definition or it rejects inputs the classification accepted.
+            if is_passive_documentation_path(entry.path()) {
+                continue;
+            }
             bail!(
                 "mixed replacement input is not Unreal-container-only: {}",
                 relative.to_string_lossy().replace('\\', "/")
@@ -3555,6 +3562,31 @@ mod tests {
             packed_texture_kind: None,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn diagnostic_container_discovery_skips_passive_documentation() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("readmeShiveringIsles.txt"), b"notes").unwrap();
+        let retoc = RetocTool::materialize().unwrap();
+        let error = discover_diagnostic_containers(temp.path(), &retoc)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "mixed replacement input contains no container triples");
+    }
+
+    #[test]
+    fn diagnostic_container_discovery_rejects_functional_loose_files() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("loader.lua"), b"return 1").unwrap();
+        let retoc = RetocTool::materialize().unwrap();
+        let error = discover_diagnostic_containers(temp.path(), &retoc)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("mixed replacement input is not Unreal-container-only"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

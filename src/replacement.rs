@@ -54,6 +54,18 @@ pub struct ReplacementContainer {
     pub relative_utoc: PathBuf,
     pub packages: Vec<PackageEntry>,
     pub package_store: Vec<PackageStoreEntry>,
+    /// Bare mount-root packages whose identity was resolved to a current-game
+    /// package by unique package ID plus filename agreement. Recorded so every
+    /// lane can disclose the resolution instead of silently treating the
+    /// package as an exact-path replacement.
+    pub root_alias_replacements: Vec<RootAliasPackageResolution>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RootAliasPackageResolution {
+    pub package_id: u64,
+    pub authored_path: String,
+    pub current_path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +307,32 @@ fn bare_root_alias_leaf(path: &str) -> Option<String> {
         return None;
     }
     Some(leaf.to_owned())
+}
+
+/// Adapter-side counterpart of the mixed diagnostic's bare-root alias rule:
+/// a package stored directly at its container mount root carries no location
+/// of its own, so it is classified by its proven current identity — and only
+/// then. The evidence is exactly the diagnostic's: the package ID must name
+/// exactly one current package (a duplicated ID is ambiguous and disqualifies
+/// itself) and the filenames must agree case-insensitively. Anything less
+/// returns `None` so the caller keeps its original fail-closed rejection.
+fn resolve_bare_root_package_identity(
+    authored_path: &str,
+    package_id: u64,
+    current_store: &[PackageStoreEntry],
+) -> Option<String> {
+    let leaf = bare_root_alias_leaf(authored_path)?;
+    let mut matches = current_store
+        .iter()
+        .filter(|entry| entry.package_id == package_id);
+    let target = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    if !leaf.eq_ignore_ascii_case(&diagnostic_package_name(&target.path)) {
+        return None;
+    }
+    Some(target.path.clone())
 }
 
 fn safe_diagnostic_candidate_root(candidate_root: Option<&str>) -> Result<PathBuf> {
@@ -804,11 +842,29 @@ fn is_armor_form_candidate(path: &str) -> bool {
     lower.starts_with(ARMOR_FORM_PATH_PREFIX) && lower.ends_with(".uasset")
 }
 
+/// Discovery without a current-game package store: bare mount-root packages
+/// have no resolvable identity here and keep their original fail-closed
+/// canonicalization rejection.
+#[cfg(test)]
 fn discover_containers(
     root: &Path,
     retoc: &RetocTool,
     scope: ReplacementScope,
 ) -> Result<Vec<ReplacementContainer>> {
+    discover_containers_with_current(root, retoc, scope, || {
+        bail!("no current package store is available for bare-root alias resolution")
+    })
+}
+
+fn discover_containers_with_current<F>(
+    root: &Path,
+    retoc: &RetocTool,
+    scope: ReplacementScope,
+    load_current_store: F,
+) -> Result<Vec<ReplacementContainer>>
+where
+    F: Fn() -> Result<Vec<PackageStoreEntry>>,
+{
     let mut files = Vec::new();
     for entry in WalkDir::new(root) {
         let entry = entry?;
@@ -855,6 +911,9 @@ fn discover_containers(
 
     let mut names = HashSet::new();
     let mut containers = Vec::new();
+    // The current store is loaded at most once per discovery, and only when a
+    // bare mount-root package actually needs identity resolution.
+    let mut current_store_cache: Option<Option<Vec<PackageStoreEntry>>> = None;
     for utoc in utocs {
         let name = utoc
             .file_stem()
@@ -874,16 +933,48 @@ fn discover_containers(
         }
         retoc.verify(&utoc, &format!("retoc verify replacement source {name}"))?;
         let (_, mut package_store) = retoc.package_store_entries(&utoc)?;
+        let canonicalize = |path: &str| match scope {
+            ReplacementScope::AdditiveStaticMesh | ReplacementScope::HeterogeneousReplacement => {
+                canonical_additive_static_mesh_path(path)
+            }
+            ReplacementScope::CompositePackage => canonical_composite_source_path(path),
+            _ => canonical_package_path(path),
+        };
+        let mut root_alias_replacements = Vec::new();
         for package in &mut package_store {
-            package.path = match scope {
-                ReplacementScope::AdditiveStaticMesh
-                | ReplacementScope::HeterogeneousReplacement => {
-                    canonical_additive_static_mesh_path(&package.path)?
+            package.path = match canonicalize(&package.path) {
+                Ok(path) => path,
+                Err(error) => {
+                    // Bare mount-root packages carry no location of their own.
+                    // The mixed diagnostic already classifies them by unique
+                    // package ID plus filename agreement; the adapter-side
+                    // canonicalization applies the same evidence rule here,
+                    // records the resolution for disclosure, and keeps the
+                    // original rejection for anything unproven. The composite
+                    // scope's canonicalizer accepts bare roots itself and
+                    // never reaches this branch for them.
+                    let resolved = current_store_cache
+                        .get_or_insert_with(|| load_current_store().ok())
+                        .as_deref()
+                        .and_then(|current_store| {
+                            resolve_bare_root_package_identity(
+                                &package.path,
+                                package.package_id,
+                                current_store,
+                            )
+                        });
+                    let Some(canonical_current) =
+                        resolved.and_then(|current_path| canonicalize(&current_path).ok())
+                    else {
+                        return Err(error);
+                    };
+                    root_alias_replacements.push(RootAliasPackageResolution {
+                        package_id: package.package_id,
+                        authored_path: package.path.clone(),
+                        current_path: canonical_current.clone(),
+                    });
+                    canonical_current
                 }
-                ReplacementScope::CompositePackage => {
-                    canonical_composite_source_path(&package.path)?
-                }
-                _ => canonical_package_path(&package.path)?,
             };
             match scope {
                 ReplacementScope::Armor if !is_skeletal_mesh_candidate(&package.path) => {
@@ -928,6 +1019,7 @@ fn discover_containers(
             pak,
             packages,
             package_store,
+            root_alias_replacements,
         });
     }
     Ok(containers)
@@ -966,7 +1058,11 @@ fn inspect_staged_for_scope(
     retoc: &RetocTool,
     scope: ReplacementScope,
 ) -> Result<ReplacementInspection> {
-    let containers = discover_containers(root, retoc, scope)?;
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    let containers = discover_containers_with_current(root, retoc, scope, || {
+        Ok(retoc.package_store_entries(&target_utoc)?.1)
+    })?;
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -992,8 +1088,6 @@ fn inspect_staged_for_scope(
         }
     }
 
-    let target_utoc =
-        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     if !target_utoc.is_file() {
         bail!(
             "current game package inventory is missing: {}",
@@ -1084,7 +1178,12 @@ pub fn inspect_mixed_armor_staged(
     game_root: &Path,
     retoc: &RetocTool,
 ) -> Result<MixedArmorInspection> {
-    let containers = discover_containers(root, retoc, ReplacementScope::MixedArmor)?;
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    let containers =
+        discover_containers_with_current(root, retoc, ReplacementScope::MixedArmor, || {
+            Ok(retoc.package_store_entries(&target_utoc)?.1)
+        })?;
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -1140,8 +1239,6 @@ pub fn inspect_mixed_armor_staged(
         );
     }
 
-    let target_utoc =
-        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     if !target_utoc.is_file() {
         bail!(
             "current game package inventory is missing: {}",
@@ -1326,7 +1423,12 @@ pub fn inspect_additive_static_mesh_staged(
     game_root: &Path,
     retoc: &RetocTool,
 ) -> Result<ReplacementInspection> {
-    let containers = discover_containers(root, retoc, ReplacementScope::AdditiveStaticMesh)?;
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    let containers =
+        discover_containers_with_current(root, retoc, ReplacementScope::AdditiveStaticMesh, || {
+            Ok(retoc.package_store_entries(&target_utoc)?.1)
+        })?;
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -1347,8 +1449,6 @@ pub fn inspect_additive_static_mesh_staged(
         }
     }
 
-    let target_utoc =
-        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     let (_, target_entries) = retoc.package_store_entries(&target_utoc)?;
     let target_by_id = target_entries
         .iter()
@@ -1482,7 +1582,14 @@ pub fn inspect_heterogeneous_replacement_staged(
     game_root: &Path,
     retoc: &RetocTool,
 ) -> Result<ReplacementInspection> {
-    let containers = discover_containers(root, retoc, ReplacementScope::HeterogeneousReplacement)?;
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    let containers = discover_containers_with_current(
+        root,
+        retoc,
+        ReplacementScope::HeterogeneousReplacement,
+        || Ok(retoc.package_store_entries(&target_utoc)?.1),
+    )?;
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -1506,8 +1613,6 @@ pub fn inspect_heterogeneous_replacement_staged(
         }
     }
 
-    let target_utoc =
-        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     if !target_utoc.is_file() {
         bail!("current game stock package store is unavailable");
     }
@@ -1595,7 +1700,12 @@ pub fn inspect_composite_package_staged(
     game_root: &Path,
     retoc: &RetocTool,
 ) -> Result<ReplacementInspection> {
-    let containers = discover_containers(root, retoc, ReplacementScope::CompositePackage)?;
+    let target_utoc =
+        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+    let containers =
+        discover_containers_with_current(root, retoc, ReplacementScope::CompositePackage, || {
+            Ok(retoc.package_store_entries(&target_utoc)?.1)
+        })?;
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -1618,8 +1728,6 @@ pub fn inspect_composite_package_staged(
         }
     }
 
-    let target_utoc =
-        game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
     if !target_utoc.is_file() {
         bail!("current game stock package store is unavailable");
     }
@@ -3025,6 +3133,30 @@ fn stage_exclusive_source_view(input: &Path) -> Result<tempfile::TempDir> {
     Ok(staged)
 }
 
+/// Composite SOURCE-package extraction counterpart of
+/// [`extract_source_packages_exact`].
+///
+/// Two extractions of the same packages prove two different properties:
+///
+/// 1. An extraction from the exclusive source-only view (source containers
+///    plus the `global` script-object store, never the current main store) is
+///    the byte-authorship truth: nothing in that view can substitute
+///    current-game bytes or rebind a path on case skew.
+/// 2. An extraction from the caller's layered view (source containers over
+///    the current stock store) is the only one that can resolve imported
+///    OBJECT names: they live in the imported packages' export maps, so a
+///    source-only view degrades current-game imports to
+///    `/Engine/UnknownPackage` markers whose object identities no downstream
+///    repair could reconstruct.
+///
+/// Only packages whose exclusive extraction still carries markers consult
+/// the layered view, and each name-resolved UAsset is adopted only after
+/// proving it carries the exclusive extraction's exact authored export
+/// payloads; any divergence means the layered view substituted foreign
+/// content and the extraction fails closed. Sidecars always keep the
+/// exclusive extraction's bytes. Donor and roundtrip extractions
+/// intentionally do NOT go through this wrapper: donors must read the pure
+/// current view, and the roundtrip must read the layered rebuilt view.
 /// Main-lane variant of [`extract_source_composite_packages_exact`] with a
 /// per-package layered fallback for packages retoc cannot convert from a
 /// source-only view at all (some Blueprint conversions require the imported
@@ -3167,30 +3299,6 @@ pub(crate) fn extract_source_composite_packages_with_fallback(
     Ok(())
 }
 
-/// Composite SOURCE-package extraction counterpart of
-/// [`extract_source_packages_exact`].
-///
-/// Two extractions of the same packages prove two different properties:
-///
-/// 1. An extraction from the exclusive source-only view (source containers
-///    plus the `global` script-object store, never the current main store) is
-///    the byte-authorship truth: nothing in that view can substitute
-///    current-game bytes or rebind a path on case skew.
-/// 2. An extraction from the caller's layered view (source containers over
-///    the current stock store) is the only one that can resolve imported
-///    OBJECT names: they live in the imported packages' export maps, so a
-///    source-only view degrades current-game imports to
-///    `/Engine/UnknownPackage` markers whose object identities no downstream
-///    repair could reconstruct.
-///
-/// Only packages whose exclusive extraction still carries markers consult
-/// the layered view, and each name-resolved UAsset is adopted only after
-/// proving it carries the exclusive extraction's exact authored export
-/// payloads; any divergence means the layered view substituted foreign
-/// content and the extraction fails closed. Sidecars always keep the
-/// exclusive extraction's bytes. Donor and roundtrip extractions
-/// intentionally do NOT go through this wrapper: donors must read the pure
-/// current view, and the roundtrip must read the layered rebuilt view.
 pub(crate) fn extract_source_composite_packages_exact(
     retoc: &RetocTool,
     input: &Path,
@@ -3629,7 +3737,16 @@ pub fn probe_heterogeneous_replacement_input(
                 .context("heterogeneous current package inventory lost a classified package")?
                 .path
                 .clone();
-            if !source_store.path.eq_ignore_ascii_case(&current_path) {
+            if let Some(resolution) = container
+                .root_alias_replacements
+                .iter()
+                .find(|resolution| resolution.package_id == package.package_id)
+            {
+                warnings.push(format!(
+                    "Package is stored at its container mount root with no project/Content path (authored {}); its package ID {} uniquely matches current package {} and the filenames agree, so it is classified as a replacement of that package via root alias",
+                    resolution.authored_path, resolution.package_id, resolution.current_path
+                ));
+            } else if !source_store.path.eq_ignore_ascii_case(&current_path) {
                 warnings.push(format!(
                     "Package path uses a project-root alias (source {}, current {}); package ID and content-relative suffix match",
                     source_store.path, current_path
@@ -4666,6 +4783,60 @@ mod tests {
         assert_eq!(bare_root_alias_leaf("../../../.."), None);
         assert_eq!(bare_root_alias_leaf("../../../"), None);
         assert_eq!(bare_root_alias_leaf("../../../Dir/../BP_Item.uasset"), None);
+    }
+
+    #[test]
+    fn bare_root_identity_resolves_only_with_unique_id_and_filename_agreement() {
+        let current = vec![
+            store(
+                50,
+                "../../../OblivionRemastered/Content/Forms/items/clothes/BP_RootAlias.uasset",
+                &[],
+            ),
+            store(
+                60,
+                "../../../OblivionRemastered/Content/Forms/items/clothes/BP_Other.uasset",
+                &[],
+            ),
+        ];
+        // Full evidence: bare root, unique ID, filenames agree.
+        assert_eq!(
+            resolve_bare_root_package_identity("../../../BP_RootAlias.uasset", 50, &current)
+                .as_deref(),
+            Some("../../../OblivionRemastered/Content/Forms/items/clothes/BP_RootAlias.uasset")
+        );
+        // Filename disagreement is not an identity proof.
+        assert_eq!(
+            resolve_bare_root_package_identity("../../../BP_RootAlias.uasset", 60, &current),
+            None
+        );
+        // A nested path is not a bare mount-root package.
+        assert_eq!(
+            resolve_bare_root_package_identity("../../../Dir/BP_RootAlias.uasset", 50, &current),
+            None
+        );
+        // An ID the current game does not carry cannot resolve.
+        assert_eq!(
+            resolve_bare_root_package_identity("../../../BP_RootAlias.uasset", 70, &current),
+            None
+        );
+        // A duplicated current package ID is ambiguous and disqualifies itself.
+        let duplicated = vec![
+            store(
+                50,
+                "../../../OblivionRemastered/Content/A/BP_RootAlias.uasset",
+                &[],
+            ),
+            store(
+                50,
+                "../../../OblivionRemastered/Content/B/BP_RootAlias.uasset",
+                &[],
+            ),
+        ];
+        assert_eq!(
+            resolve_bare_root_package_identity("../../../BP_RootAlias.uasset", 50, &duplicated),
+            None
+        );
     }
 
     #[test]

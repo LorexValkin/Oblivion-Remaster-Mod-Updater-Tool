@@ -7,11 +7,11 @@ use crate::retoc::{
 use crate::uasset::{
     BlueprintAliasRoleEvidence, CompositePackageAssetKind, CompositePackageImportRepair,
     PackageIdentityAlias, TextureAssetDiagnostic, classify_composite_package_asset,
-    create_package_identity_alias,
-    inspect_static_mesh_asset, inspect_texture_asset, prove_blueprint_alias_role,
-    repair_composite_skeletal_mesh_imports, repair_current_template_imports,
-    repair_legacy_body_setups, repair_single_external_import, repair_static_mesh_imports,
-    suppress_optional_blueprint_dependency, unresolved_package_store_dependencies,
+    create_package_identity_alias, inspect_static_mesh_asset, inspect_texture_asset,
+    prove_blueprint_alias_role, repair_composite_skeletal_mesh_imports,
+    repair_current_template_imports, repair_legacy_body_setups, repair_single_external_import,
+    repair_static_mesh_imports, suppress_optional_blueprint_dependency,
+    unresolved_package_store_dependencies,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -3840,7 +3840,10 @@ mod tests {
         assert_eq!(recovered_dependency_route("T_Iron_Boots_D"), None);
         // A plain skeletal mesh is never a sidecar of another mesh.
         assert_eq!(recovered_dependency_route("SK_Blades_Boots"), None);
-        assert_eq!(recovered_dependency_route("SK_Chainmail_Cuirass_f_Physics"), None);
+        assert_eq!(
+            recovered_dependency_route("SK_Chainmail_Cuirass_f_Physics"),
+            None
+        );
     }
 
     #[test]
@@ -4043,7 +4046,7 @@ mod tests {
                     == MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
                 && package.current_id_match_path.as_deref()
                     == Some(
-                        "../../../OblivionRemastered/Content/Forms/items/armor/BP_RootAlias.uasset"
+                        "../../../OblivionRemastered/Content/Forms/items/armor/BP_RootAlias.uasset",
                     )
         }));
         assert!(report.packages.iter().any(|package| {
@@ -4108,7 +4111,10 @@ mod tests {
             bare_root_alias_leaf("..\\..\\..\\Map_Item.umap").as_deref(),
             Some("Map_Item.umap")
         );
-        assert_eq!(bare_root_alias_leaf("BP_Item.uasset").as_deref(), Some("BP_Item.uasset"));
+        assert_eq!(
+            bare_root_alias_leaf("BP_Item.uasset").as_deref(),
+            Some("BP_Item.uasset")
+        );
         assert_eq!(bare_root_alias_leaf("../../../Dir/BP_Item.uasset"), None);
         assert_eq!(
             bare_root_alias_leaf("../../../OblivionRemastered/Content/Forms/BP_Item.uasset"),

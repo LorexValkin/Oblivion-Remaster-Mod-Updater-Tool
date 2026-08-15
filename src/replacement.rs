@@ -11,7 +11,7 @@ use crate::uasset::{
     prove_blueprint_alias_role, repair_composite_skeletal_mesh_imports,
     repair_current_template_imports, repair_legacy_body_setups, repair_single_external_import,
     repair_static_mesh_imports, suppress_optional_blueprint_dependency,
-    unresolved_package_store_dependencies,
+    unresolved_package_store_dependencies, verify_identical_export_payloads,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -2222,7 +2222,7 @@ pub fn recover_composite_package_identities(
             let candidate_root = work
                 .join("candidates")
                 .join(source_candidate.package_id.to_string());
-            extract_composite_packages_exact(
+            extract_source_composite_packages_exact(
                 retoc,
                 source_view,
                 &candidate_root,
@@ -2371,7 +2371,7 @@ pub fn recover_composite_package_identities(
             .get(&consumer_id)
             .context("identity recovery lost its consumer package")?;
         let consumer_root = work.join("consumers").join(consumer_id.to_string());
-        extract_composite_packages_exact(
+        extract_source_composite_packages_exact(
             retoc,
             source_view,
             &consumer_root,
@@ -2742,6 +2742,44 @@ fn create_additive_probe_view(game_root: &Path) -> Result<tempfile::TempDir> {
     Ok(view)
 }
 
+/// Decides whether a composite package that materialized under its exact
+/// source spelling may be accepted as the requested effective package.
+///
+/// `Ok(false)` means both canonical spellings already name the same location
+/// (case-insensitively) and nothing needs to move. `Ok(true)` requires
+/// project-root-alias evidence: both are `<Project>/Content` paths whose
+/// content-relative suffixes agree case-insensitively, so only the named
+/// project root differs. The unique package-ID half of the evidence is
+/// established by the caller: composite inspection fails closed before any
+/// pair reaches extraction unless the source package ID resolves to exactly
+/// this current identity. Without the suffix agreement re-proven here there
+/// is no evidence the materialized file is the requested package, so
+/// anything else fails closed.
+pub(crate) fn composite_alias_rebinding_required(
+    source_canonical: &str,
+    effective_canonical: &str,
+) -> Result<bool> {
+    if source_canonical.eq_ignore_ascii_case(effective_canonical) {
+        return Ok(false);
+    }
+    fn content_suffix(path: &str) -> Option<&str> {
+        path.splitn(3, '/').nth(2)
+    }
+    match (
+        content_suffix(source_canonical),
+        content_suffix(effective_canonical),
+    ) {
+        (Some(source_suffix), Some(effective_suffix))
+            if source_suffix.eq_ignore_ascii_case(effective_suffix) =>
+        {
+            Ok(true)
+        }
+        _ => bail!(
+            "materialized package {source_canonical} changes more than its project root against requested identity {effective_canonical}; refusing alias rebinding"
+        ),
+    }
+}
+
 pub(crate) fn extract_composite_packages_exact(
     retoc: &RetocTool,
     input: &Path,
@@ -2874,6 +2912,35 @@ pub(crate) fn extract_composite_packages_exact(
                     }
                 }
             }
+        } else {
+            // A named-project-root alias source materializes under its exact
+            // source spelling. When the caller proved the pair's identity by
+            // unique package ID and the content-relative suffixes agree, the
+            // materialized files ARE the requested package and move to its
+            // current identity; any other spelling difference fails closed.
+            let canonical_source = canonical_additive_static_mesh_path(&source.path)?;
+            let canonical_effective = canonical_additive_static_mesh_path(effective_path)?;
+            if composite_alias_rebinding_required(&canonical_source, &canonical_effective)? {
+                let source_asset =
+                    find_extracted_additive_static_mesh(single.path(), &source.path)?;
+                let destination = single.path().join(&canonical_effective);
+                if destination.exists() {
+                    bail!(
+                        "{package_label} project-root alias extraction collided with its canonical destination"
+                    );
+                }
+                fs::create_dir_all(
+                    destination
+                        .parent()
+                        .context("canonical alias destination has no parent")?,
+                )?;
+                for extension in ["uasset", "uexp", "ubulk", "uptnl"] {
+                    let source_sidecar = source_asset.with_extension(extension);
+                    if source_sidecar.is_file() {
+                        fs::rename(&source_sidecar, destination.with_extension(extension))?;
+                    }
+                }
+            }
         }
         let extracted_paths = extracted_uasset_paths(single.path())?;
         if !extracted_paths.contains(&expected_path) {
@@ -2956,6 +3023,244 @@ fn stage_exclusive_source_view(input: &Path) -> Result<tempfile::TempDir> {
         fs::copy(&path, staged.path().join(file_name))?;
     }
     Ok(staged)
+}
+
+/// Main-lane variant of [`extract_source_composite_packages_exact`] with a
+/// per-package layered fallback for packages retoc cannot convert from a
+/// source-only view at all (some Blueprint conversions require the imported
+/// packages' data and abort otherwise). A fallback package is extracted from
+/// the layered view and accepted only with authorship evidence:
+///
+/// - no current-game donor materializes for its identity → the layered view
+///   held a single origin for it, so the bytes are the source's; or
+/// - its export payloads differ from the pure-current donor's → the bytes
+///   cannot be the current game's; or
+/// - its payloads equal the donor's AND the source container's raw zen chunk
+///   equals the current store's raw chunk → the mod authored no change, so
+///   either origin is the same content.
+///
+/// A payload-identical fallback whose raw source chunk differs from the
+/// current chunk means the layered merge substituted current-game content
+/// and the mod's authored bytes would be lost — that fails closed.
+pub(crate) fn extract_source_composite_packages_with_fallback(
+    retoc: &RetocTool,
+    input: &Path,
+    current_view: &Path,
+    source_utocs: &[PathBuf],
+    output: &Path,
+    packages: &[(PackageEntry, String)],
+    label: &str,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut deduped = Vec::new();
+    for pair in packages {
+        if seen.insert(canonical_additive_static_mesh_path(&pair.1)?.to_ascii_lowercase()) {
+            deduped.push(pair.clone());
+        }
+    }
+    let mut fallback = Vec::new();
+    for pair in &deduped {
+        match extract_source_composite_packages_exact(
+            retoc,
+            input,
+            output,
+            std::slice::from_ref(pair),
+            label,
+        ) {
+            Ok(()) => {}
+            Err(error) => fallback.push((pair.clone(), error)),
+        }
+    }
+    if fallback.is_empty() {
+        return Ok(());
+    }
+    let fallback_work = tempfile::Builder::new()
+        .prefix("obr-composite-layered-fallback-")
+        .tempdir()?;
+    for (index, ((source, effective_path), exclusive_error)) in fallback.into_iter().enumerate() {
+        let package_root = fallback_work.path().join(index.to_string());
+        let layered_root = package_root.join("layered");
+        extract_composite_packages_exact(
+            retoc,
+            input,
+            &layered_root,
+            &[(source.clone(), effective_path.clone())],
+            &format!("{label} layered fallback"),
+        )
+        .with_context(|| {
+            format!(
+                "{label} {}: source-only conversion failed ({exclusive_error:#}) and the layered fallback did not materialize the package either",
+                source.path
+            )
+        })?;
+        let layered_asset = find_extracted_additive_static_mesh(&layered_root, &effective_path)?;
+        let donor_root = package_root.join("donor");
+        let donor = PackageEntry {
+            package_id: source.package_id,
+            path: effective_path.clone(),
+        };
+        let donor_asset = extract_composite_packages_exact(
+            retoc,
+            current_view,
+            &donor_root,
+            &[(donor.clone(), donor.path.clone())],
+            &format!("{label} layered-fallback donor"),
+        )
+        .ok()
+        .map(|()| find_extracted_additive_static_mesh(&donor_root, &donor.path))
+        .transpose()?;
+        if let Some(donor_asset) = donor_asset {
+            let payloads_identical = verify_identical_export_payloads(
+                &layered_asset,
+                &donor_asset,
+                &package_root.join("payload-proof"),
+            )
+            .is_ok();
+            if payloads_identical {
+                let source_raw = source_utocs
+                    .iter()
+                    .find_map(|utoc| {
+                        retoc
+                            .package_raw_chunk(
+                                utoc,
+                                source.package_id,
+                                &package_root.join("source-raw"),
+                            )
+                            .ok()
+                    })
+                    .with_context(|| {
+                        format!(
+                            "{label} {}: source container raw chunk is unavailable for authorship evidence",
+                            source.path
+                        )
+                    })?;
+                let current_raw = retoc.package_raw_chunk(
+                    &current_view.join("OblivionRemastered-Windows.utoc"),
+                    source.package_id,
+                    &package_root.join("current-raw"),
+                )?;
+                if source_raw != current_raw {
+                    bail!(
+                        "{label} {}: layered fallback returned the current game's package content while the source container authored different bytes; refusing the substitution",
+                        source.path
+                    );
+                }
+            }
+        }
+        let destination = output.join(canonical_additive_static_mesh_path(&effective_path)?);
+        fs::create_dir_all(
+            destination
+                .parent()
+                .context("layered fallback destination has no parent")?,
+        )?;
+        for extension in ["uasset", "uexp", "ubulk", "uptnl"] {
+            let source_sidecar = layered_asset.with_extension(extension);
+            if source_sidecar.is_file() {
+                let destination_sidecar = destination.with_extension(extension);
+                if destination_sidecar.exists() {
+                    bail!("{label} layered fallback would overwrite an extracted package");
+                }
+                fs::copy(&source_sidecar, &destination_sidecar)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Composite SOURCE-package extraction counterpart of
+/// [`extract_source_packages_exact`].
+///
+/// Two extractions of the same packages prove two different properties:
+///
+/// 1. An extraction from the exclusive source-only view (source containers
+///    plus the `global` script-object store, never the current main store) is
+///    the byte-authorship truth: nothing in that view can substitute
+///    current-game bytes or rebind a path on case skew.
+/// 2. An extraction from the caller's layered view (source containers over
+///    the current stock store) is the only one that can resolve imported
+///    OBJECT names: they live in the imported packages' export maps, so a
+///    source-only view degrades current-game imports to
+///    `/Engine/UnknownPackage` markers whose object identities no downstream
+///    repair could reconstruct.
+///
+/// Only packages whose exclusive extraction still carries markers consult
+/// the layered view, and each name-resolved UAsset is adopted only after
+/// proving it carries the exclusive extraction's exact authored export
+/// payloads; any divergence means the layered view substituted foreign
+/// content and the extraction fails closed. Sidecars always keep the
+/// exclusive extraction's bytes. Donor and roundtrip extractions
+/// intentionally do NOT go through this wrapper: donors must read the pure
+/// current view, and the roundtrip must read the layered rebuilt view.
+pub(crate) fn extract_source_composite_packages_exact(
+    retoc: &RetocTool,
+    input: &Path,
+    output: &Path,
+    packages: &[(PackageEntry, String)],
+    label: &str,
+) -> Result<()> {
+    let source_only = stage_exclusive_source_view(input)?;
+    extract_composite_packages_exact(retoc, source_only.path(), output, packages, label)?;
+    // Only packages whose exclusive extraction actually carries unresolved
+    // markers consult the layered view; every other package ships the
+    // exclusive extraction untouched. The layered view's SIDECARS are never
+    // read at all: for a package the current game also carries, the layered
+    // chunk merge can hand back the current game's bulk payload, which is
+    // exactly the substitution this extraction exists to prevent.
+    let marker = b"/Engine/UnknownPackage";
+    let mut pending = Vec::new();
+    let mut seen = BTreeSet::new();
+    for (source, effective_path) in packages {
+        if !seen.insert(canonical_additive_static_mesh_path(effective_path)?.to_ascii_lowercase())
+        {
+            continue;
+        }
+        let asset = find_extracted_additive_static_mesh(output, effective_path)?;
+        let bytes = fs::read(&asset)?;
+        if bytes
+            .windows(marker.len())
+            .any(|window| window == marker.as_slice())
+        {
+            pending.push((source.clone(), effective_path.clone()));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let resolution_work = tempfile::Builder::new()
+        .prefix("obr-composite-name-resolution-")
+        .tempdir()?;
+    let resolved_root = resolution_work.path().join("legacy");
+    extract_composite_packages_exact(
+        retoc,
+        input,
+        &resolved_root,
+        &pending,
+        &format!("{label} import-name resolution"),
+    )?;
+    for (source, effective_path) in &pending {
+        let exclusive_asset = find_extracted_additive_static_mesh(output, effective_path)?;
+        let resolved_asset = find_extracted_additive_static_mesh(&resolved_root, effective_path)?;
+        if fs::read(&exclusive_asset)? == fs::read(&resolved_asset)? {
+            continue;
+        }
+        verify_identical_export_payloads(
+            &exclusive_asset,
+            &resolved_asset,
+            &resolution_work
+                .path()
+                .join("payload-proof")
+                .join(source.package_id.to_string()),
+        )
+        .with_context(|| {
+            format!(
+                "{label} {effective_path}: layered import-name resolution must preserve the exclusive source extraction's authored export payloads"
+            )
+        })?;
+        // Adopt the UAsset only (import table and NameMap); every sidecar
+        // keeps the exclusive source extraction's bytes.
+        fs::copy(&resolved_asset, &exclusive_asset)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn extract_source_static_mesh_packages(
@@ -3476,9 +3781,16 @@ pub fn probe_composite_package_input(
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        extract_composite_packages_exact(
+        let source_utocs = inspection
+            .containers
+            .iter()
+            .map(|container| container.utoc.clone())
+            .collect::<Vec<_>>();
+        extract_source_composite_packages_with_fallback(
             &retoc,
             source_view.path(),
+            current_view.path(),
+            &source_utocs,
             &legacy,
             &packages,
             "composite source extraction",
@@ -3734,13 +4046,27 @@ pub fn probe_composite_package_input(
                     }
                     let target = &targets[0];
                     let donor_root = package_work.join("resolved-dependency");
-                    extract_composite_packages_exact(
-                        &retoc,
-                        source_view.path(),
-                        &donor_root,
-                        &[(target.clone(), target.path.clone())],
-                        "authored package dependency extraction",
-                    )?;
+                    // The proven target is either a current-game package (read
+                    // from the pure current view) or a source-bundled package
+                    // (read from the exclusive source-only view); a merged
+                    // view could silently substitute bytes for shared IDs.
+                    if inspection.target_dependencies.contains_key(&target.package_id) {
+                        extract_composite_packages_exact(
+                            &retoc,
+                            current_view.path(),
+                            &donor_root,
+                            &[(target.clone(), target.path.clone())],
+                            "authored package dependency extraction",
+                        )?;
+                    } else {
+                        extract_source_composite_packages_exact(
+                            &retoc,
+                            source_view.path(),
+                            &donor_root,
+                            &[(target.clone(), target.path.clone())],
+                            "authored package dependency extraction",
+                        )?;
+                    }
                     let donor = find_extracted_additive_static_mesh(&donor_root, &target.path)?;
                     repair_single_external_import(
                         &asset,
@@ -4340,6 +4666,35 @@ mod tests {
         assert_eq!(bare_root_alias_leaf("../../../.."), None);
         assert_eq!(bare_root_alias_leaf("../../../"), None);
         assert_eq!(bare_root_alias_leaf("../../../Dir/../BP_Item.uasset"), None);
+    }
+
+    #[test]
+    fn composite_alias_rebinding_requires_matching_content_suffix() {
+        // Identical spelling (case-insensitively) needs no rebinding.
+        assert!(
+            !composite_alias_rebinding_required(
+                "OblivionRemastered/Content/Art/Clothes/SK_Dress.uasset",
+                "oblivionremastered/content/art/clothes/sk_dress.uasset",
+            )
+            .unwrap()
+        );
+        // A named project root alias with an agreeing content-relative suffix
+        // is proven and must be rebound to the effective identity.
+        assert!(
+            composite_alias_rebinding_required(
+                "obliemperor/Content/Art/Clothes/SpecialClass/SEDuchess/SK_SE_Duchess_Dress.uasset",
+                "OblivionRemastered/Content/Art/Clothes/SpecialClass/SEDuchess/SK_SE_Duchess_Dress.uasset",
+            )
+            .unwrap()
+        );
+        // Any change beyond the project root fails closed.
+        let error = composite_alias_rebinding_required(
+            "obliemperor/Content/Art/Clothes/SK_Other.uasset",
+            "OblivionRemastered/Content/Art/Clothes/SK_SE_Duchess_Dress.uasset",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changes more than its project root"), "{error}");
     }
 
     #[test]

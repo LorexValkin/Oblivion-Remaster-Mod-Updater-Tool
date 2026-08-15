@@ -1105,6 +1105,31 @@ fn validate_export_payload(export: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Proves two extracted variants of the same package carry the identical
+/// authored export payload set (names, raw data, and serial sizes). Import
+/// tables and NameMaps may differ — that is exactly the difference between a
+/// source-only extraction (markers) and a layered extraction (resolved import
+/// names) — but any divergence in export payloads means the variants are not
+/// the same authored package and the caller must fail closed.
+pub fn verify_identical_export_payloads(left: &Path, right: &Path, work: &Path) -> Result<()> {
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let left_json = work.join("left.json");
+    let right_json = work.join("right.json");
+    tool.to_json(left, &left_json)?;
+    tool.to_json(right, &right_json)?;
+    let left_document: Value = serde_json::from_slice(&fs::read(&left_json)?)?;
+    let right_document: Value = serde_json::from_slice(&fs::read(&right_json)?)?;
+    if validated_export_data(&left_document)? != validated_export_data(&right_document)? {
+        bail!(
+            "extracted package variants disagree on authored export payloads: {} vs {}",
+            left.display(),
+            right.display()
+        );
+    }
+    Ok(())
+}
+
 fn validated_export_data(document: &Value) -> Result<Vec<(String, Value, u64)>> {
     let exports = document
         .get("Exports")

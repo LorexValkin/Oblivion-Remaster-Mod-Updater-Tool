@@ -29,6 +29,7 @@ use crate::replacement::{
     TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
     classify_heterogeneous_asset, composite_effective_package_path,
     extract_composite_packages_exact, extract_current_packages_batched,
+    extract_source_composite_packages_exact, extract_source_composite_packages_with_fallback,
     extract_source_packages_exact,
     extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
@@ -4049,13 +4050,27 @@ fn migrate_composite_package(
                 }
                 let target = &targets[0];
                 let donor_root = work.join("resolved-dependency");
-                extract_composite_packages_exact(
-                    retoc,
-                    source_view,
-                    &donor_root,
-                    &[(target.clone(), target.path.clone())],
-                    "authored package dependency extraction",
-                )?;
+                // The proven target is either a current-game package (read
+                // from the pure current view) or a source-bundled package
+                // (read from the exclusive source-only view); a merged view
+                // could silently substitute bytes for shared IDs.
+                if target_dependencies.contains_key(&target.package_id) {
+                    extract_composite_packages_exact(
+                        retoc,
+                        current_view,
+                        &donor_root,
+                        &[(target.clone(), target.path.clone())],
+                        "authored package dependency extraction",
+                    )?;
+                } else {
+                    extract_source_composite_packages_exact(
+                        retoc,
+                        source_view,
+                        &donor_root,
+                        &[(target.clone(), target.path.clone())],
+                        "authored package dependency extraction",
+                    )?;
+                }
                 let donor = find_extracted_additive_static_mesh(&donor_root, &target.path)?;
                 let repair = repair_single_external_import(
                     asset,
@@ -4245,9 +4260,16 @@ fn run_composite_package_update(
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        extract_composite_packages_exact(
+        let source_utocs = inspection
+            .containers
+            .iter()
+            .map(|container| container.utoc.clone())
+            .collect::<Vec<_>>();
+        extract_source_composite_packages_with_fallback(
             &retoc,
             source_view.path(),
+            current_view.path(),
+            &source_utocs,
             &legacy,
             &effective_packages,
             &format!("composite extraction {}", container.name),
@@ -4463,14 +4485,22 @@ fn run_composite_package_update(
             .path()
             .join("roundtrip")
             .join(&container.container.name);
+        // The rebuilt container stores every package at its effective
+        // (current) identity, so the roundtrip must request exactly that
+        // identity; a source project-root alias spelling no longer exists in
+        // the rebuilt directory index.
         let effective_packages = container
             .container
             .packages
             .iter()
             .map(|package| {
+                let effective = composite_effective_package_path(package, &inspection)?;
                 Ok((
-                    package.clone(),
-                    composite_effective_package_path(package, &inspection)?,
+                    PackageEntry {
+                        package_id: package.package_id,
+                        path: effective.clone(),
+                    },
+                    effective,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;

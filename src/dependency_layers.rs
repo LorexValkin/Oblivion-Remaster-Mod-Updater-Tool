@@ -138,12 +138,14 @@ pub struct LayeredIoStoreDependencyReport {
     pub cross_layer_collision_count: usize,
     pub excluded_installed_selected_source_count: usize,
     pub excluded_non_iostore_dependency_source_count: usize,
+    pub excluded_incomplete_container_count: usize,
     pub layers: Vec<LayeredLayerSummary>,
     pub providers: Vec<LayeredProviderReport>,
     pub dependency_edges: Vec<LayeredDependencyEdge>,
     pub cross_layer_collisions: Vec<CrossLayerPackageCollision>,
     pub excluded_installed_selected_sources: Vec<String>,
     pub excluded_non_iostore_dependency_sources: Vec<String>,
+    pub excluded_incomplete_containers: Vec<String>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -242,6 +244,7 @@ fn build_report(
     mut inputs: Vec<LayeredPackageProviderInput>,
     mut excluded_installed_selected_sources: Vec<String>,
     mut excluded_non_iostore_dependency_sources: Vec<String>,
+    mut excluded_incomplete_containers: Vec<String>,
 ) -> Result<LayeredIoStoreDependencyReport> {
     if inputs.is_empty() || inputs.len() > MAX_PROVIDER_COUNT {
         bail!("layered package provider count is outside its bounded limit");
@@ -491,6 +494,8 @@ fn build_report(
     excluded_non_iostore_dependency_sources.sort_by_key(|value| value.to_ascii_lowercase());
     excluded_non_iostore_dependency_sources
         .dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    excluded_incomplete_containers.sort_by_key(|value| value.to_ascii_lowercase());
+    excluded_incomplete_containers.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     let mut blockers = Vec::new();
     if unresolved_edge_count > 0 {
         blockers.push(format!(
@@ -513,6 +518,12 @@ fn build_report(
         warnings.push(format!(
             "Connected dependency sources without IoStore container triples were retained as out-of-lane inputs and excluded from package resolution: found {}.",
             excluded_non_iostore_dependency_sources.len()
+        ));
+    }
+    if !excluded_incomplete_containers.is_empty() {
+        warnings.push(format!(
+            "Incomplete PAK/UCAS/UTOC container group(s) cannot provide IoStore packages and were excluded from layered resolution; complete or remove them to make this environment claim exact: {}.",
+            excluded_incomplete_containers.join("; ")
         ));
     }
     let resolution_complete = blockers.is_empty();
@@ -540,12 +551,14 @@ fn build_report(
         cross_layer_collision_count: cross_layer_collisions.len(),
         excluded_installed_selected_source_count: excluded_installed_selected_sources.len(),
         excluded_non_iostore_dependency_source_count: excluded_non_iostore_dependency_sources.len(),
+        excluded_incomplete_container_count: excluded_incomplete_containers.len(),
         layers,
         providers,
         dependency_edges,
         cross_layer_collisions,
         excluded_installed_selected_sources,
         excluded_non_iostore_dependency_sources,
+        excluded_incomplete_containers,
         blockers,
         warnings,
     };
@@ -556,7 +569,7 @@ fn build_report(
 pub fn resolve_layered_package_stores(
     providers: Vec<LayeredPackageProviderInput>,
 ) -> Result<LayeredIoStoreDependencyReport> {
-    build_report(providers, Vec::new(), Vec::new())
+    build_report(providers, Vec::new(), Vec::new(), Vec::new())
 }
 
 struct StagedSource {
@@ -597,6 +610,39 @@ struct ContainerMembers {
     pak: Option<PathBuf>,
     ucas: Option<PathBuf>,
     utoc: Option<PathBuf>,
+}
+
+/// A PAK/UCAS/UTOC stem group that is missing at least one member. The group
+/// is named so an excluded or rejected source is always attributable to one
+/// concrete container instead of a generic message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IncompleteContainerGroup {
+    location: String,
+    missing: Vec<&'static str>,
+}
+
+impl IncompleteContainerGroup {
+    fn describe(&self) -> String {
+        format!("{} (missing: {})", self.location, self.missing.join(", "))
+    }
+}
+
+fn require_complete_container_triples(
+    incomplete: &[IncompleteContainerGroup],
+    context: &str,
+) -> Result<()> {
+    if incomplete.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{context} contains {} incomplete PAK/UCAS/UTOC triple(s): {}",
+        incomplete.len(),
+        incomplete
+            .iter()
+            .map(IncompleteContainerGroup::describe)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
 }
 
 fn stage_mod_source(input: &Path, prefix: &str) -> Result<StagedSource> {
@@ -658,12 +704,12 @@ fn discover_mod_container_triples(
     recursive: bool,
     require_any: bool,
     report_prefix: Option<&str>,
-) -> Result<Vec<ContainerFiles>> {
+) -> Result<(Vec<ContainerFiles>, Vec<IncompleteContainerGroup>)> {
     if !root.is_dir() {
         if require_any {
             bail!("layered package source directory is unavailable");
         }
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut walk = WalkDir::new(root).follow_links(false);
     if !recursive {
@@ -706,10 +752,12 @@ fn discover_mod_container_triples(
         let row = members.entry(key).or_default();
         if let Some(existing) = &row.relative_stem {
             if !existing.eq_ignore_ascii_case(&relative_stem) {
-                bail!("layered package source repeats a case-insensitive container stem");
+                bail!(
+                    "layered package source repeats a case-insensitive container stem: {existing} vs {relative_stem}"
+                );
             }
         } else {
-            row.relative_stem = Some(relative_stem);
+            row.relative_stem = Some(relative_stem.clone());
         }
         let slot = match extension.as_str() {
             "pak" => &mut row.pak,
@@ -718,7 +766,9 @@ fn discover_mod_container_triples(
             _ => unreachable!(),
         };
         if slot.replace(entry.path().to_path_buf()).is_some() {
-            bail!("layered package source repeats a container member");
+            bail!(
+                "layered package source repeats a container member: {relative_stem}.{extension}"
+            );
         }
         selected_bytes = selected_bytes
             .checked_add(entry.metadata()?.len())
@@ -731,25 +781,36 @@ fn discover_mod_container_triples(
         if require_any {
             bail!("layered package source contains no container triples");
         }
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut containers = Vec::new();
+    let mut incomplete = Vec::new();
     for row in members.into_values() {
-        let (Some(relative_stem), Some(pak), Some(ucas), Some(utoc)) =
-            (row.relative_stem, row.pak, row.ucas, row.utoc)
-        else {
-            bail!("layered package source contains an incomplete PAK/UCAS/UTOC triple");
-        };
-        let relative_utoc = if let Some(prefix) = report_prefix {
-            format!("{prefix}/{relative_stem}.utoc")
+        let relative_stem = row
+            .relative_stem
+            .context("layered container group lost its stem")?;
+        let location = if let Some(prefix) = report_prefix {
+            format!("{prefix}/{relative_stem}")
         } else {
-            format!("{relative_stem}.utoc")
+            relative_stem.clone()
         };
+        let missing = [
+            (row.pak.is_none(), "pak"),
+            (row.ucas.is_none(), "ucas"),
+            (row.utoc.is_none(), "utoc"),
+        ]
+        .into_iter()
+        .filter_map(|(absent, member)| absent.then_some(member))
+        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            incomplete.push(IncompleteContainerGroup { location, missing });
+            continue;
+        }
         containers.push(ContainerFiles {
-            relative_utoc,
-            pak: Some(pak),
-            ucas,
-            utoc,
+            relative_utoc: format!("{location}.utoc"),
+            pak: row.pak,
+            ucas: row.ucas.unwrap(),
+            utoc: row.utoc.unwrap(),
         });
     }
     containers.sort_by(|left, right| {
@@ -757,7 +818,12 @@ fn discover_mod_container_triples(
             .to_ascii_lowercase()
             .cmp(&right.relative_utoc.to_ascii_lowercase())
     });
-    Ok(containers)
+    incomplete.sort_by(|left, right| {
+        left.location
+            .to_ascii_lowercase()
+            .cmp(&right.location.to_ascii_lowercase())
+    });
+    Ok((containers, incomplete))
 }
 
 fn discover_game_containers(paks: &Path) -> Result<(Vec<ContainerFiles>, ContainerFiles)> {
@@ -812,14 +878,22 @@ fn discover_game_containers(paks: &Path) -> Result<(Vec<ContainerFiles>, Contain
     let mut stock_main = None;
     let mut game = Vec::new();
     for (key, row) in members {
+        let name = row.relative_stem.clone().unwrap_or_else(|| key.clone());
+        let missing = [(row.ucas.is_none(), "ucas"), (row.utoc.is_none(), "utoc")]
+            .into_iter()
+            .filter_map(|(absent, member)| absent.then_some(member))
+            .collect::<Vec<_>>();
         let (Some(stem), Some(ucas), Some(utoc)) = (row.relative_stem, row.ucas, row.utoc) else {
-            bail!("connected game contains an incomplete IoStore container pair");
+            bail!(
+                "connected game container {name} is an incomplete IoStore group (missing: {})",
+                missing.join(", ")
+            );
         };
         if key == main_key && row.pak.is_none() {
             bail!("connected game stock main container has no matching PAK");
         }
         if key != main_key && key != "global" && row.pak.is_none() {
-            bail!("connected game/DLC container has no matching PAK");
+            bail!("connected game/DLC container {stem} has no matching PAK");
         }
         let container = ContainerFiles {
             relative_utoc: format!("Content/Paks/{stem}.utoc"),
@@ -968,8 +1042,12 @@ pub fn probe_layered_iostore_dependencies(
 
     let retoc = RetocTool::materialize()?;
     let selected_staged = stage_mod_source(selected_mod_input, "obr-layered-selected-")?;
-    let selected_containers =
+    let (selected_containers, selected_incomplete) =
         discover_mod_container_triples(&selected_staged.root, true, true, None)?;
+    require_complete_container_triples(&selected_incomplete, "the selected mod source")?;
+    if selected_containers.is_empty() {
+        bail!("the selected mod source contains no complete PAK/UCAS/UTOC container triples");
+    }
     let selected_fingerprints = selected_containers
         .iter()
         .map(container_fingerprint)
@@ -983,6 +1061,7 @@ pub fn probe_layered_iostore_dependencies(
     let mut providers = vec![selected_provider];
 
     let mut excluded_non_iostore_dependency_sources = Vec::new();
+    let mut excluded_incomplete_containers = Vec::new();
     for (index, input) in dependency_inputs.iter().enumerate() {
         let Some(staged) = stage_optional_dependency_source(input, "obr-layered-dependency-")?
         else {
@@ -992,7 +1071,15 @@ pub fn probe_layered_iostore_dependencies(
             ));
             continue;
         };
-        let containers = discover_mod_container_triples(&staged.root, true, false, None)?;
+        let (containers, incomplete) =
+            discover_mod_container_triples(&staged.root, true, false, None)?;
+        for group in &incomplete {
+            excluded_incomplete_containers.push(format!(
+                "connected-source-{index}:{}:{}",
+                safe_source_leaf(input),
+                group.describe()
+            ));
+        }
         if containers.is_empty() {
             excluded_non_iostore_dependency_sources.push(format!(
                 "connected-source-{index}:{}",
@@ -1016,8 +1103,11 @@ pub fn probe_layered_iostore_dependencies(
     }
 
     let mut excluded_installed_selected_sources = Vec::new();
-    let installed_containers =
+    let (installed_containers, installed_incomplete) =
         discover_mod_container_triples(&installed_mods, true, false, Some("Content/Paks/~mods"))?;
+    for group in &installed_incomplete {
+        excluded_incomplete_containers.push(format!("installed-active-mod:{}", group.describe()));
+    }
     for container in installed_containers {
         let fingerprint = container_fingerprint(&container)?;
         if selected_fingerprints.contains(&fingerprint) {
@@ -1062,6 +1152,7 @@ pub fn probe_layered_iostore_dependencies(
         providers,
         excluded_installed_selected_sources,
         excluded_non_iostore_dependency_sources,
+        excluded_incomplete_containers,
     )
 }
 
@@ -1309,16 +1400,75 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_discovery_rejects_incomplete_triples() {
+    fn filesystem_discovery_names_incomplete_triples() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("Fixture.pak"), b"pak").unwrap();
         fs::write(temporary.path().join("Fixture.utoc"), b"utoc").unwrap();
-        assert!(discover_mod_container_triples(temporary.path(), true, true, None).is_err());
-        fs::write(temporary.path().join("Fixture.ucas"), b"ucas").unwrap();
-        let containers =
+        let (containers, incomplete) =
             discover_mod_container_triples(temporary.path(), true, true, None).unwrap();
+        assert!(containers.is_empty());
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].describe(), "Fixture (missing: ucas)");
+        let error = require_complete_container_triples(&incomplete, "the selected mod source")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Fixture"), "{error}");
+        assert!(error.contains("missing: ucas"), "{error}");
+        fs::write(temporary.path().join("Fixture.ucas"), b"ucas").unwrap();
+        let (containers, incomplete) =
+            discover_mod_container_triples(temporary.path(), true, true, None).unwrap();
+        assert!(incomplete.is_empty());
         assert_eq!(containers.len(), 1);
         assert_eq!(containers[0].relative_utoc, "Fixture.utoc");
+    }
+
+    #[test]
+    fn installed_discovery_retains_complete_triples_next_to_incomplete_leftovers() {
+        let temporary = tempfile::tempdir().unwrap();
+        for extension in ["pak", "ucas", "utoc"] {
+            fs::write(temporary.path().join(format!("Good_P.{extension}")), extension).unwrap();
+        }
+        fs::write(temporary.path().join("Leftover_P.utoc"), b"junk").unwrap();
+        fs::write(temporary.path().join("LegacyPakOnly_P.pak"), b"pak").unwrap();
+        let (containers, incomplete) = discover_mod_container_triples(
+            temporary.path(),
+            true,
+            false,
+            Some("Content/Paks/~mods"),
+        )
+        .unwrap();
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].relative_utoc, "Content/Paks/~mods/Good_P.utoc");
+        assert_eq!(incomplete.len(), 2);
+        assert_eq!(
+            incomplete[0].describe(),
+            "Content/Paks/~mods/Leftover_P (missing: pak, ucas)"
+        );
+        assert_eq!(
+            incomplete[1].describe(),
+            "Content/Paks/~mods/LegacyPakOnly_P (missing: ucas, utoc)"
+        );
+    }
+
+    #[test]
+    fn incomplete_container_exclusions_surface_in_report_warnings() {
+        let report = build_report(
+            complete_provider_set(),
+            Vec::new(),
+            Vec::new(),
+            vec!["installed-active-mod:Content/Paks/~mods/Leftover_P (missing: ucas)".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(report.excluded_incomplete_container_count, 1);
+        assert!(report.resolution_complete);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Leftover_P") && warning.contains("missing: ucas")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]
@@ -1347,13 +1497,14 @@ mod tests {
             fs::write(nested.join(format!("Fixture.{extension}")), extension).unwrap();
         }
 
-        let containers = discover_mod_container_triples(
+        let (containers, incomplete) = discover_mod_container_triples(
             temporary.path(),
             true,
             true,
             Some("Content/Paks/~mods"),
         )
         .unwrap();
+        assert!(incomplete.is_empty());
         assert_eq!(containers.len(), 1);
         assert_eq!(
             containers[0].relative_utoc,
@@ -1375,8 +1526,8 @@ mod tests {
         fs::write(first.join("Fixture.ucas"), b"first").unwrap();
         fs::write(second.join("Fixture.ucas"), b"other").unwrap();
 
-        let first = discover_mod_container_triples(&first, true, true, None).unwrap();
-        let second = discover_mod_container_triples(&second, true, true, None).unwrap();
+        let (first, _) = discover_mod_container_triples(&first, true, true, None).unwrap();
+        let (second, _) = discover_mod_container_triples(&second, true, true, None).unwrap();
         assert_ne!(
             container_fingerprint(&first[0]).unwrap(),
             container_fingerprint(&second[0]).unwrap()

@@ -2091,8 +2091,17 @@ fn analyze_internal(
             message: layered_iostore_dependency_probe
                 .as_ref()
                 .map(|report| {
+                    let excluded = if report.excluded_incomplete_container_count > 0 {
+                        format!(
+                            " {} incomplete PAK/UCAS/UTOC container group(s) were excluded from resolution: {}.",
+                            report.excluded_incomplete_container_count,
+                            report.excluded_incomplete_containers.join("; "),
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "Resolved {}/{} reachable dependency edge(s) across {} provider(s) with explicit precedence; {} edge(s) remain unresolved and {} cross-layer collision(s) were recorded.",
+                        "Resolved {}/{} reachable dependency edge(s) across {} provider(s) with explicit precedence; {} edge(s) remain unresolved and {} cross-layer collision(s) were recorded.{excluded}",
                         report.resolved_edge_count,
                         report.dependency_edge_count,
                         report.provider_count,

@@ -1542,9 +1542,11 @@ fn case_insensitive_data_entries(
     Ok(entries)
 }
 
-/// Resolves records against the effective installed master chain. Requiring every master's own
-/// dependency list to be the exact preceding prefix keeps all embedded full-plugin FormIDs aligned
-/// with the staged plugin while still supporting arbitrary-length DLC/mod master chains.
+/// Resolves records against the effective installed master chain. When records must resolve
+/// through the chain, every master's own dependency list must be the exact preceding prefix so
+/// all embedded full-plugin FormIDs stay aligned with the staged plugin; when nothing resolves
+/// through the chain, name-based presence of each declared master is the complete requirement
+/// and every installed master keeps its own free master order.
 pub fn resolve_installed_master_records(
     plugin: &Plugin,
     game_data_dir: &Path,
@@ -1573,6 +1575,38 @@ pub fn resolve_installed_master_records(
         staged_identities.push((form_id, identity));
     }
     let data_entries = case_insensitive_data_entries(game_data_dir)?;
+    if wanted.is_empty() {
+        // Nothing in the staged plugin resolves through the chain, so raw
+        // FormID alignment is irrelevant. TES4 MAST entries name the defining
+        // plugin directly (the Unblivion lineage model), so name-based
+        // presence of every declared master as one direct regular TES4 Data
+        // file is the complete requirement; each installed master keeps its
+        // own free master order.
+        for declared_name in &plugin.masters {
+            let candidates = data_entries
+                .get(&declared_name.to_ascii_lowercase())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if candidates.len() != 1 {
+                bail!(
+                    "declared master {declared_name} requires one case-insensitive Data match; found {}",
+                    candidates.len()
+                );
+            }
+            let candidate = &candidates[0];
+            if !candidate.regular_file || candidate.symlink {
+                bail!("declared master {declared_name} is not a direct regular Data file");
+            }
+            let mut magic = [0_u8; 4];
+            fs::File::open(&candidate.path)
+                .and_then(|mut file| file.read_exact(&mut magic))
+                .with_context(|| format!("reading installed master {declared_name}"))?;
+            if &magic != b"TES4" {
+                bail!("installed master {declared_name} does not begin with a TES4 header");
+            }
+        }
+        return Ok(HashMap::new());
+    }
     let mut effective = BTreeMap::<CanonicalFormId, IndexedMasterRecord>::new();
     for (master_index, declared_name) in plugin.masters.iter().enumerate() {
         let candidates = data_entries
@@ -3545,6 +3579,56 @@ mod tests {
             blocker
                 == "installed-master-unmappable-record-collides-with-target-local-id:Base.esm:0x01001234"
         }));
+    }
+
+    #[test]
+    fn additive_contract_accepts_installed_masters_with_free_master_order_when_nothing_resolves_through_them()
+     {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // The staged plugin owns one WEAP and overrides nothing, exactly like
+        // a standalone-weapon mod that declares the remaster's own base ESP as
+        // a late master.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm", "AltarESPMain.esp"],
+                &[("WEAP", 0x0200_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("STAT", 0x0000_0800)], 0x900),
+        );
+        // The installed base ESP declares its own master order, which is not a
+        // prefix of the staged plugin's chain. Nothing in the staged plugin
+        // resolves through it, so name-based presence is sufficient.
+        write_plugin(
+            data.path(),
+            "AltarESPMain.esp",
+            &plugin_bytes(
+                &["Oblivion.esm", "DLCFoo.esp"],
+                &[("STAT", 0x0200_0800)],
+                0x900,
+            ),
+        );
+
+        let (_plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(
+            contract.compatible,
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+        assert!(contract.current_master_checked);
     }
 
     fn raw_record(kind: &str, form_id: u32, flags: u32, data: &[u8]) -> Vec<u8> {

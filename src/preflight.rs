@@ -770,7 +770,10 @@ fn is_direct_mod_container_path(path: &str) -> bool {
     parts.len() == 4
         && parts[0].eq_ignore_ascii_case("Content")
         && parts[1].eq_ignore_ascii_case("Paks")
-        && parts[2].eq_ignore_ascii_case("~mods")
+        && !parts[2].is_empty()
+        && !matches!(parts[2], "." | "..")
+        && !parts[2].contains(':')
+        && !parts[2].chars().any(char::is_control)
         && Path::new(parts[3])
             .extension()
             .and_then(|extension| extension.to_str())
@@ -952,11 +955,6 @@ fn analyze_internal(
     let candidate_mod_root = inventory
         .as_ref()
         .and_then(|value| value.candidate_mod_root.as_deref());
-    let current_esm = request
-        .game_root
-        .as_deref()
-        .map(normalize_install_root)
-        .map(|root| root.join(r"OblivionRemastered\Content\Dev\ObvData\Data\Oblivion.esm"));
     let current_game_data = request
         .game_root
         .as_deref()
@@ -973,7 +971,7 @@ fn analyze_internal(
                 match inspect_additive_contract_input(
                     &request.mod_input,
                     candidate_mod_root,
-                    current_esm.as_deref(),
+                    current_game_data.as_deref(),
                 ) {
                     Ok((plugin_set, contract)) => {
                         let complex_worldspace = plugin_set.artifacts.iter().any(|artifact| {
@@ -1369,6 +1367,30 @@ fn analyze_internal(
             None, None, None, None, None, None, None, None, None, None, None, None,
         )
     };
+    let (additive_composite_probe, additive_composite_probe_error) = if additive_shape
+        && !selected_active_game_mods
+    {
+        progress("Proving the additive mod's composite Unreal package migration");
+        if let Some(game) = game.as_ref().filter(|value| value.valid) {
+            match probe_composite_package_input(&request.mod_input, &game.root) {
+                Ok(summary) => (Some(summary), None),
+                Err(error) => (None, Some(redact_preflight_error(&error, request))),
+            }
+        } else {
+            (
+                    None,
+                    Some(
+                        "A complete target game is required for additive composite package classification."
+                            .to_owned(),
+                    ),
+                )
+        }
+    } else {
+        (None, None)
+    };
+    let composite_package_probe = composite_package_probe.or(additive_composite_probe);
+    let composite_package_probe_error =
+        composite_package_probe_error.or(additive_composite_probe_error);
     let replacement_probe = armor_probe
         .as_ref()
         .or(mixed_armor_probe.as_ref())
@@ -1709,7 +1731,7 @@ fn analyze_internal(
                 "plugin-additive-syncmap-policy",
                 plugin_report.additive_syncmap_v1.compatible,
                 true,
-                "The plugin matches the one-ESP, one-Oblivion.esm, CONT-only additive policy.",
+                "The plugin matches the one-full-ESP inventory-addition policy with Oblivion.esm first in its full-master chain.",
                 format!(
                     "The plugin does not match the proven additive policy: {}",
                     plugin_report.additive_syncmap_v1.blockers.join(", ")
@@ -1722,7 +1744,7 @@ fn analyze_internal(
                     .as_ref()
                     .is_some_and(|value| value.compatible),
                 true,
-                "The SyncMap is non-empty, every mapped FormID is plugin-owned, and every CONT override is additive against the current Oblivion.esm.",
+                "The SyncMap is non-empty, every mapped FormID is plugin-owned, and every supported CONT, CREA, or NPC_ inventory override is compatible with the installed master chain.",
                 additive_contract
                     .as_ref()
                     .map(|value| {
@@ -1735,7 +1757,7 @@ fn analyze_internal(
                         "The additive plugin/SyncMap contract could not be inspected safely."
                             .to_owned()
                     }),
-                Some("Use a non-empty SyncMap whose local IDs exist in the ESP, and rebase CONT overrides against the current Oblivion.esm without changing or removing existing content."),
+                Some("Use a non-empty SyncMap whose local IDs exist in the ESP. Inventory overrides may add entries, but conflicting changes to installed master rows remain report-only."),
             ));
         }
         if complex_worldspace_plugin {
@@ -1926,20 +1948,21 @@ fn analyze_internal(
             "additive-container-layout",
             publishable_container_layout,
             true,
-            "Every additive container is a direct child of Content/Paks/~mods, matching the native publisher's path-preservation contract.",
-            "One or more additive containers are nested below Content/Paks/~mods. They are included in diagnostics, but the native publisher cannot yet preserve that nested physical layout.",
+            "Every additive container is in one direct child folder of Content/Paks, and the native publisher preserves that folder.",
+            "One or more additive containers are nested more deeply below Content/Paks or split across physical folders.",
             Some(
-                "Keep this layout report-only until native additive publication preserves nested container paths atomically.",
+                "Place every complete container triple together in one direct child folder of Content/Paks.",
             ),
         ));
         let dependency_closure = mixed_iostore_dependency_probe
             .as_ref()
-            .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved);
+            .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+            || composite_package_probe.is_some();
         let failure = mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| {
                 format!(
-                    "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s). The updater can only consume dependencies bundled with the selected mod or present in the current game package store.",
+                    "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the guarded composite identity-recovery contract.",
                     probe.collision_count, probe.dependencies.unresolved_edge_count
                 )
             })
@@ -2180,7 +2203,8 @@ fn analyze_internal(
         .collect::<Vec<_>>();
     let additive_dependency_closure = mixed_iostore_dependency_probe
         .as_ref()
-        .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved);
+        .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+        || (additive_shape && composite_package_probe.is_some());
     let additive_can_update =
         additive_shape && additive_dependency_closure && adapter_blockers.is_empty();
     let armor_can_update =
@@ -2385,7 +2409,7 @@ fn analyze_internal(
             .as_ref()
             .is_some_and(|value| value.compatible),
         evidence_level: "current-master-field-aware-validation".to_owned(),
-        description: "Binds the unique candidate root, ESP, SyncMap, and current Oblivion.esm; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT overrides that remove or functionally change current content.".to_owned(),
+        description: "Binds the unique candidate root, ESP, SyncMap, and ordered installed full-master chain; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT, CREA, or NPC_ overrides that conflict with installed inventory or non-inventory semantics. Newly installed master rows are merged into the candidate without dropping the mod's additions.".to_owned(),
         blockers: additive_contract
             .as_ref()
             .map(|value| value.blockers.clone())
@@ -2868,12 +2892,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_additive_publication_only_accepts_direct_mod_containers() {
+    fn native_additive_publication_accepts_direct_author_container_folders() {
         assert!(is_direct_mod_container_path(
             "Content/Paks/~mods/Fixture_P.utoc"
         ));
         assert!(is_direct_mod_container_path(
             "content\\paks\\~MODS\\Fixture_P.UTOC"
+        ));
+        assert!(is_direct_mod_container_path(
+            "Content/Paks/Author Name/Fixture_P.utoc"
         ));
         assert!(!is_direct_mod_container_path(
             "Content/Paks/~mods/Nested/Fixture_P.utoc"
@@ -3020,10 +3047,15 @@ mod tests {
     }
 
     fn game_fixture(root: &Path) {
-        for (_, relative) in crate::game::REQUIRED_GAME_FILES {
+        for (label, relative) in crate::game::REQUIRED_GAME_FILES {
             let path = root.join(relative);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, b"fixture").unwrap();
+            let payload = if *label == "Oblivion.esm" {
+                current_master_with_container_bytes()
+            } else {
+                b"fixture".to_vec()
+            };
+            fs::write(path, payload).unwrap();
         }
     }
 

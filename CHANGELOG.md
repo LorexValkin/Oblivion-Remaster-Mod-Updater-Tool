@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.3 - 2026-08-14
+
+- Extend the guarded additive lane to ordered full-master chains with `Oblivion.esm` first and inventory-only `CONT`, `CREA`, and `NPC_` overrides. A field-aware three-way merge preserves newly installed master rows and the mod's additions, rejects conflicts, rewrites only proven records, updates nested group sizes and compression, and reparses the completed ESP.
+- Add a role-proven optional secondary Blueprint component repair. An absent StaticMesh dependency can be retired only when it appears exactly once in a serialized scabbard component role and one bundled primary StaticMesh provides the replacement identity; unrelated dependencies must remain intact.
+- Generalize decoder placeholder repair to custom project `Content` roots and duplicate placeholder rows for one package-store-proven dependency. Multiple candidate targets, unsafe paths, changed authored payloads, or rebuilt graph mismatches remain blockers.
+- Accept complete additive container triples in one direct `Content/Paks/<folder>` directory, including `mods`, `~mods`, and author-named folders, while preserving the original folder in the candidate.
+- Upgrade additive update reports to schema v7 with semantic ESP-merge evidence, per-package composite migrations, optional dependency suppressions, and exact approved dependency-graph verification.
+- Structurally tested the complete conversion path with [Captain's Cutlass](https://www.nexusmods.com/oblivionremastered/mods/3966): the installed-master inventory merge, Unreal rebuild, package import graph, candidate verification, report, and archive all passed. In-game behavior remains unverified.
+
 ## 0.6.2 - 2026-08-14
 
 - Add `native-composite-package-rebase-v2`, which recovers missing Unreal package names from raw Zen NameMap data by verifying them against Unreal package IDs. Recovery is bounded, class-driven, and refuses ambiguous names or source candidates.

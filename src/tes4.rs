@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
 use flate2::read::ZlibDecoder;
+use flate2::{Compression, write::ZlibEncoder};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const COMPRESSED_RECORD: u32 = 0x0004_0000;
@@ -56,6 +57,7 @@ pub struct OverrideResult {
     pub compatible_with_current_master: bool,
     pub allowed_presentation_changes: Vec<String>,
     pub added_inventory_entries: Vec<AddedInventoryEntry>,
+    pub preserved_current_master_entries: Vec<AddedInventoryEntry>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -333,13 +335,27 @@ struct InventoryToken {
     extra_data: Vec<Vec<u8>>,
 }
 
-struct ContainerParts {
+struct InventoryRecordParts {
     non_inventory_tokens: Vec<Vec<u8>>,
     inventory: Vec<InventoryToken>,
     declared_inventory_count: Option<u32>,
 }
 
-fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<ContainerParts> {
+pub fn supports_additive_inventory_record(kind: &str) -> bool {
+    matches!(kind, "CONT" | "CREA" | "NPC_")
+}
+
+fn split_inventory_record(
+    record: &Record,
+    plugin_index: Option<u8>,
+) -> Result<InventoryRecordParts> {
+    if !supports_additive_inventory_record(&record.kind) {
+        bail!(
+            "{} 0x{:08X} is not a supported inventory-bearing record",
+            record.kind,
+            record.form_id
+        );
+    }
     let mut non_inventory_tokens = Vec::new();
     let mut inventory = Vec::new();
     let mut declared_inventory_count = None;
@@ -350,7 +366,8 @@ fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<C
             "COCT" => {
                 if declared_inventory_count.is_some() || subrecord.data.len() != 4 {
                     bail!(
-                        "CONT 0x{:08X} has an invalid or duplicate COCT subrecord",
+                        "{} 0x{:08X} has an invalid or duplicate COCT subrecord",
+                        record.kind,
                         record.form_id
                     );
                 }
@@ -360,7 +377,8 @@ fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<C
             "CNTO" => {
                 if subrecord.data.len() != 8 {
                     bail!(
-                        "CONT 0x{:08X} has a CNTO subrecord with {} bytes instead of 8",
+                        "{} 0x{:08X} has a CNTO subrecord with {} bytes instead of 8",
+                        record.kind,
                         record.form_id,
                         subrecord.data.len()
                     );
@@ -371,7 +389,8 @@ fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<C
                     && (item_form_id >> 24) as u8 > plugin_index
                 {
                     bail!(
-                        "CONT 0x{:08X} references inventory item 0x{item_form_id:08X} beyond plugin index {plugin_index}",
+                        "{} 0x{:08X} references inventory item 0x{item_form_id:08X} beyond plugin index {plugin_index}",
+                        record.kind,
                         record.form_id
                     );
                 }
@@ -389,7 +408,8 @@ fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<C
                 });
             }
             "COED" => bail!(
-                "CONT 0x{:08X} has an orphan COED inventory extension",
+                "{} 0x{:08X} has an orphan COED inventory extension",
+                record.kind,
                 record.form_id
             ),
             _ => non_inventory_tokens.push(token(subrecord)),
@@ -397,7 +417,7 @@ fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<C
         index += 1;
     }
     inventory.sort();
-    Ok(ContainerParts {
+    Ok(InventoryRecordParts {
         non_inventory_tokens,
         inventory,
         declared_inventory_count,
@@ -405,7 +425,7 @@ fn split_container_record(record: &Record, plugin_index: Option<u8>) -> Result<C
 }
 
 pub fn container_inventory_form_ids(record: &Record) -> Result<Vec<u32>> {
-    let mut ids = split_container_record(record, None)?
+    let mut ids = split_inventory_record(record, None)?
         .inventory
         .into_iter()
         .map(|entry| entry.item_form_id)
@@ -442,11 +462,66 @@ fn inventory_evidence(entries: &[InventoryToken]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
-fn tokens_without_presentation_fields(tokens: &[Vec<u8>]) -> Vec<&Vec<u8>> {
-    tokens
-        .iter()
-        .filter(|value| !value.starts_with(b"FULL:"))
-        .collect()
+#[derive(Debug, Eq, PartialEq)]
+struct FunctionalSemantics {
+    ordered_tokens: Vec<Vec<u8>>,
+    sorted_factions: Vec<Vec<u8>>,
+    sorted_spells: Vec<Vec<u8>>,
+    sorted_model_paths: Vec<Vec<u8>>,
+}
+
+fn normalized_model_paths(token: &[u8], record: &Record) -> Result<Vec<Vec<u8>>> {
+    let data = token.get(5..).unwrap_or_default();
+    if !data.is_empty() && !data.ends_with(&[0]) {
+        bail!(
+            "{} 0x{:08X} has a malformed NIFZ model list",
+            record.kind,
+            record.form_id
+        );
+    }
+    let mut paths = data
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| path.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn functional_semantics(record: &Record, tokens: &[Vec<u8>]) -> Result<FunctionalSemantics> {
+    let actor = matches!(record.kind.as_str(), "CREA" | "NPC_");
+    let mut semantics = FunctionalSemantics {
+        ordered_tokens: Vec::new(),
+        sorted_factions: Vec::new(),
+        sorted_spells: Vec::new(),
+        sorted_model_paths: Vec::new(),
+    };
+    for value in tokens {
+        if value.starts_with(b"FULL:") {
+            continue;
+        }
+        if actor && value.starts_with(b"SNAM:") {
+            semantics.sorted_factions.push(value.clone());
+        } else if actor && value.starts_with(b"SPLO:") {
+            semantics.sorted_spells.push(value.clone());
+        } else if record.kind == "CREA" && value.starts_with(b"NIFZ:") {
+            semantics
+                .sorted_model_paths
+                .extend(normalized_model_paths(value, record)?);
+        } else if record.kind == "CREA"
+            && value.starts_with(b"NIFT:")
+            && value.get(5..) == Some([0, 0, 0, 0].as_slice())
+        {
+            // TES4 represents an empty creature model-texture list both as an omitted NIFT and as
+            // a four-byte zero count. Treat only that exact empty encoding as equivalent.
+        } else {
+            semantics.ordered_tokens.push(value.clone());
+        }
+    }
+    semantics.sorted_factions.sort();
+    semantics.sorted_spells.sort();
+    semantics.sorted_model_paths.sort();
+    Ok(semantics)
 }
 
 fn presentation_tokens(tokens: &[Vec<u8>]) -> Vec<&Vec<u8>> {
@@ -471,14 +546,17 @@ fn token_evidence(tokens: &[Vec<u8>]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
-pub fn validate_container_addition(
+
+fn compare_inventory_record_fields(
     override_record: &Record,
     current: &Record,
     plugin_index: u8,
-) -> Result<OverrideResult> {
-    if override_record.kind != "CONT" || current.kind != "CONT" {
+) -> Result<(InventoryRecordParts, InventoryRecordParts, Vec<String>)> {
+    if !supports_additive_inventory_record(&override_record.kind)
+        || override_record.kind != current.kind
+    {
         bail!(
-            "only additive CONT master overrides are supported; 0x{:08X} is {}/{}",
+            "only matching additive inventory-bearing master overrides are supported; 0x{:08X} is {}/{}",
             override_record.form_id,
             override_record.kind,
             current.kind
@@ -486,21 +564,21 @@ pub fn validate_container_addition(
     }
     if override_record.form_id != current.form_id {
         bail!(
-            "CONT override identity mismatch: 0x{:08X} versus current 0x{:08X}",
+            "{} override identity mismatch: 0x{:08X} versus current 0x{:08X}",
+            override_record.kind,
             override_record.form_id,
             current.form_id
         );
     }
-    // Compare the container by meaning: authors may reorder inventory rows or retain an old
-    // display name, but every current item and every functional field still has to survive.
-    let override_parts = split_container_record(override_record, Some(plugin_index))?;
-    let current_parts = split_container_record(current, None)?;
+    let override_parts = split_inventory_record(override_record, Some(plugin_index))?;
+    let current_parts = split_inventory_record(current, None)?;
     if override_parts
         .declared_inventory_count
         .is_some_and(|value| value as usize != override_parts.inventory.len())
     {
         bail!(
-            "CONT override 0x{:08X} declares an inventory count that does not match its CNTO entries",
+            "{} override 0x{:08X} declares an inventory count that does not match its CNTO entries",
+            override_record.kind,
             override_record.form_id
         );
     }
@@ -509,18 +587,27 @@ pub fn validate_container_addition(
         .is_some_and(|value| value as usize != current_parts.inventory.len())
     {
         bail!(
-            "current CONT 0x{:08X} declares an inventory count that does not match its CNTO entries",
+            "current {} 0x{:08X} declares an inventory count that does not match its CNTO entries",
+            current.kind,
             current.form_id
         );
     }
-    if tokens_without_presentation_fields(&override_parts.non_inventory_tokens)
-        != tokens_without_presentation_fields(&current_parts.non_inventory_tokens)
+    if functional_semantics(override_record, &override_parts.non_inventory_tokens)?
+        != functional_semantics(current, &current_parts.non_inventory_tokens)?
     {
         bail!(
-            "CONT override 0x{:08X} changes functional non-inventory fields relative to the current Oblivion.esm (override [{}], current [{}])",
+            "{} override 0x{:08X} changes functional non-inventory fields relative to the current master (override [{}], current [{}])",
+            override_record.kind,
             override_record.form_id,
             token_evidence(&override_parts.non_inventory_tokens),
             token_evidence(&current_parts.non_inventory_tokens)
+        );
+    }
+    if override_record.flags & !COMPRESSED_RECORD != current.flags & !COMPRESSED_RECORD {
+        bail!(
+            "{} override 0x{:08X} changes record flags relative to the current master",
+            override_record.kind,
+            override_record.form_id
         );
     }
     let mut allowed_presentation_changes = Vec::new();
@@ -529,27 +616,48 @@ pub fn validate_container_addition(
     {
         allowed_presentation_changes.push("FULL".to_owned());
     }
+    Ok((override_parts, current_parts, allowed_presentation_changes))
+}
+
+fn reported_inventory_entry(entry: InventoryToken, plugin_index: u8) -> AddedInventoryEntry {
+    AddedInventoryEntry {
+        item_form_id: format!("0x{:08X}", entry.item_form_id),
+        count: entry.count,
+        reference_scope: if (entry.item_form_id >> 24) as u8 == plugin_index {
+            "plugin-owned"
+        } else {
+            "current-master"
+        }
+        .to_owned(),
+        reference_validated: false,
+    }
+}
+
+pub fn validate_inventory_addition(
+    override_record: &Record,
+    current: &Record,
+    plugin_index: u8,
+) -> Result<OverrideResult> {
+    // Compare inventory-bearing records by meaning: authors may reorder inventory rows or retain
+    // an old display name, but every current item and every functional field still has to survive.
+    let (override_parts, current_parts, allowed_presentation_changes) =
+        compare_inventory_record_fields(override_record, current, plugin_index)?;
     let additions = additions_against_current(
         &override_parts.inventory,
         &current_parts.inventory,
     )
     .with_context(|| {
         format!(
-            "CONT override 0x{:08X} removes or changes current-master inventory (override [{}], current [{}])",
-            override_record.form_id,
+            "{} override 0x{:08X} removes or changes current-master inventory (override [{}], current [{}])",
+            override_record.kind, override_record.form_id,
             inventory_evidence(&override_parts.inventory),
             inventory_evidence(&current_parts.inventory)
         )
     })?;
     if additions.is_empty() {
         bail!(
-            "CONT override 0x{:08X} has no inventory additions",
-            override_record.form_id
-        );
-    }
-    if override_record.flags & !COMPRESSED_RECORD != current.flags & !COMPRESSED_RECORD {
-        bail!(
-            "CONT override 0x{:08X} changes record flags relative to the current Oblivion.esm",
+            "{} override 0x{:08X} has no inventory additions",
+            override_record.kind,
             override_record.form_id
         );
     }
@@ -560,20 +668,249 @@ pub fn validate_container_addition(
         allowed_presentation_changes,
         added_inventory_entries: additions
             .into_iter()
-            .map(|entry| AddedInventoryEntry {
-                item_form_id: format!("0x{:08X}", entry.item_form_id),
-                count: entry.count,
-                reference_scope: if (entry.item_form_id >> 24) as u8 == plugin_index {
-                    "plugin-owned"
-                } else {
-                    "current-master"
-                }
-                .to_owned(),
-                reference_validated: false,
-            })
+            .map(|entry| reported_inventory_entry(entry, plugin_index))
             .collect(),
+        preserved_current_master_entries: Vec::new(),
     })
 }
+
+fn subrecord_from_token(value: &[u8]) -> Result<Subrecord> {
+    if value.len() < 5 || value[4] != b':' {
+        bail!("invalid inventory extension token");
+    }
+    Ok(Subrecord {
+        kind: String::from_utf8_lossy(&value[..4]).into_owned(),
+        data: value[5..].to_vec(),
+    })
+}
+
+fn inventory_subrecords(entry: &InventoryToken) -> Result<Vec<Subrecord>> {
+    let mut data = entry.item_form_id.to_le_bytes().to_vec();
+    data.extend_from_slice(&entry.count.to_le_bytes());
+    let mut rows = vec![Subrecord {
+        kind: "CNTO".to_owned(),
+        data,
+    }];
+    for extra in &entry.extra_data {
+        rows.push(subrecord_from_token(extra)?);
+    }
+    Ok(rows)
+}
+
+/// Produces a strict additive three-way merge. Functional fields and conflicting inventory rows
+/// still fail closed; exact rows added by a newer installed master are restored into the override.
+pub fn merge_inventory_addition(
+    override_record: &Record,
+    current: &Record,
+    plugin_index: u8,
+) -> Result<(Record, OverrideResult)> {
+    let (override_parts, current_parts, allowed_presentation_changes) =
+        compare_inventory_record_fields(override_record, current, plugin_index)?;
+    let mut remaining = override_parts.inventory.clone();
+    let mut missing_current = Vec::new();
+    for current_entry in &current_parts.inventory {
+        if let Some(index) = remaining
+            .iter()
+            .position(|candidate| candidate == current_entry)
+        {
+            remaining.remove(index);
+        } else if remaining
+            .iter()
+            .any(|candidate| candidate.item_form_id == current_entry.item_form_id)
+        {
+            bail!(
+                "{} override 0x{:08X} changes a current-master inventory row for 0x{:08X}",
+                override_record.kind,
+                override_record.form_id,
+                current_entry.item_form_id
+            );
+        } else {
+            missing_current.push(current_entry.clone());
+        }
+    }
+    if remaining.is_empty() {
+        bail!(
+            "{} override 0x{:08X} has no inventory additions",
+            override_record.kind,
+            override_record.form_id
+        );
+    }
+
+    let mut merged = override_record.clone();
+    if !missing_current.is_empty() {
+        let insertion = merged
+            .subrecords
+            .iter()
+            .rposition(|row| matches!(row.kind.as_str(), "CNTO" | "COED"))
+            .map(|index| index + 1)
+            .context("inventory override has no CNTO insertion anchor")?;
+        let mut restored_rows = Vec::new();
+        for entry in &missing_current {
+            restored_rows.extend(inventory_subrecords(entry)?);
+        }
+        merged
+            .subrecords
+            .splice(insertion..insertion, restored_rows);
+        if let Some(count) = merged.subrecords.iter_mut().find(|row| row.kind == "COCT") {
+            count.data = u32::try_from(override_parts.inventory.len() + missing_current.len())?
+                .to_le_bytes()
+                .to_vec();
+        }
+    }
+    // Re-validate the synthesized record with the stricter no-removal rule.
+    let mut result = validate_inventory_addition(&merged, current, plugin_index)?;
+    result.allowed_presentation_changes = allowed_presentation_changes;
+    result.preserved_current_master_entries = missing_current
+        .into_iter()
+        .map(|entry| reported_inventory_entry(entry, plugin_index))
+        .collect();
+    Ok((merged, result))
+}
+
+pub fn validate_container_addition(
+    override_record: &Record,
+    current: &Record,
+    plugin_index: u8,
+) -> Result<OverrideResult> {
+    validate_inventory_addition(override_record, current, plugin_index)
+}
+
+fn encode_subrecords(subrecords: &[Subrecord]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    for subrecord in subrecords {
+        let kind = subrecord.kind.as_bytes();
+        if kind.len() != 4 {
+            bail!("invalid TES4 subrecord type {}", subrecord.kind);
+        }
+        if subrecord.data.len() > u32::MAX as usize {
+            bail!("TES4 subrecord {} is too large", subrecord.kind);
+        }
+        if subrecord.data.len() > u16::MAX as usize {
+            output.extend_from_slice(b"XXXX");
+            output.extend_from_slice(&4_u16.to_le_bytes());
+            output.extend_from_slice(&(subrecord.data.len() as u32).to_le_bytes());
+        }
+        output.extend_from_slice(kind);
+        output
+            .extend_from_slice(&(subrecord.data.len().min(u16::MAX as usize) as u16).to_le_bytes());
+        output.extend_from_slice(&subrecord.data);
+    }
+    Ok(output)
+}
+
+fn encoded_record_payload(record: &Record) -> Result<Vec<u8>> {
+    let expanded = encode_subrecords(&record.subrecords)?;
+    if expanded.len() > MAX_EXPANDED_RECORD_BYTES {
+        bail!("rewritten TES4 record exceeds the expanded record safety limit");
+    }
+    if record.flags & COMPRESSED_RECORD == 0 {
+        return Ok(expanded);
+    }
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&expanded)?;
+    let compressed = encoder.finish()?;
+    let mut output = Vec::with_capacity(compressed.len() + 4);
+    output.extend_from_slice(&u32::try_from(expanded.len())?.to_le_bytes());
+    output.extend_from_slice(&compressed);
+    Ok(output)
+}
+
+fn rewrite_plugin_sequence(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    replacements: &HashMap<u32, Record>,
+    replaced: &mut HashSet<u32>,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut offset = start;
+    while offset < end {
+        if offset
+            .checked_add(20)
+            .is_none_or(|header_end| header_end > end)
+        {
+            bail!("TES4 rewrite encountered a truncated record header");
+        }
+        let header = &bytes[offset..offset + 20];
+        let kind = &header[..4];
+        let declared_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        if kind == b"GRUP" {
+            if declared_size < 20
+                || offset
+                    .checked_add(declared_size)
+                    .is_none_or(|group_end| group_end > end)
+            {
+                bail!("TES4 rewrite encountered an invalid GRUP");
+            }
+            let group_end = offset + declared_size;
+            let children =
+                rewrite_plugin_sequence(bytes, offset + 20, group_end, replacements, replaced)?;
+            let rebuilt_size = 20_usize
+                .checked_add(children.len())
+                .context("rewritten GRUP size overflow")?;
+            let mut rebuilt_header = header.to_vec();
+            rebuilt_header[4..8].copy_from_slice(&u32::try_from(rebuilt_size)?.to_le_bytes());
+            output.extend_from_slice(&rebuilt_header);
+            output.extend_from_slice(&children);
+            offset = group_end;
+            continue;
+        }
+        let record_end = offset
+            .checked_add(20)
+            .and_then(|value| value.checked_add(declared_size))
+            .context("TES4 record size overflow")?;
+        if record_end > end {
+            bail!("TES4 rewrite encountered a truncated record");
+        }
+        let form_id = u32::from_le_bytes(header[12..16].try_into().unwrap());
+        if let Some(record) = replacements.get(&form_id) {
+            if record.kind.as_bytes() != kind
+                || record.form_id != form_id
+                || record.flags != u32::from_le_bytes(header[8..12].try_into().unwrap())
+            {
+                bail!("TES4 replacement record identity or flags do not match the source");
+            }
+            if !replaced.insert(form_id) {
+                bail!("TES4 source contains a duplicate replacement FormID 0x{form_id:08X}");
+            }
+            let payload = encoded_record_payload(record)?;
+            let mut rebuilt_header = header.to_vec();
+            rebuilt_header[4..8].copy_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
+            output.extend_from_slice(&rebuilt_header);
+            output.extend_from_slice(&payload);
+        } else {
+            output.extend_from_slice(&bytes[offset..record_end]);
+        }
+        offset = record_end;
+    }
+    Ok(output)
+}
+
+/// Rewrites only explicitly supplied records, preserving every other record and GRUP header byte.
+pub fn rewrite_plugin_records(
+    bytes: &[u8],
+    replacements: &HashMap<u32, Record>,
+    source: &str,
+) -> Result<Vec<u8>> {
+    read_plugin_bytes(bytes, source)?;
+    let mut replaced = HashSet::new();
+    let output = rewrite_plugin_sequence(bytes, 0, bytes.len(), replacements, &mut replaced)?;
+    if replaced.len() != replacements.len() {
+        let mut missing = replacements
+            .keys()
+            .filter(|form_id| !replaced.contains(form_id))
+            .map(|form_id| format!("0x{form_id:08X}"))
+            .collect::<Vec<_>>();
+        missing.sort();
+        bail!(
+            "TES4 replacement records were not found: {}",
+            missing.join(", ")
+        );
+    }
+    read_plugin_bytes(&output, source).context("reparsing rewritten TES4 plugin")?;
+    Ok(output)
+}
+
 pub fn package_to_game_path(package: &str) -> Result<String> {
     let mut normalized = package.replace('\\', "/");
     for extension in [".uasset", ".umap"] {
@@ -581,8 +918,8 @@ pub fn package_to_game_path(package: &str) -> Result<String> {
             normalized.truncate(normalized.len() - extension.len());
         }
     }
-    if normalized.starts_with('/') {
-        let components = normalized[1..].split('/').collect::<Vec<_>>();
+    if let Some(mounted) = normalized.strip_prefix('/') {
+        let components = mounted.split('/').collect::<Vec<_>>();
         if normalized.starts_with("//")
             || components.len() < 2
             || components.iter().any(|component| {
@@ -731,8 +1068,12 @@ mod tests {
     }
 
     fn container(subrecords: Vec<Subrecord>) -> Record {
+        inventory_record("CONT", subrecords)
+    }
+
+    fn inventory_record(kind: &str, subrecords: Vec<Subrecord>) -> Record {
         Record {
-            kind: "CONT".to_owned(),
+            kind: kind.to_owned(),
             form_id: 0x0009_2285,
             flags: 0,
             subrecords,
@@ -766,6 +1107,134 @@ mod tests {
         assert!(result.added_inventory_entries.iter().any(|entry| {
             entry.item_form_id == "0x00020000" && entry.reference_scope == "current-master"
         }));
+    }
+
+    #[test]
+    fn accepts_field_aware_actor_inventory_additions() {
+        for kind in ["CREA", "NPC_"] {
+            let current = inventory_record(
+                kind,
+                vec![
+                    subrecord("EDID", b"InventoryOwner\0".to_vec()),
+                    inventory(0x0001_0000, 1),
+                ],
+            );
+            let override_record = inventory_record(
+                kind,
+                vec![
+                    subrecord("EDID", b"InventoryOwner\0".to_vec()),
+                    inventory(0x0001_0000, 1),
+                    inventory(0x0100_0800, 1),
+                ],
+            );
+            let result = validate_inventory_addition(&override_record, &current, 1).unwrap();
+            assert_eq!(result.kind, kind);
+            assert_eq!(result.added_inventory_entries.len(), 1);
+            assert_eq!(result.added_inventory_entries[0].item_form_id, "0x01000800");
+            assert_eq!(
+                result.added_inventory_entries[0].reference_scope,
+                "plugin-owned"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalizes_documented_actor_set_fields_without_hiding_changes() {
+        let current = inventory_record(
+            "CREA",
+            vec![
+                subrecord("EDID", b"InventoryOwner\0".to_vec()),
+                subrecord(
+                    "NIFZ",
+                    b"Creatures\\Skellie.NIF\0Creatures\\Skull.NIF\0".to_vec(),
+                ),
+                subrecord("SNAM", [1, 0, 0, 0, 0, 0, 0, 0]),
+                subrecord("SNAM", [2, 0, 0, 0, 1, 0, 0, 0]),
+                subrecord("SPLO", 0x0001_0001_u32.to_le_bytes()),
+                subrecord("SPLO", 0x0001_0002_u32.to_le_bytes()),
+                inventory(0x0001_0000, 1),
+            ],
+        );
+        let override_record = inventory_record(
+            "CREA",
+            vec![
+                subrecord("EDID", b"InventoryOwner\0".to_vec()),
+                subrecord(
+                    "NIFZ",
+                    b"creatures\\skull.nif\0creatures\\skellie.nif\0".to_vec(),
+                ),
+                subrecord("NIFT", [0, 0, 0, 0]),
+                subrecord("SNAM", [2, 0, 0, 0, 1, 0, 0, 0]),
+                subrecord("SNAM", [1, 0, 0, 0, 0, 0, 0, 0]),
+                subrecord("SPLO", 0x0001_0002_u32.to_le_bytes()),
+                subrecord("SPLO", 0x0001_0001_u32.to_le_bytes()),
+                inventory(0x0001_0000, 1),
+                inventory(0x0100_0800, 1),
+            ],
+        );
+        validate_inventory_addition(&override_record, &current, 1).unwrap();
+
+        let mut changed_model = override_record.clone();
+        changed_model
+            .subrecords
+            .iter_mut()
+            .find(|subrecord| subrecord.kind == "NIFZ")
+            .unwrap()
+            .data = b"creatures\\different.nif\0".to_vec();
+        assert!(validate_inventory_addition(&changed_model, &current, 1).is_err());
+
+        let mut nonempty_model_info = override_record.clone();
+        nonempty_model_info
+            .subrecords
+            .iter_mut()
+            .find(|subrecord| subrecord.kind == "NIFT")
+            .unwrap()
+            .data = [1, 0, 0, 0].to_vec();
+        assert!(validate_inventory_addition(&nonempty_model_info, &current, 1).is_err());
+    }
+
+    #[test]
+    fn merges_new_current_master_rows_without_accepting_conflicting_changes() {
+        let current = inventory_record(
+            "CREA",
+            vec![
+                subrecord("EDID", b"InventoryOwner\0".to_vec()),
+                inventory(0x0001_0000, 1),
+                inventory(0x0100_0100, 1),
+            ],
+        );
+        let old_override = inventory_record(
+            "CREA",
+            vec![
+                subrecord("EDID", b"InventoryOwner\0".to_vec()),
+                inventory(0x0001_0000, 1),
+                inventory(0x0200_0800, 1),
+            ],
+        );
+        let (merged, result) = merge_inventory_addition(&old_override, &current, 2).unwrap();
+        assert_eq!(result.added_inventory_entries.len(), 1);
+        assert_eq!(result.preserved_current_master_entries.len(), 1);
+        assert_eq!(
+            container_inventory_form_ids(&merged).unwrap(),
+            [0x0001_0000, 0x0100_0100, 0x0200_0800]
+        );
+        validate_inventory_addition(&merged, &current, 2).unwrap();
+
+        let mut conflict = old_override;
+        conflict.subrecords.insert(2, inventory(0x0100_0100, 2));
+        assert!(merge_inventory_addition(&conflict, &current, 2).is_err());
+    }
+
+    #[test]
+    fn refuses_inventory_semantics_for_unsupported_or_mismatched_record_types() {
+        let container = inventory_record("CONT", vec![inventory(0x0001_0000, 1)]);
+        let creature = inventory_record(
+            "CREA",
+            vec![inventory(0x0001_0000, 1), inventory(0x0100_0800, 1)],
+        );
+        assert!(validate_inventory_addition(&creature, &container, 1).is_err());
+        let weapon = inventory_record("WEAP", vec![inventory(0x0100_0800, 1)]);
+        assert!(validate_inventory_addition(&weapon, &weapon, 1).is_err());
     }
 
     #[test]

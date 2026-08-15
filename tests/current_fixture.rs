@@ -1,5 +1,10 @@
 use obr_mod_updater::engine::{UpdateRequest, run_update};
 use obr_mod_updater::replacement::probe_composite_package_input;
+use obr_mod_updater::tes4::{
+    merge_inventory_addition, read_plugin, read_plugin_bytes, read_target_records,
+    rewrite_plugin_records, validate_inventory_addition,
+};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[test]
@@ -51,15 +56,16 @@ fn updates_current_offhand_staves_fixture() {
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
     assert_eq!(report["implementation"], "native-rust");
-    assert_eq!(report["version"], 6);
-    assert_eq!(
-        report["fixApis"],
-        serde_json::json!([
-            "zen-dependency-trace-v1",
-            "zen-exact-dependency-extraction-v1",
-            "zen-dependency-preservation-v1"
-        ])
-    );
+    assert_eq!(report["version"], 7);
+    let fix_apis = report["fixApis"].as_array().unwrap();
+    for required in [
+        "tes4-plugin-byte-preservation-v1",
+        "tes4-syncmap-additive-contract-v2",
+        "zen-approved-dependency-migration-v1",
+        "zen-exact-dependency-extraction-v1",
+    ] {
+        assert!(fix_apis.iter().any(|value| value == required));
+    }
     assert_eq!(report["identity"]["espBytePreserved"], true);
     assert_eq!(report["unreal"]["targetPathCollisionCount"], 0);
     assert_eq!(
@@ -159,6 +165,161 @@ fn updates_current_composite_package_fixture() {
         report["verification"]["approvedExportPayloadMigrationPreserved"],
         true
     );
+}
+
+#[test]
+#[ignore = "requires an installed game and a local additive composite fixture"]
+fn updates_current_additive_composite_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-additive-syncmap-v1".to_owned(),
+            mod_input: required("OBR_TEST_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "additive composite update failed:\n{error:#}\n{}",
+            log.join("\n")
+        )
+    });
+    assert_eq!(outcome.adapter, "native-additive-syncmap-v1");
+    assert!(outcome.output_archive.is_file());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["structurallyVerified"], true);
+    assert_eq!(report["identity"]["espBytePreserved"], false);
+    assert_eq!(report["identity"]["espSemanticInventoryMerge"], true);
+    assert!(
+        report["identity"]["rewrittenOverrideCount"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        report["identity"]["optionalUnrealDependencySuppressionCount"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        report["fixApis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| { value == "optional-secondary-blueprint-component-suppression-v1" })
+    );
+    assert!(
+        report["unreal"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|container| {
+                container["optionalDependencySuppressions"]
+                    .as_array()
+                    .unwrap()
+            })
+            .count()
+            > 0
+    );
+    assert!(
+        report["unreal"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|container| container["packageMigrations"].as_array().unwrap())
+            .filter_map(|migration| migration["importRepair"]["policy"].as_str())
+            .any(|policy| policy == "single-resolved-dependency-public-export-rebase-v2")
+    );
+    assert_eq!(
+        report["verification"]["approvedCompositeDependencyMigration"],
+        true
+    );
+    assert!(
+        report["unreal"]["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|container| container["dependencyPreservation"]["preserved"] == true)
+    );
+}
+
+#[test]
+#[ignore = "requires a local inventory-addition plugin and its installed target master"]
+fn validates_current_inventory_master_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let plugin = read_plugin(&required("OBR_TEST_INVENTORY_PLUGIN")).unwrap();
+    let plugin_index = u8::try_from(plugin.masters.len()).unwrap();
+    let overrides = plugin
+        .records
+        .iter()
+        .filter(|record| (record.form_id >> 24) as u8 != plugin_index)
+        .collect::<Vec<_>>();
+    assert!(!overrides.is_empty());
+    let target_ids = overrides
+        .iter()
+        .map(|record| record.form_id)
+        .collect::<Vec<_>>();
+    let current = read_target_records(&required("OBR_TEST_INVENTORY_MASTER"), &target_ids).unwrap();
+    let mut replacements = HashMap::new();
+    let results = overrides
+        .into_iter()
+        .map(|record| {
+            let (merged, result) = merge_inventory_addition(
+                record,
+                current.get(&record.form_id).unwrap(),
+                plugin_index,
+            )
+            .unwrap();
+            replacements.insert(record.form_id, merged);
+            result
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        results
+            .iter()
+            .all(|result| result.compatible_with_current_master)
+    );
+    assert!(
+        results
+            .iter()
+            .flat_map(|result| &result.added_inventory_entries)
+            .any(|entry| entry.reference_scope == "plugin-owned")
+    );
+    assert!(
+        results
+            .iter()
+            .flat_map(|result| &result.preserved_current_master_entries)
+            .any(|entry| entry.reference_scope == "current-master")
+    );
+    let plugin_path = required("OBR_TEST_INVENTORY_PLUGIN");
+    let source = std::fs::read(&plugin_path).unwrap();
+    let rewritten =
+        rewrite_plugin_records(&source, &replacements, "inventory-fixture.esp").unwrap();
+    let reparsed = read_plugin_bytes(&rewritten, "inventory-fixture.esp").unwrap();
+    for record in reparsed
+        .records
+        .iter()
+        .filter(|record| replacements.contains_key(&record.form_id))
+    {
+        validate_inventory_addition(record, current.get(&record.form_id).unwrap(), plugin_index)
+            .unwrap();
+    }
 }
 
 #[test]

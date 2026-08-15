@@ -165,8 +165,26 @@ pub struct BlueprintAliasRoleEvidence {
     pub role: String,
     pub export_name: String,
     pub export_index: usize,
+    pub object_import_index: usize,
     pub serialized_reference_offset: usize,
     pub provenance: String,
+    pub policy: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionalBlueprintDependencySuppression {
+    pub asset: String,
+    pub target_package_id: u64,
+    pub target_package_path: String,
+    pub target_class: String,
+    pub role: String,
+    pub export_name: String,
+    pub serialized_reference_offset: usize,
+    pub removed_dependency_count: usize,
+    pub replacement_package_id: u64,
+    pub replacement_package_path: String,
+    pub target_imported_package_ids: Vec<u64>,
     pub policy: String,
 }
 
@@ -1100,38 +1118,61 @@ fn resolved_import(document: &Value, class_name: &str) -> Result<(String, String
     Ok(matches[0].clone())
 }
 
-fn package_key(path: &str) -> Result<String> {
+fn content_relative_package_path(path: &str) -> Result<String> {
     let normalized = path.replace('\\', "/");
-    let lower = normalized.to_ascii_lowercase();
-    let relative = if let Some(value) = lower.strip_prefix("/game/") {
-        value.to_owned()
+    let mut parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    while parts
+        .first()
+        .is_some_and(|part| matches!(*part, "." | ".."))
+    {
+        parts.remove(0);
+    }
+    if parts.iter().any(|part| matches!(*part, "." | "..")) {
+        bail!("package path contains unresolved traversal: {path}");
+    }
+    let relative = if parts
+        .first()
+        .is_some_and(|part| part.eq_ignore_ascii_case("Game"))
+    {
+        &parts[1..]
     } else {
-        let marker = "oblivionremastered/content/";
-        let offset = lower
-            .find(marker)
-            .with_context(|| format!("package path is outside game content: {path}"))?;
-        lower[offset + marker.len()..].to_owned()
+        let content_index = parts
+            .iter()
+            .position(|part| part.eq_ignore_ascii_case("Content"))
+            .with_context(|| format!("package path is outside a mounted Content root: {path}"))?;
+        if content_index != 1 {
+            bail!("package path has an unsupported mounted Content layout: {path}");
+        }
+        &parts[content_index + 1..]
     };
-    Ok(relative
-        .trim_end_matches(".uasset")
-        .trim_matches('/')
-        .to_owned())
+    if relative.is_empty() {
+        bail!("package path has no asset below its mounted root: {path}");
+    }
+    let mut relative = relative.join("/");
+    for extension in [".uasset", ".umap"] {
+        if relative
+            .get(relative.len().saturating_sub(extension.len())..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(extension))
+        {
+            relative.truncate(relative.len() - extension.len());
+            break;
+        }
+    }
+    if relative.is_empty() {
+        bail!("package path has no package name: {path}");
+    }
+    Ok(relative)
+}
+
+fn package_key(path: &str) -> Result<String> {
+    Ok(content_relative_package_path(path)?.to_ascii_lowercase())
 }
 
 fn game_package_path(path: &str) -> Result<String> {
-    let normalized = path.replace('\\', "/");
-    if normalized.to_ascii_lowercase().starts_with("/game/") {
-        return Ok(normalized.trim_end_matches(".uasset").to_owned());
-    }
-    let lower = normalized.to_ascii_lowercase();
-    let marker = "oblivionremastered/content/";
-    let offset = lower
-        .find(marker)
-        .with_context(|| format!("package path is outside game content: {path}"))?;
-    let suffix = normalized[offset + marker.len()..]
-        .trim_end_matches(".uasset")
-        .trim_matches('/');
-    Ok(format!("/Game/{suffix}"))
+    Ok(format!("/Game/{}", content_relative_package_path(path)?))
 }
 
 fn target_for_path(
@@ -1360,7 +1401,7 @@ fn serialized_material_slots(
         let Some(count) = little_i32(&bytes, offset - 4) else {
             continue;
         };
-        if count < 1 || count > MAX_MATERIALS {
+        if !(1..=MAX_MATERIALS).contains(&count) {
             continue;
         }
         let Some(end) = offset.checked_add(count as usize * MATERIAL_BYTES) else {
@@ -1865,10 +1906,15 @@ pub fn unresolved_package_store_dependencies(
                 })
         })
         .collect::<Result<Vec<_>>>()?;
-    if pairs.len() != missing.len() {
+    let unresolved_package_count = pairs
+        .iter()
+        .map(|(package_index, _)| *package_index)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let one_target_proves_all_placeholders = missing.len() == 1 && unresolved_package_count > 0;
+    if !one_target_proves_all_placeholders && unresolved_package_count != missing.len() {
         bail!(
-            "decoder exposes {} unresolved object import(s), but package-store comparison identifies {} missing resolved package identity/identities",
-            pairs.len(),
+            "decoder exposes {unresolved_package_count} unresolved package import(s), but package-store comparison identifies {} missing resolved package identity/identities",
             missing.len()
         );
     }
@@ -1892,7 +1938,7 @@ fn serialized_resolved_material_slots(document: &Value) -> Result<SerializedMate
         let Some(count) = little_i32(&bytes, offset - 4) else {
             continue;
         };
-        if count < 1 || count > MAX_MATERIALS {
+        if !(1..=MAX_MATERIALS).contains(&count) {
             continue;
         }
         let Some(end) = offset.checked_add(count as usize * MATERIAL_BYTES) else {
@@ -2483,9 +2529,7 @@ pub fn prove_blueprint_alias_role(
     tool.to_json(consumer_asset, &json_path)?;
     let document: Value = serde_json::from_slice(&fs::read(&json_path)?)?;
     validated_export_data(&document)?;
-    if !unresolved_import_pairs(&document)?.is_empty() {
-        bail!("Blueprint alias role proof requires a fully resolved consumer import table");
-    }
+    let unresolved_pairs = unresolved_import_pairs(&document)?;
     let imports = document
         .get("Imports")
         .and_then(Value::as_array)
@@ -2502,40 +2546,40 @@ pub fn prove_blueprint_alias_role(
         })
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    if package_indices.len() != 1 {
+    if package_indices.len() > 1 {
         bail!(
-            "Blueprint consumer must import the recovered package identity exactly once; found {}",
+            "Blueprint consumer imports the recovered package identity more than once; found {}",
             package_indices.len()
         );
     }
-    let package_outer = -i64::try_from(package_indices[0])? - 1;
-    let object_indices = imports
-        .iter()
-        .enumerate()
-        .filter(|(_, import)| {
-            import.get("OuterIndex").and_then(Value::as_i64) == Some(package_outer)
-        })
-        .filter(|(_, import)| {
-            import
-                .get("ClassName")
-                .and_then(Value::as_str)
-                .is_some_and(|class| class.eq_ignore_ascii_case(expected_class))
-        })
-        .filter(|(_, import)| {
-            import
-                .get("ObjectName")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(&target_object_name))
-        })
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    if object_indices.len() != 1 {
-        bail!(
-            "Blueprint consumer must import one {expected_class} public export from the recovered package; found {}",
-            object_indices.len()
-        );
-    }
-    let reference = (-i32::try_from(object_indices[0])? - 1).to_le_bytes();
+    let object_indices = if package_indices.len() == 1 {
+        let package_outer = -i64::try_from(package_indices[0])? - 1;
+        imports
+            .iter()
+            .enumerate()
+            .filter(|(_, import)| {
+                import.get("OuterIndex").and_then(Value::as_i64) == Some(package_outer)
+            })
+            .filter(|(_, import)| {
+                import
+                    .get("ClassName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|class| class.eq_ignore_ascii_case(expected_class))
+            })
+            .filter(|(_, import)| {
+                import
+                    .get("ObjectName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&target_object_name))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    } else {
+        unresolved_pairs
+            .iter()
+            .map(|(_, object)| *object)
+            .collect::<Vec<_>>()
+    };
     let (role, required_export_name) =
         if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
             ("blood-splatter-material", "bloodsplatter")
@@ -2549,36 +2593,45 @@ pub fn prove_blueprint_alias_role(
         .and_then(Value::as_array)
         .context("Blueprint consumer has no Exports")?;
     let mut matches = Vec::new();
-    let mut all_reference_count = 0_usize;
-    for (export_index, export) in exports.iter().enumerate() {
-        let Some(encoded) = export.get("Data").and_then(Value::as_str) else {
-            continue;
-        };
-        let bytes = BASE64.decode(encoded)?;
-        for offset in 0..bytes.len().saturating_sub(3) {
-            if bytes[offset..offset + 4] != reference {
+    for object_index in object_indices {
+        let reference = (-i32::try_from(object_index)? - 1).to_le_bytes();
+        let mut object_matches = Vec::new();
+        let mut all_reference_count = 0_usize;
+        for (export_index, export) in exports.iter().enumerate() {
+            let Some(encoded) = export.get("Data").and_then(Value::as_str) else {
                 continue;
-            }
-            all_reference_count += 1;
-            let export_name = export
-                .get("ObjectName")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if export_name
-                .to_ascii_lowercase()
-                .contains(required_export_name)
-            {
-                matches.push((export_index, export_name.to_owned(), offset));
+            };
+            let bytes = BASE64.decode(encoded)?;
+            for offset in 0..bytes.len().saturating_sub(3) {
+                if bytes[offset..offset + 4] != reference {
+                    continue;
+                }
+                all_reference_count += 1;
+                let export_name = export
+                    .get("ObjectName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if export_name
+                    .to_ascii_lowercase()
+                    .contains(required_export_name)
+                {
+                    object_matches.push((export_index, export_name.to_owned(), offset));
+                }
             }
         }
+        if all_reference_count == 1 && object_matches.len() == 1 {
+            let (export_index, export_name, offset) = object_matches.remove(0);
+            matches.push((object_index, export_index, export_name, offset));
+        }
     }
-    if all_reference_count != 1 || matches.len() != 1 {
+    if matches.len() != 1 {
         bail!(
-            "recovered {expected_class} import must occur exactly once in its serialized Blueprint role export; found {all_reference_count} total and {} role match(es)",
+            "recovered {expected_class} import must map to exactly one serialized Blueprint role reference; found {}",
             matches.len()
         );
     }
-    let (export_index, export_name, serialized_reference_offset) = matches.remove(0);
+    let (object_import_index, export_index, export_name, serialized_reference_offset) =
+        matches.remove(0);
     Ok(BlueprintAliasRoleEvidence {
         consumer: consumer_asset.display().to_string(),
         target_package_id,
@@ -2588,9 +2641,273 @@ pub fn prove_blueprint_alias_role(
         role: role.to_owned(),
         export_name,
         export_index,
+        object_import_index,
         serialized_reference_offset,
         provenance: "serialized-consumer-reference".to_owned(),
         policy: "blueprint-serialized-alias-role-proof-v1".to_owned(),
+    })
+}
+
+/// Retires one optional secondary Blueprint component dependency after its serialized role was
+/// proven. The dead import pair is rebound to an already-bundled dependency so the rebuilt package
+/// store no longer requires the absent package; the component property itself is explicitly null.
+pub fn suppress_optional_blueprint_dependency(
+    consumer_asset: &Path,
+    source_store: &PackageStoreEntry,
+    target_package: &PackageEntry,
+    replacement_package: &PackageEntry,
+    replacement_object_name: &str,
+    evidence: &BlueprintAliasRoleEvidence,
+    work: &Path,
+) -> Result<OptionalBlueprintDependencySuppression> {
+    if evidence.role != "scabbard-static-mesh"
+        || evidence.target_class != "StaticMesh"
+        || evidence.target_package_id != target_package.package_id
+    {
+        bail!("optional Blueprint suppression requires a proven secondary StaticMesh role");
+    }
+    fs::create_dir_all(work)?;
+    let tool = UAssetGuiTool::materialize()?;
+    let source_json = work.join("source.json");
+    let patched_json = work.join("patched.json");
+    let verify_json = work.join("verify.json");
+    let rebuilt_asset = work.join(
+        consumer_asset
+            .file_name()
+            .context("Blueprint consumer has no filename")?,
+    );
+    tool.to_json(consumer_asset, &source_json)?;
+    let mut document: Value = serde_json::from_slice(&fs::read(&source_json)?)?;
+    validated_export_data(&document)?;
+    let original_unresolved_pairs = unresolved_import_pairs(&document)?;
+    let original_resolved_package_ids = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("Blueprint consumer has no Imports")?
+        .iter()
+        .filter(|import| import.get("ClassName").and_then(Value::as_str) == Some("Package"))
+        .filter_map(|import| import.get("ObjectName").and_then(Value::as_str))
+        .filter(|name| {
+            name.get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Game/"))
+        })
+        .map(unreal_package_id)
+        .collect::<Result<BTreeSet<_>>>()?;
+
+    let target_path = game_package_path(&target_package.path)?;
+    let replacement_path = game_package_path(&replacement_package.path)?;
+    let calculated_replacement_id = unreal_package_id(&replacement_path)?;
+    if calculated_replacement_id != replacement_package.package_id {
+        bail!(
+            "optional Blueprint replacement path hashes to {calculated_replacement_id}, not replacement package ID {}",
+            replacement_package.package_id
+        );
+    }
+    let (package_index, object_index) = {
+        let imports = document
+            .get("Imports")
+            .and_then(Value::as_array)
+            .context("Blueprint consumer has no Imports")?;
+        let packages = imports
+            .iter()
+            .enumerate()
+            .filter(|(_, import)| {
+                import.get("ClassName").and_then(Value::as_str) == Some("Package")
+            })
+            .filter(|(_, import)| {
+                import
+                    .get("ObjectName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&target_path))
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if packages.len() == 1 {
+            let outer = -i64::try_from(packages[0])? - 1;
+            let objects = imports
+                .iter()
+                .enumerate()
+                .filter(|(_, import)| {
+                    import.get("OuterIndex").and_then(Value::as_i64) == Some(outer)
+                })
+                .filter(|(_, import)| {
+                    import
+                        .get("ClassName")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("StaticMesh"))
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if objects != [evidence.object_import_index] {
+                bail!("optional Blueprint resolved target object identity changed");
+            }
+            (packages[0], objects[0])
+        } else if packages.is_empty() {
+            let pairs = original_unresolved_pairs
+                .iter()
+                .filter(|(_, object)| *object == evidence.object_import_index)
+                .copied()
+                .collect::<Vec<_>>();
+            if pairs.len() != 1 {
+                bail!("optional Blueprint unresolved role has no unique import pair");
+            }
+            pairs[0]
+        } else {
+            bail!("optional Blueprint target package occurs more than once");
+        }
+    };
+    let reference = -i32::try_from(object_index)? - 1;
+    let reference_bytes = reference.to_le_bytes();
+    let exports = document
+        .get("Exports")
+        .and_then(Value::as_array)
+        .context("Blueprint consumer has no Exports")?;
+    let total_references = exports
+        .iter()
+        .filter_map(|export| export.get("Data").and_then(Value::as_str))
+        .map(|encoded| BASE64.decode(encoded))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .map(|bytes| {
+            bytes
+                .windows(4)
+                .filter(|window| *window == reference_bytes)
+                .count()
+        })
+        .sum::<usize>();
+    if total_references != 1 {
+        bail!("optional Blueprint import must have exactly one serialized reference");
+    }
+
+    let export = document
+        .get_mut("Exports")
+        .and_then(Value::as_array_mut)
+        .and_then(|exports| exports.get_mut(evidence.export_index))
+        .context("optional Blueprint role export index is unavailable")?;
+    if export.get("ObjectName").and_then(Value::as_str) != Some(evidence.export_name.as_str()) {
+        bail!("optional Blueprint role export identity changed");
+    }
+    let mut bytes = BASE64.decode(
+        export
+            .get("Data")
+            .and_then(Value::as_str)
+            .context("optional Blueprint role export has no raw Data")?,
+    )?;
+    let offset = evidence.serialized_reference_offset;
+    if bytes.get(offset..offset + 4) != Some(reference_bytes.as_slice()) {
+        bail!("optional Blueprint serialized role reference moved");
+    }
+    bytes[offset..offset + 4].copy_from_slice(&0_i32.to_le_bytes());
+    export["Data"] = Value::String(BASE64.encode(&bytes));
+    let mut removed_dependency_count = 0_usize;
+    for key in [
+        "CreateBeforeSerializationDependencies",
+        "SerializationBeforeCreateDependencies",
+        "CreateBeforeCreateDependencies",
+        "SerializationBeforeSerializationDependencies",
+    ] {
+        if let Some(dependencies) = export.get_mut(key).and_then(Value::as_array_mut) {
+            let before = dependencies.len();
+            dependencies.retain(|value| value.as_i64() != Some(i64::from(reference)));
+            removed_dependency_count += before - dependencies.len();
+        }
+    }
+    if removed_dependency_count == 0 {
+        bail!("optional Blueprint serialized role has no matching dependency edge");
+    }
+    {
+        let imports = document
+            .get_mut("Imports")
+            .and_then(Value::as_array_mut)
+            .context("Blueprint consumer Imports is not mutable")?;
+        imports[package_index]["ObjectName"] = Value::String(replacement_path.clone());
+        imports[object_index]["ObjectName"] = Value::String(replacement_object_name.to_owned());
+        imports[object_index]["ClassPackage"] = Value::String("/Script/Engine".to_owned());
+        imports[object_index]["ClassName"] = Value::String("StaticMesh".to_owned());
+    }
+    let replacement_target = ImportTarget {
+        package_id: replacement_package.package_id,
+        package_path: replacement_path.clone(),
+        object_name: replacement_object_name.to_owned(),
+        class_name: "StaticMesh".to_owned(),
+    };
+    add_import_names(&mut document, std::slice::from_ref(&replacement_target))?;
+    let intended_exports = validated_export_data(&document)?;
+    fs::write(&patched_json, serde_json::to_vec(&document)?)?;
+    tool.import_json(&patched_json, &rebuilt_asset)?;
+    tool.to_json(&rebuilt_asset, &verify_json)?;
+    let verified: Value = serde_json::from_slice(&fs::read(&verify_json)?)?;
+    let expected_unresolved_pairs = original_unresolved_pairs
+        .into_iter()
+        .filter(|pair| *pair != (package_index, object_index))
+        .collect::<Vec<_>>();
+    if validated_export_data(&verified)? != intended_exports
+        || unresolved_import_pairs(&verified)? != expected_unresolved_pairs
+    {
+        bail!("optional Blueprint suppression did not survive UAsset rebuild");
+    }
+    if verified
+        .get("Imports")
+        .and_then(Value::as_array)
+        .is_some_and(|imports| {
+            imports.iter().any(|import| {
+                import
+                    .get("ObjectName")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&target_path))
+            })
+        })
+    {
+        bail!("optional Blueprint suppression retained the absent package identity");
+    }
+    let verified_resolved_package_ids = verified
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("rebuilt Blueprint consumer has no Imports")?
+        .iter()
+        .filter(|import| import.get("ClassName").and_then(Value::as_str) == Some("Package"))
+        .filter_map(|import| import.get("ObjectName").and_then(Value::as_str))
+        .filter(|name| {
+            name.get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("/Game/"))
+        })
+        .map(unreal_package_id)
+        .collect::<Result<BTreeSet<_>>>()?;
+    let mut intended_resolved_package_ids = original_resolved_package_ids;
+    intended_resolved_package_ids.remove(&target_package.package_id);
+    intended_resolved_package_ids.insert(replacement_package.package_id);
+    if verified_resolved_package_ids != intended_resolved_package_ids {
+        bail!("optional Blueprint suppression changed unrelated resolved package imports");
+    }
+    let mut target_imported_package_ids = source_store
+        .imported_package_ids
+        .iter()
+        .copied()
+        .filter(|package_id| *package_id != target_package.package_id)
+        .collect::<BTreeSet<_>>();
+    target_imported_package_ids.insert(replacement_package.package_id);
+    for extension in ["uasset", "uexp", "ubulk", "uptnl"] {
+        let rebuilt = rebuilt_asset.with_extension(extension);
+        let destination = consumer_asset.with_extension(extension);
+        if rebuilt.is_file() {
+            fs::copy(rebuilt, destination)?;
+        } else if destination.is_file() {
+            bail!("optional Blueprint suppression dropped an authored sidecar");
+        }
+    }
+    Ok(OptionalBlueprintDependencySuppression {
+        asset: consumer_asset.to_string_lossy().replace('\\', "/"),
+        target_package_id: target_package.package_id,
+        target_package_path: target_path,
+        target_class: "StaticMesh".to_owned(),
+        role: evidence.role.clone(),
+        export_name: evidence.export_name.clone(),
+        serialized_reference_offset: offset,
+        removed_dependency_count,
+        replacement_package_id: replacement_package.package_id,
+        replacement_package_path: replacement_path,
+        target_imported_package_ids: target_imported_package_ids.into_iter().collect(),
+        policy: "optional-secondary-blueprint-component-suppression-v1".to_owned(),
     })
 }
 
@@ -2943,8 +3260,12 @@ pub fn repair_single_external_import(
     let dependency_document: Value = serde_json::from_slice(&fs::read(&dependency_json)?)?;
     let original_exports = validated_export_data(&document)?;
     let pairs = unresolved_import_pairs(&document)?;
-    if pairs.len() != 1 {
-        bail!("single external import repair requires exactly one unresolved object import");
+    let package_indices = pairs
+        .iter()
+        .map(|(package_index, _)| *package_index)
+        .collect::<BTreeSet<_>>();
+    if package_indices.is_empty() || pairs.is_empty() {
+        bail!("single external package repair requires unresolved package imports");
     }
     let dependency_exports = dependency_document
         .get("Exports")
@@ -2984,11 +3305,14 @@ pub fn repair_single_external_import(
             .get_mut("Imports")
             .and_then(Value::as_array_mut)
             .context("source package Imports is not an array")?;
-        let (package_index, object_index) = pairs[0];
-        imports[package_index]["ObjectName"] = Value::String(target.package_path.clone());
-        imports[object_index]["ObjectName"] = Value::String(target.object_name.clone());
-        imports[object_index]["ClassPackage"] = Value::String("/Script/Engine".to_owned());
-        imports[object_index]["ClassName"] = Value::String(target.class_name.clone());
+        for package_index in &package_indices {
+            imports[*package_index]["ObjectName"] = Value::String(target.package_path.clone());
+        }
+        for (_, object_index) in &pairs {
+            imports[*object_index]["ObjectName"] = Value::String(target.object_name.clone());
+            imports[*object_index]["ClassPackage"] = Value::String("/Script/Engine".to_owned());
+            imports[*object_index]["ClassName"] = Value::String(target.class_name.clone());
+        }
     }
     add_import_names(&mut document, std::slice::from_ref(&target))?;
     let intended_exports = validated_export_data(&document)?;
@@ -3028,7 +3352,7 @@ pub fn repair_single_external_import(
         asset: asset.to_string_lossy().replace('\\', "/"),
         package_id: source_store.package_id,
         asset_kind: "single-external-import".to_owned(),
-        repaired_import_count: 1,
+        repaired_import_count: pairs.len(),
         repaired_targets: vec![target.package_path],
         retired_physics_asset: false,
         stale_create_dependencies_removed: 0,
@@ -3037,7 +3361,7 @@ pub fn repair_single_external_import(
         target_imported_package_ids,
         exports_byte_identical,
         uexp_byte_identical,
-        policy: "single-resolved-current-dependency-public-export-rebase-v1".to_owned(),
+        policy: "single-resolved-dependency-public-export-rebase-v2".to_owned(),
     })
 }
 
@@ -3992,6 +4316,25 @@ pub fn verify_preserved_export_payloads(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn maps_valid_project_content_roots_to_game_packages() {
+        assert_eq!(
+            game_package_path("../../../ExampleProject/Content/Items/SM_Item.uasset").unwrap(),
+            "/Game/Items/SM_Item"
+        );
+        assert_eq!(
+            game_package_path("OblivionRemastered\\Content\\Items\\BP_Item.umap").unwrap(),
+            "/Game/Items/BP_Item"
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_or_traversing_content_roots() {
+        assert!(game_package_path("Content/Items/SM_Item.uasset").is_err());
+        assert!(game_package_path("Project/Content/Items/../Secrets/SM_Item.uasset").is_err());
+        assert!(game_package_path("A/B/Content/Items/SM_Item.uasset").is_err());
+    }
 
     fn fixture(path: &Path, duplicate_anchor: bool, payload_bytes: usize) -> Value {
         let mut data = vec![0xAA; 11];

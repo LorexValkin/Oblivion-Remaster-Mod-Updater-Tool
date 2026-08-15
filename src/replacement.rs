@@ -10,6 +10,7 @@ use crate::uasset::{
     inspect_static_mesh_asset, inspect_texture_asset, prove_blueprint_alias_role,
     repair_composite_skeletal_mesh_imports, repair_current_template_imports,
     repair_legacy_body_setups, repair_single_external_import, repair_static_mesh_imports,
+    suppress_optional_blueprint_dependency, unresolved_package_store_dependencies,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -75,6 +76,18 @@ pub struct CompositeIdentityAliasPlan {
     pub role: BlueprintAliasRoleEvidence,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositeOptionalDependencySuppressionPlan {
+    pub consumer_package_id: u64,
+    pub consumer_package_path: String,
+    pub temporary_source_package: PackageEntry,
+    pub target_package: PackageEntry,
+    pub expected_class: String,
+    pub temporary_identity: PackageIdentityAlias,
+    pub role: BlueprintAliasRoleEvidence,
+}
+
 #[derive(Clone, Debug)]
 pub struct CompositeIdentityRecovery {
     pub provider_name: String,
@@ -84,6 +97,7 @@ pub struct CompositeIdentityRecovery {
     pub legacy_root: PathBuf,
     pub relative_utoc: PathBuf,
     pub aliases: Vec<CompositeIdentityAliasPlan>,
+    pub suppressions: Vec<CompositeOptionalDependencySuppressionPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -812,6 +826,33 @@ fn discover_containers(
         });
     }
     Ok(containers)
+}
+
+fn unique_container_parent(root: &Path) -> Result<PathBuf> {
+    let mut parents = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("utoc"))
+        })
+        .filter_map(|entry| entry.path().parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+    if parents.len() != 1 {
+        bail!(
+            "composite input requires every container triple in one physical folder; found {} folders",
+            parents.len()
+        );
+    }
+    Ok(parents.remove(0))
 }
 
 fn inspect_staged_for_scope(
@@ -1590,15 +1631,21 @@ pub(crate) fn composite_effective_package_path(
 
 fn mounted_game_package_name(path: &str) -> Result<String> {
     let canonical = canonical_additive_static_mesh_path(path)?;
-    let content = canonical
-        .get("OblivionRemastered/Content/".len()..)
-        .context("canonical package path has no game Content suffix")?;
+    let parts = canonical.split('/').collect::<Vec<_>>();
+    let content_index = parts
+        .iter()
+        .position(|part| part.eq_ignore_ascii_case("Content"))
+        .context("canonical package path has no mounted Content root")?;
+    if content_index != 1 || content_index + 1 >= parts.len() {
+        bail!("canonical package path has an unsupported mounted Content layout");
+    }
+    let content = parts[content_index + 1..].join("/");
     Ok(format!(
         "/Game/{}",
         content
             .strip_suffix(".uasset")
             .or_else(|| content.strip_suffix(".umap"))
-            .unwrap_or(content)
+            .unwrap_or(&content)
     ))
 }
 
@@ -1739,16 +1786,51 @@ fn composite_alias_candidate(
     Ok(candidates.into_iter().next().unwrap())
 }
 
+fn composite_primary_static_mesh_candidate(
+    consumer: &PackageStoreEntry,
+    source_store: &HashMap<u64, PackageStoreEntry>,
+    source_packages: &HashMap<u64, PackageEntry>,
+) -> Result<PackageEntry> {
+    let mut candidates = consumer
+        .imported_package_ids
+        .iter()
+        .filter_map(|package_id| source_store.get(package_id))
+        .filter(|entry| {
+            package_leaf_without_extension(&entry.path)
+                .get(..3)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
+        })
+        .filter_map(|entry| source_packages.get(&entry.package_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|package| package.package_id);
+    candidates.dedup_by_key(|package| package.package_id);
+    if candidates.len() != 1 {
+        bail!(
+            "optional secondary StaticMesh recovery requires exactly one bundled primary StaticMesh; found {}",
+            candidates.len()
+        );
+    }
+    Ok(candidates.remove(0))
+}
+
 fn authoritative_alias_source_identity(
     source_candidate: &PackageEntry,
     inspection: &ReplacementInspection,
     retoc: &RetocTool,
     work: &Path,
 ) -> Result<PackageEntry> {
-    if unreal_package_id(&source_candidate.path)
-        .is_ok_and(|package_id| package_id == source_candidate.package_id)
+    if let Ok(canonical) = canonical_additive_static_mesh_path(&source_candidate.path)
+        && canonical
+            .get(.."OblivionRemastered/Content/".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("OblivionRemastered/Content/"))
+        && unreal_package_id(&canonical)
+            .is_ok_and(|package_id| package_id == source_candidate.package_id)
     {
-        return Ok(source_candidate.clone());
+        return Ok(PackageEntry {
+            package_id: source_candidate.package_id,
+            path: canonical,
+        });
     }
     let container = inspection
         .containers
@@ -1823,8 +1905,8 @@ pub fn recover_composite_package_identities(
     let alias_legacy = work.join("legacy");
     fs::create_dir_all(&alias_legacy)?;
     let mut recovered_targets =
-        HashMap::<u64, (String, String, PackageEntry, PackageIdentityAlias)>::new();
-    let mut pending = Vec::<(u64, u64, String, String, PackageEntry)>::new();
+        HashMap::<u64, (String, String, PackageEntry, PackageIdentityAlias, bool)>::new();
+    let mut pending = Vec::<(u64, u64, String, String, PackageEntry, bool)>::new();
     for (consumer_id, target_id) in missing_edges {
         let consumer = source_store
             .get(&consumer_id)
@@ -1868,18 +1950,27 @@ pub fn recover_composite_package_identities(
         } else {
             bail!("recovered dependency {target_name} has no supported structural alias class");
         };
-        let source_candidate = composite_alias_candidate(
+        let (source_candidate, suppress_optional_component) = match composite_alias_candidate(
             consumer,
             &target_name,
             expected_class,
             &source_store,
             &source_packages,
-        )?;
-        if let Some((known_name, known_class, known_source, _)) = recovered_targets.get(&target_id)
+        ) {
+            Ok(candidate) => (candidate, false),
+            Err(_) if expected_class.eq_ignore_ascii_case("StaticMesh") => (
+                composite_primary_static_mesh_candidate(consumer, &source_store, &source_packages)?,
+                true,
+            ),
+            Err(error) => return Err(error),
+        };
+        if let Some((known_name, known_class, known_source, _, known_suppression)) =
+            recovered_targets.get(&target_id)
         {
             if !known_name.eq_ignore_ascii_case(&target_name)
                 || !known_class.eq_ignore_ascii_case(expected_class)
                 || known_source.package_id != source_candidate.package_id
+                || *known_suppression != suppress_optional_component
             {
                 bail!("multiple consumers disagree on recovered package identity {target_id}");
             }
@@ -1937,6 +2028,7 @@ pub fn recover_composite_package_identities(
                     expected_class.to_owned(),
                     source_candidate.clone(),
                     identity,
+                    suppress_optional_component,
                 ),
             );
         }
@@ -1946,6 +2038,7 @@ pub fn recover_composite_package_identities(
             target_name,
             expected_class.to_owned(),
             source_candidate,
+            suppress_optional_component,
         ));
     }
 
@@ -1997,7 +2090,16 @@ pub fn recover_composite_package_identities(
     }
 
     let mut aliases = Vec::new();
-    for (consumer_id, target_id, target_name, expected_class, source_candidate) in pending {
+    let mut suppressions = Vec::new();
+    for (
+        consumer_id,
+        target_id,
+        target_name,
+        expected_class,
+        source_candidate,
+        suppress_optional_component,
+    ) in pending
+    {
         let consumer_package = source_packages
             .get(&consumer_id)
             .context("identity recovery lost its consumer package")?;
@@ -2024,18 +2126,34 @@ pub fn recover_composite_package_identities(
             .context("identity recovery lost its alias report")?
             .3
             .clone();
-        aliases.push(CompositeIdentityAliasPlan {
-            consumer_package_id: consumer_id,
-            consumer_package_path: consumer_package.path.clone(),
-            source_package: source_candidate,
-            target_package: PackageEntry {
-                package_id: target_id,
-                path: mounted_game_legacy_path(&target_name)?,
-            },
-            expected_class,
-            identity,
-            role,
-        });
+        let target_package = PackageEntry {
+            package_id: target_id,
+            path: mounted_game_legacy_path(&target_name)?,
+        };
+        if suppress_optional_component {
+            if role.role != "scabbard-static-mesh" {
+                bail!("optional StaticMesh fallback did not prove a secondary scabbard role");
+            }
+            suppressions.push(CompositeOptionalDependencySuppressionPlan {
+                consumer_package_id: consumer_id,
+                consumer_package_path: consumer_package.path.clone(),
+                temporary_source_package: source_candidate,
+                target_package,
+                expected_class,
+                temporary_identity: identity,
+                role,
+            });
+        } else {
+            aliases.push(CompositeIdentityAliasPlan {
+                consumer_package_id: consumer_id,
+                consumer_package_path: consumer_package.path.clone(),
+                source_package: source_candidate,
+                target_package,
+                expected_class,
+                identity,
+                role,
+            });
+        }
     }
     aliases.sort_by(|left, right| {
         left.target_package
@@ -2043,6 +2161,17 @@ pub fn recover_composite_package_identities(
             .cmp(&right.target_package.package_id)
             .then(left.consumer_package_id.cmp(&right.consumer_package_id))
     });
+    suppressions.sort_by(|left, right| {
+        left.target_package
+            .package_id
+            .cmp(&right.target_package.package_id)
+            .then(left.consumer_package_id.cmp(&right.consumer_package_id))
+    });
+    if !aliases.is_empty() && !suppressions.is_empty() {
+        bail!(
+            "mixed persistent aliases and temporary optional-component providers require separate provider containers"
+        );
+    }
     let first_container = inspection
         .containers
         .first()
@@ -2060,6 +2189,7 @@ pub fn recover_composite_package_identities(
         legacy_root: alias_legacy,
         relative_utoc,
         aliases,
+        suppressions,
     }))
 }
 pub fn probe_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
@@ -2881,8 +3011,9 @@ pub fn probe_composite_package_input(
     let staged = work.path().join("source");
     let legacy = work.path().join("legacy");
     stage_input(mod_input, &staged)?;
+    let container_root = unique_container_parent(&staged)?;
     let retoc = RetocTool::materialize()?;
-    let inspection = inspect_composite_package_staged(&staged, game_root, &retoc)?;
+    let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
     for package in &inspection.packages {
         let effective = composite_effective_package_path(package, &inspection)?;
         canonical_additive_static_mesh_path(&effective).with_context(|| {
@@ -2943,6 +3074,11 @@ pub fn probe_composite_package_input(
                 .entry(alias.target_package.package_id)
                 .or_insert_with(|| alias.target_package.clone());
         }
+        for suppression in &recovery.suppressions {
+            available_dependencies
+                .entry(suppression.target_package.package_id)
+                .or_insert_with(|| suppression.target_package.clone());
+        }
     }
     let source_ids = inspection
         .packages
@@ -2975,7 +3111,34 @@ pub fn probe_composite_package_input(
         let store = source_store
             .get(&package.package_id)
             .context("composite source package store lost a package")?;
-        let missing_store_dependencies = store
+        let mut effective_store = (*store).clone();
+        if let Some(recovery) = &identity_recovery {
+            let suppressions = recovery
+                .suppressions
+                .iter()
+                .filter(|suppression| suppression.consumer_package_id == package.package_id)
+                .collect::<Vec<_>>();
+            if suppressions.len() > 1 {
+                bail!("one Blueprint package requires multiple optional dependency suppressions");
+            }
+            if let Some(suppression) = suppressions.first() {
+                let replacement = PackageEntry {
+                    package_id: suppression.temporary_source_package.package_id,
+                    path: suppression.temporary_identity.source_package_path.clone(),
+                };
+                let result = suppress_optional_blueprint_dependency(
+                    &asset,
+                    store,
+                    &suppression.target_package,
+                    &replacement,
+                    &suppression.temporary_identity.source_object_name,
+                    &suppression.role,
+                    &package_work.join("optional-component-suppression"),
+                )?;
+                effective_store.imported_package_ids = result.target_imported_package_ids;
+            }
+        }
+        let missing_store_dependencies = effective_store
             .imported_package_ids
             .iter()
             .filter(|dependency| !available_dependencies.contains_key(dependency))
@@ -3130,6 +3293,38 @@ pub fn probe_composite_package_input(
                 *kinds.entry("resolved-authored-package").or_default() += 1;
                 if missing_store_dependencies != 0 {
                     bail!("authored package retains unresolved package-store dependencies");
+                }
+                if unresolved != 0 {
+                    let targets = unresolved_package_store_dependencies(
+                        &asset,
+                        &effective_store,
+                        &available_dependencies,
+                        &package_work.join("unresolved-package-store"),
+                    )?;
+                    if targets.len() != 1 {
+                        bail!(
+                            "authored package decoder repair requires exactly one package-store-proven target; found {}",
+                            targets.len()
+                        );
+                    }
+                    let target = &targets[0];
+                    let donor_root = package_work.join("resolved-dependency");
+                    extract_composite_packages_exact(
+                        &retoc,
+                        source_view.path(),
+                        &donor_root,
+                        &[(target.clone(), target.path.clone())],
+                        "authored package dependency extraction",
+                    )?;
+                    let donor = find_extracted_additive_static_mesh(&donor_root, &target.path)?;
+                    repair_single_external_import(
+                        &asset,
+                        &donor,
+                        target,
+                        &effective_store,
+                        &available_dependencies,
+                        &package_work.join("repair"),
+                    )?;
                 }
             }
             CompositePackageAssetKind::CurrentTemplatePackage => {
@@ -3309,6 +3504,16 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_any_valid_project_content_root_to_game_mount() {
+        assert_eq!(
+            mounted_game_package_name("../../../ExampleProject/Content/Items/SM_Item.uasset")
+                .unwrap(),
+            "/Game/Items/SM_Item"
+        );
+        assert!(mounted_game_package_name("A/B/Content/Items/SM_Item.uasset").is_err());
+    }
 
     fn store(package_id: u64, path: &str, imported_package_ids: &[u64]) -> PackageStoreEntry {
         PackageStoreEntry {

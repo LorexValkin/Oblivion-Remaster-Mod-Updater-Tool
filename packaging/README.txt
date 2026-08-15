@@ -1,4 +1,4 @@
-OBLIVION REMASTER MOD UPDATER v0.6.1
+OBLIVION REMASTER MOD UPDATER v0.6.3
 EXPERIMENTAL TEST RELEASE
 
 Made by Lorex_
@@ -15,7 +15,7 @@ Current guarded lanes include selected additive SyncMap equipment mods, armor
 and clothing replacements, StaticMesh and Texture2D replacements, mixed armor
 sets, and composite package sets whose decoded classes, identities, current
 templates, serialized reference roles, and dependency closure can all be
-proven. Unsupported Blueprints, missing authored packages, ambiguous imports,
+proven. Unproven Blueprints, missing required authored packages, ambiguous imports,
 plugin semantics, cloth, and shader closures remain report-only.
 
 BEFORE YOU START

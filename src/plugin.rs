@@ -1,8 +1,8 @@
 use crate::archive::{MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions, sha256_bytes};
 use crate::tes4::{
-    COMPRESSED_RECORD, DELETED_RECORD, LIGHT_PLUGIN, MASTER_FILE, Plugin,
-    container_inventory_form_ids, package_to_game_path, read_plugin_bytes, read_sync_map_bytes,
-    read_target_records, validate_container_addition,
+    COMPRESSED_RECORD, DELETED_RECORD, LIGHT_PLUGIN, MASTER_FILE, Plugin, Record,
+    merge_inventory_addition, package_to_game_path, read_plugin_bytes, read_sync_map_bytes,
+    supports_additive_inventory_record,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -14,12 +14,13 @@ use walkdir::WalkDir;
 
 pub const PLUGIN_MANIFEST_API: &str = "tes4-plugin-manifest-v1";
 pub const PLUGIN_PRESERVATION_API: &str = "tes4-plugin-byte-preservation-v1";
-pub const ADDITIVE_PLUGIN_POLICY: &str = "tes4-additive-syncmap-policy-v1";
+pub const PLUGIN_SEMANTIC_REWRITE_API: &str = "tes4-inventory-semantic-rewrite-v1";
+pub const ADDITIVE_PLUGIN_POLICY: &str = "tes4-additive-syncmap-policy-v2";
 const MIN_FULL_PLUGIN_LOCAL_ID: u32 = 0x800;
 const MAX_PLUGIN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SELECTED_METADATA_BYTES: u64 = 512 * 1024 * 1024;
 const PLUGIN_METADATA_EXTENSIONS: &[&str] = &["esp", "esm", "esl", "ini"];
-pub const ADDITIVE_CONTRACT_API: &str = "tes4-syncmap-additive-contract-v1";
+pub const ADDITIVE_CONTRACT_API: &str = "tes4-syncmap-additive-contract-v2";
 pub const WORLDSPACE_MASTER_PROBE_API: &str = "tes4-worldspace-master-resolution-probe-v1";
 
 #[derive(Clone, Debug, Serialize)]
@@ -473,15 +474,17 @@ fn evaluate_additive_policy(
         if plugin.parse_status != "parsed" {
             blockers.push("esp-could-not-be-parsed".to_owned());
         }
-        if plugin.masters.len() != 1 || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
-            blockers.push("requires-one-exact-oblivion-esm-master".to_owned());
+        if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
+            blockers.push("requires-oblivion-esm-as-first-master".to_owned());
         }
         if plugin
             .master_override_type_counts
             .keys()
-            .any(|kind| kind != "CONT")
+            .any(|kind| !supports_additive_inventory_record(kind))
         {
-            blockers.push("master-overrides-outside-cont-are-unsupported".to_owned());
+            blockers.push(
+                "master-overrides-outside-supported-inventory-records-are-unsupported".to_owned(),
+            );
         }
         blockers.extend(plugin.structural_blockers.iter().cloned());
     }
@@ -491,7 +494,7 @@ fn evaluate_additive_policy(
         id: ADDITIVE_PLUGIN_POLICY.to_owned(),
         compatible: blockers.is_empty(),
         mutation_policy: if blockers.is_empty() {
-            "byte-preserve-plugin-and-validate-cont-additions".to_owned()
+            "merge-current-master-inventory-and-preserve-plugin-additions".to_owned()
         } else {
             "report-only".to_owned()
         },
@@ -998,6 +1001,7 @@ struct CanonicalFormId {
 struct IndexedMasterRecord {
     kind: String,
     provider: String,
+    record: Record,
 }
 
 #[derive(Clone, Debug)]
@@ -1015,6 +1019,12 @@ struct DataEntryCandidate {
     path: PathBuf,
     regular_file: bool,
     symlink: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedInstalledRecord {
+    pub record: Record,
+    pub provider: String,
 }
 
 fn canonical_form_id(owner: &str, masters: &[String], form_id: u32) -> Result<CanonicalFormId> {
@@ -1202,6 +1212,7 @@ fn index_installed_master(
                         IndexedMasterRecord {
                             kind,
                             provider: declared_name.to_owned(),
+                            record: parsed_record,
                         },
                     )
                     .is_some()
@@ -1268,6 +1279,94 @@ fn case_insensitive_data_entries(
             });
     }
     Ok(entries)
+}
+
+/// Resolves records against the effective installed master chain. Requiring every master's own
+/// dependency list to be the exact preceding prefix keeps all embedded full-plugin FormIDs aligned
+/// with the staged plugin while still supporting arbitrary-length DLC/mod master chains.
+pub fn resolve_installed_master_records(
+    plugin: &Plugin,
+    game_data_dir: &Path,
+    wanted_form_ids: &[u32],
+) -> Result<HashMap<u32, ResolvedInstalledRecord>> {
+    if plugin.masters.is_empty() || plugin.masters.len() > u8::MAX as usize {
+        bail!("plugin must declare a non-empty full-master chain");
+    }
+    let mut names = HashSet::new();
+    if plugin
+        .masters
+        .iter()
+        .any(|name| !names.insert(name.to_ascii_lowercase()))
+    {
+        bail!("plugin declares duplicate case-insensitive master names");
+    }
+    let mut wanted = BTreeSet::new();
+    let mut staged_identities = Vec::new();
+    for form_id in wanted_form_ids.iter().copied() {
+        let source_index = (form_id >> 24) as usize;
+        if source_index >= plugin.masters.len() {
+            bail!("wanted FormID 0x{form_id:08X} is not owned by a declared master");
+        }
+        let identity = canonical_form_id("<staged-plugin>", &plugin.masters, form_id)?;
+        wanted.insert(identity.clone());
+        staged_identities.push((form_id, identity));
+    }
+    let data_entries = case_insensitive_data_entries(game_data_dir)?;
+    let mut effective = BTreeMap::<CanonicalFormId, IndexedMasterRecord>::new();
+    for (master_index, declared_name) in plugin.masters.iter().enumerate() {
+        let candidates = data_entries
+            .get(&declared_name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if candidates.len() != 1 {
+            bail!(
+                "declared master {declared_name} requires one case-insensitive Data match; found {}",
+                candidates.len()
+            );
+        }
+        let candidate = &candidates[0];
+        if !candidate.regular_file || candidate.symlink {
+            bail!("declared master {declared_name} is not a direct regular Data file");
+        }
+        let index = index_installed_master(&candidate.path, declared_name, &wanted)
+            .with_context(|| format!("indexing declared master {declared_name}"))?;
+        if index.masters.len() != master_index
+            || index
+                .masters
+                .iter()
+                .zip(&plugin.masters[..master_index])
+                .any(|(actual, expected)| !actual.eq_ignore_ascii_case(expected))
+        {
+            bail!(
+                "installed master {declared_name} does not declare the exact preceding master prefix"
+            );
+        }
+        if !index.unmappable_target_collisions.is_empty() {
+            bail!("installed master {declared_name} has an unmappable target FormID collision");
+        }
+        for (identity, record) in index.matching_records {
+            effective.insert(identity, record);
+        }
+    }
+    let mut resolved = HashMap::new();
+    for (staged_form_id, identity) in staged_identities {
+        let indexed = effective.get(&identity).with_context(|| {
+            format!("installed master chain has no target for 0x{staged_form_id:08X}")
+        })?;
+        if indexed.record.form_id != staged_form_id {
+            bail!(
+                "installed master prefix alignment produced a different raw FormID for 0x{staged_form_id:08X}"
+            );
+        }
+        resolved.insert(
+            staged_form_id,
+            ResolvedInstalledRecord {
+                record: indexed.record.clone(),
+                provider: indexed.provider.clone(),
+            },
+        );
+    }
+    Ok(resolved)
 }
 
 fn finish_worldspace_master_probe(
@@ -1596,7 +1695,7 @@ pub fn inspect_worldspace_master_probe_input(
 fn additive_contract_from_staged(
     root: &Path,
     plugin_set: &PluginSetReport,
-    current_esm: Option<&Path>,
+    game_data_dir: Option<&Path>,
 ) -> AdditiveContractReport {
     let mut blockers = plugin_set
         .additive_syncmap_v1
@@ -1686,67 +1785,76 @@ fn additive_contract_from_staged(
                         }
                     }
 
-                    let current_esm = current_esm
-                        .filter(|path| path.is_file())
-                        .context("current Oblivion.esm is unavailable")?;
+                    let game_data_dir = game_data_dir
+                        .filter(|path| path.is_dir())
+                        .context("current game Data directory is unavailable")?;
                     current_master_checked = true;
                     let overrides = plugin
                         .records
                         .iter()
                         .filter(|record| ((record.form_id >> 24) as u8) < plugin_index)
                         .collect::<Vec<_>>();
-                    let mut target_ids = overrides
+                    let target_ids = overrides
                         .iter()
                         .map(|record| record.form_id)
                         .collect::<Vec<_>>();
-                    for record in &overrides {
-                        target_ids.extend(
-                            container_inventory_form_ids(record)?
-                                .into_iter()
-                                .filter(|form_id| ((form_id >> 24) as u8) < plugin_index),
-                        );
-                    }
-                    target_ids.sort_unstable();
-                    target_ids.dedup();
-                    let current = read_target_records(current_esm, &target_ids)?;
+                    let current =
+                        resolve_installed_master_records(&plugin, game_data_dir, &target_ids)?;
+                    let mut referenced_master_ids = Vec::new();
                     for record in &overrides {
                         let current_record = current.get(&record.form_id).with_context(|| {
                             format!(
-                                "current Oblivion.esm has no override target 0x{:08X}",
+                                "installed master chain has no override target 0x{:08X}",
                                 record.form_id
                             )
                         })?;
-                        let result =
-                            validate_container_addition(record, current_record, plugin_index)?;
-                        for addition in result.added_inventory_entries {
+                        if current_record.record.kind != record.kind {
+                            bail!(
+                                "master override 0x{:08X} is {}/{} in staged/installed data",
+                                record.form_id,
+                                record.kind,
+                                current_record.record.kind
+                            );
+                        }
+                        let (_, result) =
+                            merge_inventory_addition(record, &current_record.record, plugin_index)?;
+                        for addition in result
+                            .added_inventory_entries
+                            .into_iter()
+                            .chain(result.preserved_current_master_entries)
+                        {
                             let item_form_id = u32::from_str_radix(
                                 addition.item_form_id.trim_start_matches("0x"),
                                 16,
                             )?;
-                            let resolved = match addition.reference_scope.as_str() {
-                                "plugin-owned" => owned_ids.contains(&item_form_id),
-                                "current-master" => current.contains_key(&item_form_id),
-                                _ => false,
-                            };
-                            if !resolved {
-                                bail!(
-                                    "CONT override {} has unresolved {} reference {}",
+                            match addition.reference_scope.as_str() {
+                                "plugin-owned" if !owned_ids.contains(&item_form_id) => bail!(
+                                    "inventory override {} has unresolved plugin-owned reference {}",
                                     result.form_id,
-                                    addition.reference_scope,
                                     addition.item_form_id
-                                );
+                                ),
+                                "current-master" => referenced_master_ids.push(item_form_id),
+                                "plugin-owned" => {}
+                                _ => bail!("unknown inventory reference scope"),
                             }
                         }
                     }
+                    referenced_master_ids.sort_unstable();
+                    referenced_master_ids.dedup();
+                    resolve_installed_master_records(
+                        &plugin,
+                        game_data_dir,
+                        &referenced_master_ids,
+                    )?;
                     Ok(overrides.len())
                 })();
                 match semantic_result {
                     Ok(count) => validated_master_override_count = count,
                     Err(error) => {
                         let mut detail = format!("{error:#}");
-                        if let Some(path) = current_esm {
+                        if let Some(path) = game_data_dir {
                             detail = detail
-                                .replace(path.to_string_lossy().as_ref(), "<current Oblivion.esm>");
+                                .replace(path.to_string_lossy().as_ref(), "<current game Data>");
                         }
                         blockers.push(format!("additive-semantic-validation-failed:{detail}"));
                     }
@@ -1785,12 +1893,12 @@ fn additive_contract_from_staged(
 pub fn inspect_additive_contract_input(
     input: &Path,
     candidate_root: Option<&str>,
-    current_esm: Option<&Path>,
+    game_data_dir: Option<&Path>,
 ) -> Result<(PluginSetReport, AdditiveContractReport)> {
     let (_staged, root, scan_mode) = inspect_staged_plugin_input(input, candidate_root)?;
     let mut plugin_set = inspect_plugin_set(&root)?;
     plugin_set.scan_mode = scan_mode.to_owned();
-    let contract = additive_contract_from_staged(&root, &plugin_set, current_esm);
+    let contract = additive_contract_from_staged(&root, &plugin_set, game_data_dir);
     Ok((plugin_set, contract))
 }
 
@@ -1823,6 +1931,56 @@ pub fn verify_plugin_set_preserved(source_root: &Path, candidate_root: &Path) ->
         .collect::<Vec<_>>();
     if source_rows != candidate_rows {
         bail!("candidate plugin set differs in path, kind, size, or SHA-256");
+    }
+    Ok(())
+}
+
+pub fn verify_plugin_set_with_rewritten_esp(
+    source_root: &Path,
+    candidate_root: &Path,
+    rewritten_relative_path: &str,
+) -> Result<()> {
+    let source = inspect_plugin_set(source_root)?;
+    let candidate = inspect_plugin_set(candidate_root)?;
+    let source = source
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.relative_path.to_ascii_lowercase(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let candidate = candidate
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.relative_path.to_ascii_lowercase(), artifact))
+        .collect::<BTreeMap<_, _>>();
+    if source.keys().collect::<Vec<_>>() != candidate.keys().collect::<Vec<_>>() {
+        bail!("candidate plugin set differs in paths");
+    }
+    let rewritten = rewritten_relative_path
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    for (path, source) in source {
+        let candidate = candidate[&path];
+        if path == rewritten {
+            if source.kind != "esp"
+                || candidate.kind != "esp"
+                || candidate.parse_status != "parsed"
+                || source.master_flag != candidate.master_flag
+                || source.light_plugin_flag != candidate.light_plugin_flag
+                || source.masters != candidate.masters
+                || source.declared_record_count != candidate.declared_record_count
+                || source.next_object_id != candidate.next_object_id
+                || source.record_type_counts != candidate.record_type_counts
+                || source.plugin_owned_record_count != candidate.plugin_owned_record_count
+                || source.master_override_record_count != candidate.master_override_record_count
+            {
+                bail!("rewritten ESP changed plugin structure or identity");
+            }
+        } else if source.kind != candidate.kind
+            || source.bytes != candidate.bytes
+            || source.sha256 != candidate.sha256
+        {
+            bail!("candidate changed a plugin artifact outside the rewritten ESP: {path}");
+        }
     }
     Ok(())
 }
@@ -2043,12 +2201,9 @@ mod tests {
                 .blockers
                 .contains(&"case-insensitive-plugin-filename-collision".to_owned())
         );
-        assert!(
-            report
-                .additive_syncmap_v1
-                .blockers
-                .contains(&"master-overrides-outside-cont-are-unsupported".to_owned())
-        );
+        assert!(report.additive_syncmap_v1.blockers.contains(
+            &"master-overrides-outside-supported-inventory-records-are-unsupported".to_owned()
+        ));
         assert!(
             !report
                 .additive_syncmap_v1

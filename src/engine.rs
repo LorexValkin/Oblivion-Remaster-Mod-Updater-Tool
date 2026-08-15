@@ -7,9 +7,9 @@ use crate::dependencies::{
     game_is_running, installed_state, scan_dependencies,
 };
 use crate::fixes::{
-    DEPENDENCY_PRESERVATION_API, DEPENDENCY_TRACE_API, DependencyPreservationReport,
-    EXACT_DEPENDENCY_EXTRACTION_API, ExactExtractionReport, extract_packages_with_dependency_view,
-    trace_package_dependencies, verify_dependency_preservation,
+    DEPENDENCY_DIAGNOSTIC_API, DEPENDENCY_PRESERVATION_API, DependencyPreservationReport,
+    EXACT_DEPENDENCY_EXTRACTION_API, ExactExtractionReport, diagnose_package_dependencies,
+    extract_packages_with_dependency_view,
 };
 use crate::game::{save_settings, validate_game_install};
 use crate::install_plan::{
@@ -18,8 +18,9 @@ use crate::install_plan::{
     resolve_staged_install_view, supports_logical_install_publication, verify_install_trees_match,
 };
 use crate::plugin::{
-    ADDITIVE_CONTRACT_API, PLUGIN_MANIFEST_API, PLUGIN_PRESERVATION_API, inspect_plugin_set,
-    verify_plugin_set_preserved,
+    ADDITIVE_CONTRACT_API, PLUGIN_MANIFEST_API, PLUGIN_PRESERVATION_API,
+    PLUGIN_SEMANTIC_REWRITE_API, inspect_plugin_set, resolve_installed_master_records,
+    verify_plugin_set_preserved, verify_plugin_set_with_rewritten_esp,
 };
 use crate::preflight::{PreflightRequest, analyze};
 use crate::replacement::{
@@ -36,17 +37,18 @@ use crate::replacement::{
 };
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
-    Record, SyncMapEntry, container_inventory_form_ids, package_to_game_path, read_plugin,
-    read_sync_map, read_target_records, record_editor_id, sorted_form_ids,
-    validate_container_addition,
+    Record, SyncMapEntry, merge_inventory_addition, package_to_game_path, read_plugin,
+    read_sync_map, record_editor_id, rewrite_plugin_records, sorted_form_ids,
+    validate_inventory_addition,
 };
 use crate::uasset::{
     BodySetupRepair, CompositePackageAssetKind, CompositePackageImportRepair, MaterialImportRepair,
-    PayloadEquivalenceReport, SkeletalCompatibilityProfile, TextureAssetDiagnostic,
-    classify_composite_package_asset, derive_skeletal_compatibility_profile,
-    inspect_static_mesh_asset, inspect_texture_asset, repair_composite_skeletal_mesh_imports,
-    repair_current_template_imports, repair_legacy_body_setups, repair_single_external_import,
-    repair_skeletal_mesh_imports, repair_static_mesh_imports,
+    OptionalBlueprintDependencySuppression, PayloadEquivalenceReport, SkeletalCompatibilityProfile,
+    TextureAssetDiagnostic, classify_composite_package_asset,
+    derive_skeletal_compatibility_profile, inspect_static_mesh_asset, inspect_texture_asset,
+    repair_composite_skeletal_mesh_imports, repair_current_template_imports,
+    repair_legacy_body_setups, repair_single_external_import, repair_skeletal_mesh_imports,
+    repair_static_mesh_imports, suppress_optional_blueprint_dependency,
     unresolved_package_store_dependencies, verify_preserved_export_payloads,
     verify_rebased_asset_metadata, verify_rebased_payloads,
 };
@@ -109,6 +111,8 @@ struct ContainerResult {
     body_setup_repairs: Vec<BodySetupRepair>,
     exact_extraction: ExactExtractionReport,
     dependency_preservation: DependencyPreservationReport,
+    package_migrations: Vec<CompositePackageMigration>,
+    optional_dependency_suppressions: Vec<OptionalBlueprintDependencySuppression>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -179,6 +183,66 @@ fn files_with_extension(directory: &Path, extension: &str) -> Result<Vec<PathBuf
     Ok(rows)
 }
 
+fn has_direct_container_directory(root: &Path) -> bool {
+    let paks = root.join(r"Content\Paks");
+    paks.is_dir()
+        && WalkDir::new(paks)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("utoc"))
+            })
+}
+
+fn find_single_container_directory(mod_root: &Path) -> Result<PathBuf> {
+    let paks = mod_root.join(r"Content\Paks");
+    let mut utocs = WalkDir::new(&paks)
+        .min_depth(1)
+        .max_depth(8)
+        .follow_links(false)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|entry| {
+            entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("utoc"))
+        })
+        .map(|entry| entry.into_path())
+        .collect::<Vec<_>>();
+    utocs.sort();
+    if utocs.is_empty() {
+        bail!("mod contains no UTOC containers below Content\\Paks");
+    }
+    let mut parents = utocs
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    parents.sort();
+    parents.dedup();
+    if parents.len() != 1 {
+        bail!(
+            "native additive scope requires every container triple in one physical folder; found {} folders",
+            parents.len()
+        );
+    }
+    let relative = parents[0].strip_prefix(&paks)?;
+    if relative.components().count() != 1 {
+        bail!("native additive container folder must be a direct child of Content\\Paks");
+    }
+    Ok(parents.remove(0))
+}
+
 fn find_mod_root(extracted: &Path) -> Result<PathBuf> {
     let roots = WalkDir::new(extracted)
         .max_depth(8)
@@ -187,13 +251,12 @@ fn find_mod_root(extracted: &Path) -> Result<PathBuf> {
         .filter(|entry| entry.file_type().is_dir())
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.join(r"Content\Dev\ObvData\Data").is_dir()
-                && path.join(r"Content\Paks\~mods").is_dir()
+            path.join(r"Content\Dev\ObvData\Data").is_dir() && has_direct_container_directory(path)
         })
         .collect::<Vec<_>>();
     if roots.len() != 1 {
         bail!(
-            "expected exactly one extracted mod root containing Content\\Dev and Content\\Paks\\~mods; found {}",
+            "expected exactly one extracted mod root containing Content\\Dev and one direct Content\\Paks container folder; found {}",
             roots.len()
         );
     }
@@ -1275,7 +1338,7 @@ fn run_additive_update_with_dependency_policy(
         "the native additive adapter requires one canonical complete logical mod root; physical wrappers must enter through the guarded logical-install publication adapter",
     )?;
     let mod_data = mod_root.join(r"Content\Dev\ObvData\Data");
-    let mod_paks = mod_root.join(r"Content\Paks\~mods");
+    let mod_paks = find_single_container_directory(&mod_root)?;
     // Inventory the complete staged input so a sibling ESP/ESM/ESL cannot be
     // silently dropped, then evaluate the mutation policy relative to the exact
     // mod root whose Content directories the engine will consume.
@@ -1325,9 +1388,9 @@ fn run_additive_update_with_dependency_policy(
         "Validating runtime tools, ESP, ESM override, and stable FormIDs",
     );
     let plugin = read_plugin(&esp_files[0])?;
-    if plugin.masters.len() != 1 || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
+    if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
         bail!(
-            "native additive scope supports one exact master, Oblivion.esm; found: {}",
+            "native additive scope requires Oblivion.esm first in a full-master chain; found: {}",
             plugin.masters.join(", ")
         );
     }
@@ -1354,42 +1417,55 @@ fn run_additive_update_with_dependency_policy(
         .map(|record| record.form_id)
         .collect::<HashSet<_>>();
     let owned_ids = sorted_form_ids(owned_records.iter().map(|record| record.form_id));
-    let mut target_record_ids = overrides
+    let target_record_ids = overrides
         .iter()
         .map(|record| record.form_id)
         .collect::<Vec<_>>();
-    for override_record in &overrides {
-        target_record_ids.extend(
-            container_inventory_form_ids(override_record)?
-                .into_iter()
-                .filter(|form_id| ((form_id >> 24) as u8) < plugin_index),
-        );
-    }
-    target_record_ids.sort_unstable();
-    target_record_ids.dedup();
-    let current_records = read_target_records(&game_esm, &target_record_ids)?;
+    let current_records =
+        resolve_installed_master_records(&plugin, &game_data, &target_record_ids)?;
     let mut override_results = Vec::new();
+    let mut plugin_replacements = HashMap::new();
+    let mut referenced_master_ids = Vec::new();
     for override_record in overrides {
         let current = current_records
             .get(&override_record.form_id)
             .with_context(|| {
                 format!(
-                    "current Oblivion.esm has no override target 0x{:08X}",
+                    "installed master chain has no override target 0x{:08X}",
                     override_record.form_id
                 )
             })?;
-        let mut result = validate_container_addition(override_record, current, plugin_index)?;
-        for addition in &mut result.added_inventory_entries {
+        if current.record.kind != override_record.kind {
+            bail!(
+                "master override 0x{:08X} is {}/{} in staged/installed data",
+                override_record.form_id,
+                override_record.kind,
+                current.record.kind
+            );
+        }
+        let (merged, mut result) =
+            merge_inventory_addition(override_record, &current.record, plugin_index)?;
+        if !result.preserved_current_master_entries.is_empty() {
+            plugin_replacements.insert(override_record.form_id, merged);
+        }
+        for addition in result
+            .added_inventory_entries
+            .iter_mut()
+            .chain(&mut result.preserved_current_master_entries)
+        {
             let item_form_id =
                 u32::from_str_radix(addition.item_form_id.trim_start_matches("0x"), 16)?;
             addition.reference_validated = match addition.reference_scope.as_str() {
                 "plugin-owned" => owned_record_ids.contains(&item_form_id),
-                "current-master" => current_records.contains_key(&item_form_id),
+                "current-master" => {
+                    referenced_master_ids.push(item_form_id);
+                    true
+                }
                 _ => false,
             };
             if !addition.reference_validated {
                 bail!(
-                    "CONT override {} adds unresolved {} inventory reference {}",
+                    "inventory override {} adds unresolved {} inventory reference {}",
                     result.form_id,
                     addition.reference_scope,
                     addition.item_form_id
@@ -1398,6 +1474,10 @@ fn run_additive_update_with_dependency_policy(
         }
         override_results.push(result);
     }
+    referenced_master_ids.sort_unstable();
+    referenced_master_ids.dedup();
+    resolve_installed_master_records(&plugin, &game_data, &referenced_master_ids)
+        .context("resolving inventory references through the installed master chain")?;
     let dependency_candidates = scan_dependencies(&request.dependency_inputs, Some(&mod_input));
     let installed_dependencies = installed_state(&game.root);
     let ue4ss_available = installed_dependencies.ue4ss.installed
@@ -1469,7 +1549,8 @@ fn run_additive_update_with_dependency_policy(
         .flat_map(|container| container.package_store.iter().cloned())
         .collect::<Vec<_>>();
     let (_, current_game_store) = retoc.package_store_entries(&stock_utoc)?;
-    let dependency_trace = trace_package_dependencies(&source_package_store, &current_game_store)?;
+    let dependency_trace =
+        diagnose_package_dependencies(&source_package_store, &current_game_store)?;
     let dependency_view = create_isolated_stock_view(&game.root)?;
     let target_probe = work.path().join("target-probe");
     fs::create_dir_all(&target_probe)?;
@@ -1516,6 +1597,37 @@ fn run_additive_update_with_dependency_policy(
             copy_file(source, &target)?;
         }
     }
+    let composite_inspection = inspect_composite_package_staged(&mod_paks, &game.root, &retoc)?;
+    let identity_recovery = recover_composite_package_identities(
+        &composite_inspection,
+        &retoc,
+        dependency_view.path(),
+        &work.path().join("identity-recovery"),
+    )?;
+    let mut available_dependencies = composite_inspection.target_dependencies.clone();
+    for package in &composite_inspection.packages {
+        available_dependencies
+            .entry(package.package_id)
+            .or_insert_with(|| package.clone());
+    }
+    if let Some(recovery) = &identity_recovery {
+        for alias in &recovery.aliases {
+            available_dependencies
+                .entry(alias.target_package.package_id)
+                .or_insert_with(|| alias.target_package.clone());
+        }
+        for suppression in &recovery.suppressions {
+            available_dependencies
+                .entry(suppression.target_package.package_id)
+                .or_insert_with(|| suppression.target_package.clone());
+        }
+    }
+    let source_ids = composite_inspection
+        .packages
+        .iter()
+        .map(|package| package.package_id)
+        .collect::<HashSet<_>>();
+    let current_composite_view = create_isolated_stock_view(&game.root)?;
 
     stage(
         callback,
@@ -1529,7 +1641,27 @@ fn run_additive_update_with_dependency_policy(
             .context("mod root has no directory name")?,
     );
     copy_tree(&mod_root, &candidate_root)?;
-    let candidate_paks = candidate_root.join(r"Content\Paks\~mods");
+    let candidate_paks = candidate_root.join(
+        mod_paks
+            .strip_prefix(&mod_root)
+            .context("container folder is outside the selected mod root")?,
+    );
+    let esp_relative = esp_files[0]
+        .strip_prefix(&mod_root)
+        .context("ESP is outside the selected mod root")?;
+    let candidate_esp = candidate_root.join(esp_relative);
+    if !plugin_replacements.is_empty() {
+        let source_bytes = fs::read(&esp_files[0])?;
+        let rewritten = rewrite_plugin_records(
+            &source_bytes,
+            &plugin_replacements,
+            esp_files[0]
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("plugin.esp"),
+        )?;
+        fs::write(&candidate_esp, rewritten)?;
+    }
     let mut container_results = Vec::new();
     for container in &container_inputs {
         let root = container_work.join(&container.name);
@@ -1552,6 +1684,84 @@ fn run_additive_update_with_dependency_policy(
             &package_entries,
             &format!("dependency-complete extraction {}", container.name),
         )?;
+        let composite_container = composite_inspection
+            .containers
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(&container.name))
+            .context("composite inspection lost an additive container")?;
+        let source_store = composite_container
+            .package_store
+            .iter()
+            .map(|entry| (entry.package_id, entry))
+            .collect::<HashMap<_, _>>();
+        let mut expected_imports = HashMap::<u64, Vec<u64>>::new();
+        let mut package_migrations = Vec::new();
+        let mut optional_dependency_suppressions = Vec::new();
+        for package in &composite_container.packages {
+            let effective = composite_effective_package_path(package, &composite_inspection)?;
+            let asset = find_extracted_additive_static_mesh(&legacy, &effective)?;
+            let suppressions = identity_recovery
+                .as_ref()
+                .map(|recovery| {
+                    recovery
+                        .suppressions
+                        .iter()
+                        .filter(|suppression| suppression.consumer_package_id == package.package_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if suppressions.len() > 1 {
+                bail!("one Blueprint package requires multiple optional dependency suppressions");
+            }
+            let package_store = source_store
+                .get(&package.package_id)
+                .context("additive composite container lost a package-store row")?;
+            let suppression = suppressions
+                .first()
+                .map(|suppression| {
+                    let replacement = PackageEntry {
+                        package_id: suppression.temporary_source_package.package_id,
+                        path: suppression.temporary_identity.source_package_path.clone(),
+                    };
+                    suppress_optional_blueprint_dependency(
+                        &asset,
+                        package_store,
+                        &suppression.target_package,
+                        &replacement,
+                        &suppression.temporary_identity.source_object_name,
+                        &suppression.role,
+                        &root
+                            .join("optional-component-suppression")
+                            .join(package.package_id.to_string()),
+                    )
+                })
+                .transpose()?;
+            let mut migration_store = (*package_store).clone();
+            if let Some(suppression) = &suppression {
+                migration_store.imported_package_ids =
+                    suppression.target_imported_package_ids.clone();
+            }
+            let migration = migrate_composite_package(
+                package,
+                &asset,
+                &migration_store,
+                &source_ids,
+                &composite_inspection.target_dependencies,
+                &composite_inspection.target_package_imports,
+                &available_dependencies,
+                dependency_view.path(),
+                current_composite_view.path(),
+                &retoc,
+                &root
+                    .join("package-migrations")
+                    .join(package.package_id.to_string()),
+            )?;
+            expected_imports.insert(package.package_id, migration.expected_imports.clone());
+            package_migrations.push(migration);
+            if let Some(suppression) = suppression {
+                optional_dependency_suppressions.push(suppression);
+            }
+        }
         let body_setup_repairs = repair_legacy_body_setups(&legacy)?;
         let rebuilt_utoc = rebuilt.join(format!("{}.utoc", container.name));
         let to_zen = retoc.run(args([
@@ -1580,8 +1790,37 @@ fn run_additive_update_with_dependency_policy(
             &format!("package inventory for {}", container.name),
         )?;
         let (_, rebuilt_store) = retoc.package_store_entries(&rebuilt_utoc)?;
-        let dependency_preservation =
-            verify_dependency_preservation(&container.package_store, &rebuilt_store)?;
+        let mut dependency_edge_count = 0_usize;
+        for (package_id, expected) in &expected_imports {
+            let actual = rebuilt_store
+                .iter()
+                .find(|entry| entry.package_id == *package_id)
+                .with_context(|| format!("rebuilt additive store lost package {package_id}"))?;
+            if actual
+                .imported_package_ids
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                != expected.iter().copied().collect::<BTreeSet<_>>()
+            {
+                bail!(
+                    "rebuilt additive imports changed for package {package_id}: expected {:?}, found {:?}",
+                    expected.iter().copied().collect::<BTreeSet<_>>(),
+                    actual
+                        .imported_package_ids
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                );
+            }
+            dependency_edge_count += expected.len();
+        }
+        let dependency_preservation = DependencyPreservationReport {
+            api: "zen-approved-dependency-migration-v1".to_owned(),
+            package_count: expected_imports.len(),
+            dependency_edge_count,
+            preserved: true,
+        };
         for path in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
             copy_file(path, &candidate_paks.join(path.file_name().unwrap()))?;
         }
@@ -1604,7 +1843,24 @@ fn run_additive_update_with_dependency_policy(
             body_setup_repairs,
             exact_extraction,
             dependency_preservation,
+            package_migrations,
+            optional_dependency_suppressions,
         });
+    }
+    if let Some(recovery) = &identity_recovery
+        && !recovery.aliases.is_empty()
+    {
+        for source in [
+            &recovery.provider_utoc,
+            &recovery.provider_ucas,
+            &recovery.provider_pak,
+        ] {
+            copy_file(source, &candidate_paks.join(source.file_name().unwrap()))?;
+        }
+        retoc.verify(
+            &candidate_paks.join(recovery.provider_utoc.file_name().unwrap()),
+            "additive identity alias provider",
+        )?;
     }
 
     stage(
@@ -1612,15 +1868,20 @@ fn run_additive_update_with_dependency_policy(
         5,
         "Rechecking ESP bytes, IDs, SyncMap, and package inventories",
     );
-    let candidate_esp = candidate_root
-        .join(r"Content\Dev\ObvData\Data")
-        .join(esp_files[0].file_name().unwrap());
     let source_esp_hash = sha256_file(&esp_files[0])?;
     let candidate_esp_hash = sha256_file(&candidate_esp)?;
-    if source_esp_hash != candidate_esp_hash {
-        bail!("ESP bytes changed during update");
+    if plugin_replacements.is_empty() && source_esp_hash != candidate_esp_hash {
+        bail!("ESP bytes changed without a planned semantic inventory merge");
     }
-    verify_plugin_set_preserved(&mod_root, &candidate_root)?;
+    if plugin_replacements.is_empty() {
+        verify_plugin_set_preserved(&mod_root, &candidate_root)?;
+    } else {
+        verify_plugin_set_with_rewritten_esp(
+            &mod_root,
+            &candidate_root,
+            &esp_relative.to_string_lossy(),
+        )?;
+    }
     let candidate_plugin = read_plugin(&candidate_esp)?;
     let candidate_owned_ids = sorted_form_ids(
         candidate_plugin
@@ -1632,6 +1893,19 @@ fn run_additive_update_with_dependency_policy(
     ensure_same_set(&owned_ids, &candidate_owned_ids, "plugin-owned ESP FormIDs")?;
     if plugin.masters != candidate_plugin.masters {
         bail!("ESP master list changed");
+    }
+    if candidate_plugin.declared_record_count != plugin.declared_record_count
+        || candidate_plugin.next_object_id != plugin.next_object_id
+    {
+        bail!("ESP header identity changed during inventory merge");
+    }
+    for (form_id, current) in &current_records {
+        let candidate_override = candidate_plugin
+            .records
+            .iter()
+            .find(|record| record.form_id == *form_id)
+            .with_context(|| format!("rewritten ESP lost override 0x{form_id:08X}"))?;
+        validate_inventory_addition(candidate_override, &current.record, plugin_index)?;
     }
     let sync_entries = read_sync_map(&sync_files[0])?;
     if sync_entries.is_empty() {
@@ -1645,22 +1919,61 @@ fn run_additive_update_with_dependency_policy(
         .iter()
         .map(|container| container.body_setup_repairs.len())
         .sum::<usize>();
+    let persistent_alias_package_count = identity_recovery
+        .as_ref()
+        .map(|recovery| {
+            recovery
+                .aliases
+                .iter()
+                .map(|alias| alias.target_package.package_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
     let report_path = output_directory.join("additive-update-report.json");
     let dependency_install_report_path =
         output_directory.join("runtime-dependency-install-report.json");
+    let mut fix_apis = vec![
+        PLUGIN_MANIFEST_API,
+        ADDITIVE_CONTRACT_API,
+        RUNTIME_DEPENDENCY_TRANSACTION_API,
+        DEPENDENCY_DIAGNOSTIC_API,
+        EXACT_DEPENDENCY_EXTRACTION_API,
+        DEPENDENCY_PRESERVATION_API,
+        "zen-approved-dependency-migration-v1",
+        "single-resolved-dependency-public-export-rebase-v2",
+        "package-store-decoder-placeholder-repair-v2",
+    ];
+    if plugin_replacements.is_empty() {
+        fix_apis.push(PLUGIN_PRESERVATION_API);
+    } else {
+        fix_apis.push(PLUGIN_SEMANTIC_REWRITE_API);
+    }
+    if identity_recovery
+        .as_ref()
+        .is_some_and(|recovery| !recovery.aliases.is_empty())
+    {
+        fix_apis.extend([
+            "package-root-public-export-identity-alias-v1",
+            "blueprint-serialized-alias-role-proof-v1",
+        ]);
+    }
+    if identity_recovery
+        .as_ref()
+        .is_some_and(|recovery| !recovery.suppressions.is_empty())
+    {
+        fix_apis.extend([
+            "blueprint-serialized-alias-role-proof-v1",
+            "optional-secondary-blueprint-component-suppression-v1",
+        ]);
+    }
+    fix_apis.sort_unstable();
+    fix_apis.dedup();
     let mut report = json!({
         "schema": "obr-additive-mod-update-report",
-        "version": 6,
+        "version": 7,
         "implementation": "native-rust",
-        "fixApis": [
-            PLUGIN_MANIFEST_API,
-            PLUGIN_PRESERVATION_API,
-            ADDITIVE_CONTRACT_API,
-            RUNTIME_DEPENDENCY_TRANSACTION_API,
-            DEPENDENCY_TRACE_API,
-            EXACT_DEPENDENCY_EXTRACTION_API,
-            DEPENDENCY_PRESERVATION_API,
-        ],
+        "fixApis": fix_apis,
         "generatedAt": chrono::Utc::now().to_rfc3339(),
         "reportSnapshot": "candidate-publication",
         "status": if dependency_plan.ready {
@@ -1691,7 +2004,9 @@ fn run_additive_update_with_dependency_policy(
         },
         "identity": {
             "esmEdited": false,
-            "espBytePreserved": true,
+            "espBytePreserved": plugin_replacements.is_empty(),
+            "espSemanticInventoryMerge": !plugin_replacements.is_empty(),
+            "rewrittenOverrideCount": plugin_replacements.len(),
             "espSourceSha256": source_esp_hash,
             "espCandidateSha256": candidate_esp_hash,
             "mastersPreserved": true,
@@ -1700,6 +2015,14 @@ fn run_additive_update_with_dependency_policy(
             "nextObjectId": format!("0x{:08X}", plugin.next_object_id),
             "pluginOwnedFormIds": owned_ids,
             "masterOverrides": override_results,
+            "optionalUnrealDependencySuppressionCount": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.suppressions.len())
+                .unwrap_or(0),
+            "persistentUnrealIdentityAliasCount": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.aliases.len())
+                .unwrap_or(0),
             "syncMapEntries": sync_entries,
             "syncMapResolutions": sync_map_resolutions,
         },
@@ -1733,6 +2056,7 @@ fn run_additive_update_with_dependency_policy(
             "packageInventoriesPreserved": true,
             "packageDependencyGraphsPreserved": true,
             "dependencyCompleteExtraction": true,
+            "approvedCompositeDependencyMigration": true,
             "espReparsed": true,
             "completePluginSetPreserved": true,
             "syncMapLinksResolved": true,
@@ -1772,7 +2096,7 @@ fn run_additive_update_with_dependency_policy(
                 output_directory,
                 output_archive,
                 report_path,
-                package_count: original_packages.len(),
+                package_count: original_packages.len() + persistent_alias_package_count,
             },
             dependency_candidates,
         ));
@@ -1825,7 +2149,7 @@ fn run_additive_update_with_dependency_policy(
             output_directory,
             output_archive,
             report_path,
-            package_count: original_packages.len(),
+            package_count: original_packages.len() + persistent_alias_package_count,
         },
         Vec::new(),
     ))
@@ -3404,6 +3728,8 @@ fn run_heterogeneous_replacement_update(
     })
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CompositePackageMigration {
     kind: &'static str,
     decoder_unresolved_import_count: usize,
@@ -3773,6 +4099,11 @@ fn run_composite_package_update(
                 .entry(alias.target_package.package_id)
                 .or_insert_with(|| alias.target_package.clone());
         }
+        for suppression in &recovery.suppressions {
+            available_dependencies
+                .entry(suppression.target_package.package_id)
+                .or_insert_with(|| suppression.target_package.clone());
+        }
     }
     let source_ids = inspection
         .packages
@@ -3830,12 +4161,52 @@ fn run_composite_package_update(
         for package in &container.packages {
             let effective = composite_effective_package_path(package, &inspection)?;
             let asset = find_extracted_additive_static_mesh(&legacy, &effective)?;
+            let suppression = identity_recovery
+                .as_ref()
+                .map(|recovery| {
+                    recovery
+                        .suppressions
+                        .iter()
+                        .filter(|suppression| suppression.consumer_package_id == package.package_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if suppression.len() > 1 {
+                bail!("one Blueprint package requires multiple optional dependency suppressions");
+            }
+            let package_store = source_store
+                .get(&package.package_id)
+                .context("composite container lost a package-store row")?;
+            let suppression = suppression
+                .first()
+                .map(|suppression| {
+                    let replacement = PackageEntry {
+                        package_id: suppression.temporary_source_package.package_id,
+                        path: suppression.temporary_identity.source_package_path.clone(),
+                    };
+                    suppress_optional_blueprint_dependency(
+                        &asset,
+                        package_store,
+                        &suppression.target_package,
+                        &replacement,
+                        &suppression.temporary_identity.source_object_name,
+                        &suppression.role,
+                        &root
+                            .join("packages")
+                            .join(package.package_id.to_string())
+                            .join("optional-component-suppression"),
+                    )
+                })
+                .transpose()?;
+            let mut migration_store = (*package_store).clone();
+            if let Some(suppression) = &suppression {
+                migration_store.imported_package_ids =
+                    suppression.target_imported_package_ids.clone();
+            }
             let migration = migrate_composite_package(
                 package,
                 &asset,
-                source_store
-                    .get(&package.package_id)
-                    .context("composite container lost a package-store row")?,
+                &migration_store,
                 &source_ids,
                 &inspection.target_dependencies,
                 &inspection.target_package_imports,
@@ -3855,6 +4226,7 @@ fn run_composite_package_update(
                 "decoderUnresolvedImportCount": migration.decoder_unresolved_import_count,
                 "importRepair": migration.import_repair,
                 "staticMeshRepair": migration.static_mesh_repair,
+                "optionalDependencySuppression": suppression,
             }));
         }
         let body_setup_repairs = repair_legacy_body_setups(&legacy)?;
@@ -3955,7 +4327,9 @@ fn run_composite_package_update(
             )?;
         }
     }
-    if let Some(recovery) = &identity_recovery {
+    if let Some(recovery) = &identity_recovery
+        && !recovery.aliases.is_empty()
+    {
         for source in [
             &recovery.provider_utoc,
             &recovery.provider_ucas,
@@ -4026,7 +4400,9 @@ fn run_composite_package_update(
         }));
     }
 
-    let identity_alias_report = if let Some(recovery) = &identity_recovery {
+    let identity_alias_report = if let Some(recovery) = &identity_recovery
+        && !recovery.aliases.is_empty()
+    {
         let mut alias_packages = recovery
             .aliases
             .iter()
@@ -4108,10 +4484,11 @@ fn run_composite_package_update(
             "zen-dependency-preservation-v1",
             "identity-and-export-topology-current-template-import-rebase-v1",
             "serialized-role-current-template-import-rebase-v1",
-            "single-resolved-current-dependency-public-export-rebase-v1",
-            "package-store-decoder-placeholder-repair-v1",
+            "single-resolved-dependency-public-export-rebase-v2",
+            "package-store-decoder-placeholder-repair-v2",
             "package-root-public-export-identity-alias-v1",
-            "blueprint-serialized-alias-role-proof-v1"
+            "blueprint-serialized-alias-role-proof-v1",
+            "optional-secondary-blueprint-component-suppression-v1"
         ],
         "unreal": {
             "containers": container_reports,

@@ -2318,12 +2318,18 @@ fn run_esp_sync_lane_update(
                 .len()
         })
         .unwrap_or(0);
-    let report_path = output_directory.join("additive-update-report.json");
+    let report_path = output_directory.join(match lane {
+        EspSyncLane::AdditiveSyncmap => "additive-update-report.json",
+        EspSyncLane::MagicLoaderWorldspace => "magicloader-worldspace-update-report.json",
+    });
     let dependency_install_report_path =
         output_directory.join("runtime-dependency-install-report.json");
     let mut fix_apis = vec![
         PLUGIN_MANIFEST_API,
-        ADDITIVE_CONTRACT_API,
+        match lane {
+            EspSyncLane::AdditiveSyncmap => ADDITIVE_CONTRACT_API,
+            EspSyncLane::MagicLoaderWorldspace => crate::plugin::MAGICLOADER_SYNCMAP_KEY_GATE_API,
+        },
         RUNTIME_DEPENDENCY_TRANSACTION_API,
         DEPENDENCY_DIAGNOSTIC_API,
         EXACT_DEPENDENCY_EXTRACTION_API,

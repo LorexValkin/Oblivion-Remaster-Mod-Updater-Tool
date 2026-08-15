@@ -5,8 +5,9 @@ use crate::retoc::{
     PackageEntry, PackageStoreEntry, RetocTool, game_package_names_for_ids, unreal_package_id,
 };
 use crate::uasset::{
-    BlueprintAliasRoleEvidence, CompositePackageAssetKind, PackageIdentityAlias,
-    TextureAssetDiagnostic, classify_composite_package_asset, create_package_identity_alias,
+    BlueprintAliasRoleEvidence, CompositePackageAssetKind, CompositePackageImportRepair,
+    PackageIdentityAlias, TextureAssetDiagnostic, classify_composite_package_asset,
+    create_package_identity_alias,
     inspect_static_mesh_asset, inspect_texture_asset, prove_blueprint_alias_role,
     repair_composite_skeletal_mesh_imports, repair_current_template_imports,
     repair_legacy_body_setups, repair_single_external_import, repair_static_mesh_imports,
@@ -89,15 +90,38 @@ pub struct CompositeOptionalDependencySuppressionPlan {
 }
 
 #[derive(Clone, Debug)]
-pub struct CompositeIdentityRecovery {
+pub struct CompositeIdentityAliasProvider {
     pub provider_name: String,
     pub provider_utoc: PathBuf,
     pub provider_ucas: PathBuf,
     pub provider_pak: PathBuf,
     pub legacy_root: PathBuf,
     pub relative_utoc: PathBuf,
+}
+
+/// One stale dependency edge that is rebound to the current game revision by
+/// its consumer's serialized-role donor repair instead of an identity alias.
+/// The successor is never chosen from the retired package name: the consumer's
+/// same-identity current-game donor decides it, and the import repair
+/// hard-fails without donor class and serialized-role evidence.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompositeDonorRebindPlan {
+    pub consumer_package_id: u64,
+    pub consumer_package_path: String,
+    pub target_package_id: u64,
+    pub target_package_name: String,
+    pub expected_class: String,
+    pub evidence: String,
+    pub policy: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompositeIdentityRecovery {
+    pub provider: Option<CompositeIdentityAliasProvider>,
     pub aliases: Vec<CompositeIdentityAliasPlan>,
     pub suppressions: Vec<CompositeOptionalDependencySuppressionPlan>,
+    pub donor_rebinds: Vec<CompositeDonorRebindPlan>,
 }
 
 #[derive(Clone, Debug)]
@@ -1715,6 +1739,49 @@ fn differs_by_at_most_one_ascii_edit(left: &str, right: &str) -> bool {
     true
 }
 
+/// Structural route for one recovered (missing) dependency edge.
+///
+/// This is the successor-decision seam for current-revision rebinding. The
+/// route is only a dispatch hint taken from the retired package's leaf name;
+/// every route re-proves its own evidence against the connected game before
+/// anything is rebound, so a misrouted name can only fail truthfully, never
+/// rebind incorrectly. A richer current-package-store successor search can
+/// extend this seam without touching the container rebuild, roundtrip, or
+/// disclosure plumbing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveredDependencyRoute {
+    /// The edge is satisfied by aliasing one structurally related bundled
+    /// package under the retired identity, proven by decoded class, unique
+    /// identity, and a serialized Blueprint role reference.
+    BundledAlias(&'static str),
+    /// The edge is a retired Unreal-editor default sidecar of an existing
+    /// skeletal mesh (`<SK_Mesh>_Skeleton` / `<SK_Mesh>_PhysicsAsset`). The
+    /// consumer's same-identity current-game donor decides the successor
+    /// through the serialized-role import repair; the current game uses
+    /// `SKEL_`/`PA_` naming for those classes, so these suffixes only occur
+    /// as retired mod-cooked sidecars.
+    CurrentDonorRebind(&'static str),
+}
+
+pub(crate) fn recovered_dependency_route(target_leaf: &str) -> Option<RecoveredDependencyRoute> {
+    let lower = target_leaf.to_ascii_lowercase();
+    if lower.starts_with("mic_") {
+        return Some(RecoveredDependencyRoute::BundledAlias(
+            "MaterialInstanceConstant",
+        ));
+    }
+    if lower.starts_with("sm_") {
+        return Some(RecoveredDependencyRoute::BundledAlias("StaticMesh"));
+    }
+    if lower.starts_with("sk_") && lower.ends_with("_skeleton") {
+        return Some(RecoveredDependencyRoute::CurrentDonorRebind("Skeleton"));
+    }
+    if lower.starts_with("sk_") && lower.ends_with("_physicsasset") {
+        return Some(RecoveredDependencyRoute::CurrentDonorRebind("PhysicsAsset"));
+    }
+    None
+}
+
 fn composite_alias_candidate(
     consumer: &PackageStoreEntry,
     target_package_name: &str,
@@ -1914,6 +1981,7 @@ pub fn recover_composite_package_identities(
     let mut recovered_targets =
         HashMap::<u64, (String, String, PackageEntry, PackageIdentityAlias, bool)>::new();
     let mut pending = Vec::<(u64, u64, String, String, PackageEntry, bool)>::new();
+    let mut donor_rebinds = Vec::<CompositeDonorRebindPlan>::new();
     for (consumer_id, target_id) in missing_edges {
         let consumer = source_store
             .get(&consumer_id)
@@ -1944,18 +2012,44 @@ pub fn recover_composite_package_identities(
         }
         let target_name = names[0].clone();
         let target_leaf = package_leaf_without_extension(&target_name);
-        let expected_class = if target_leaf
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MIC_"))
-        {
-            "MaterialInstanceConstant"
-        } else if target_leaf
-            .get(..3)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
-        {
-            "StaticMesh"
-        } else {
-            bail!("recovered dependency {target_name} has no supported structural alias class");
+        let expected_class = match recovered_dependency_route(&target_leaf) {
+            None => {
+                bail!("recovered dependency {target_name} has no supported structural alias class")
+            }
+            Some(RecoveredDependencyRoute::CurrentDonorRebind(expected_class)) => {
+                // The stale sidecar is not aliased. Its consumer must be an
+                // existing same-identity current-game package whose donor no
+                // longer imports the retired dependency; the per-package
+                // serialized-role import repair then rebinds the edge to the
+                // donor's proven successor (or proves retirement) and the
+                // rebuilt container is verified against the donor-derived
+                // import set. Recovery only records the routing decision.
+                let current_imports =
+                    inspection
+                        .target_package_imports
+                        .get(&consumer_id)
+                        .with_context(|| {
+                            format!(
+                                "recovered stale {expected_class} dependency {target_name} requires a same-identity current-game donor for its consumer"
+                            )
+                        })?;
+                if current_imports.contains(&target_id) {
+                    bail!(
+                        "current game still imports recovered dependency {target_name}; stale-dependency evidence is inconsistent"
+                    );
+                }
+                donor_rebinds.push(CompositeDonorRebindPlan {
+                    consumer_package_id: consumer_id,
+                    consumer_package_path: consumer.path.clone(),
+                    target_package_id: target_id,
+                    target_package_name: target_name.clone(),
+                    expected_class: expected_class.to_owned(),
+                    evidence: "same-identity-current-donor-import-table".to_owned(),
+                    policy: "serialized-role-current-template-import-rebase-v1".to_owned(),
+                });
+                continue;
+            }
+            Some(RecoveredDependencyRoute::BundledAlias(expected_class)) => expected_class,
         };
         let (source_candidate, suppress_optional_component) = match composite_alias_candidate(
             consumer,
@@ -2049,52 +2143,75 @@ pub fn recover_composite_package_identities(
         ));
     }
 
-    let mut target_ids = recovered_targets.keys().copied().collect::<Vec<_>>();
-    target_ids.sort_unstable();
-    let provider_hash = sha256_bytes(
-        target_ids
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join("|")
-            .as_bytes(),
-    );
-    let provider_name = format!("OBR_IdentityAliases_{}_P", &provider_hash[..12]);
-    let provider_root = work.join("provider");
-    fs::create_dir_all(&provider_root)?;
-    let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
-    let result = retoc.run([
-        OsString::from("to-zen"),
-        OsString::from("--version"),
-        OsString::from("UE5_3"),
-        alias_legacy.as_os_str().to_owned(),
-        provider_utoc.as_os_str().to_owned(),
-    ])?;
-    RetocTool::assert_success(&result, "identity alias provider rebuild")?;
-    let provider_ucas = provider_utoc.with_extension("ucas");
-    let provider_pak = provider_utoc.with_extension("pak");
-    for path in [&provider_utoc, &provider_ucas, &provider_pak] {
-        if !path.is_file() {
-            bail!("identity alias provider is incomplete: {}", path.display());
+    let provider = if recovered_targets.is_empty() {
+        // Every missing edge was routed to a current-donor rebind, so no
+        // alias provider container is needed or built.
+        None
+    } else {
+        let mut target_ids = recovered_targets.keys().copied().collect::<Vec<_>>();
+        target_ids.sort_unstable();
+        let provider_hash = sha256_bytes(
+            target_ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join("|")
+                .as_bytes(),
+        );
+        let provider_name = format!("OBR_IdentityAliases_{}_P", &provider_hash[..12]);
+        let provider_root = work.join("provider");
+        fs::create_dir_all(&provider_root)?;
+        let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
+        let result = retoc.run([
+            OsString::from("to-zen"),
+            OsString::from("--version"),
+            OsString::from("UE5_3"),
+            alias_legacy.as_os_str().to_owned(),
+            provider_utoc.as_os_str().to_owned(),
+        ])?;
+        RetocTool::assert_success(&result, "identity alias provider rebuild")?;
+        let provider_ucas = provider_utoc.with_extension("ucas");
+        let provider_pak = provider_utoc.with_extension("pak");
+        for path in [&provider_utoc, &provider_ucas, &provider_pak] {
+            if !path.is_file() {
+                bail!("identity alias provider is incomplete: {}", path.display());
+            }
+            copy_probe_file(
+                path,
+                &source_view.join(
+                    path.file_name()
+                        .context("identity alias provider has no filename")?,
+                ),
+            )?;
         }
-        copy_probe_file(
-            path,
-            &source_view.join(
-                path.file_name()
-                    .context("identity alias provider has no filename")?,
-            ),
-        )?;
-    }
-    retoc.verify(&provider_utoc, "identity alias provider")?;
-    let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
-    if provider_packages
-        .iter()
-        .map(|package| package.package_id)
-        .collect::<BTreeSet<_>>()
-        != target_ids.iter().copied().collect::<BTreeSet<_>>()
-    {
-        bail!("identity alias provider inventory does not match recovered target IDs");
-    }
+        retoc.verify(&provider_utoc, "identity alias provider")?;
+        let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
+        if provider_packages
+            .iter()
+            .map(|package| package.package_id)
+            .collect::<BTreeSet<_>>()
+            != target_ids.iter().copied().collect::<BTreeSet<_>>()
+        {
+            bail!("identity alias provider inventory does not match recovered target IDs");
+        }
+        let first_container = inspection
+            .containers
+            .first()
+            .context("identity recovery has no source container")?;
+        let relative_utoc = first_container
+            .relative_utoc
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(format!("{provider_name}.utoc"));
+        Some(CompositeIdentityAliasProvider {
+            provider_name,
+            provider_utoc,
+            provider_ucas,
+            provider_pak,
+            legacy_root: alias_legacy.clone(),
+            relative_utoc,
+        })
+    };
 
     let mut aliases = Vec::new();
     let mut suppressions = Vec::new();
@@ -2179,24 +2296,16 @@ pub fn recover_composite_package_identities(
             "mixed persistent aliases and temporary optional-component providers require separate provider containers"
         );
     }
-    let first_container = inspection
-        .containers
-        .first()
-        .context("identity recovery has no source container")?;
-    let relative_utoc = first_container
-        .relative_utoc
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(format!("{provider_name}.utoc"));
+    donor_rebinds.sort_by(|left, right| {
+        left.target_package_id
+            .cmp(&right.target_package_id)
+            .then(left.consumer_package_id.cmp(&right.consumer_package_id))
+    });
     Ok(Some(CompositeIdentityRecovery {
-        provider_name,
-        provider_utoc,
-        provider_ucas,
-        provider_pak,
-        legacy_root: alias_legacy,
-        relative_utoc,
+        provider,
         aliases,
         suppressions,
+        donor_rebinds,
     }))
 }
 pub fn probe_input(mod_input: &Path, game_root: &Path) -> Result<ReplacementProbeSummary> {
@@ -3008,6 +3117,52 @@ pub fn probe_heterogeneous_replacement_input(
     })
 }
 
+/// Verifies that every planned current-donor rebind was actually consumed by
+/// a successful serialized-role skeletal repair of its consumer: the stale
+/// target must appear among the repair's missing source imports and must be
+/// absent from the donor-derived rebound import set. Any uncovered plan fails
+/// the lane instead of shipping a container that still needs the retired
+/// package.
+pub(crate) fn verify_donor_rebinds_consumed(
+    recovery: Option<&CompositeIdentityRecovery>,
+    skeletal_donor_repairs: &HashMap<u64, CompositePackageImportRepair>,
+) -> Result<()> {
+    let Some(recovery) = recovery else {
+        return Ok(());
+    };
+    for rebind in &recovery.donor_rebinds {
+        let repair = skeletal_donor_repairs
+            .get(&rebind.consumer_package_id)
+            .with_context(|| {
+                format!(
+                    "recovered stale {} dependency {} was not consumed by a serialized-role donor repair of {}",
+                    rebind.expected_class, rebind.target_package_name, rebind.consumer_package_path
+                )
+            })?;
+        if !repair
+            .missing_source_imported_package_ids
+            .contains(&rebind.target_package_id)
+        {
+            bail!(
+                "donor repair of {} did not account for stale dependency {}",
+                rebind.consumer_package_path,
+                rebind.target_package_name
+            );
+        }
+        if repair
+            .target_imported_package_ids
+            .contains(&rebind.target_package_id)
+        {
+            bail!(
+                "donor repair of {} still imports stale dependency {}",
+                rebind.consumer_package_path,
+                rebind.target_package_name
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn probe_composite_package_input(
     mod_input: &Path,
     game_root: &Path,
@@ -3099,6 +3254,7 @@ pub fn probe_composite_package_input(
         .map(|entry| (entry.package_id, entry))
         .collect::<HashMap<_, _>>();
     let mut kinds = BTreeMap::<&'static str, usize>::new();
+    let mut skeletal_donor_repairs = HashMap::new();
     for package in &inspection.packages {
         let effective_path = composite_effective_package_path(package, &inspection)?;
         let asset = find_extracted_additive_static_mesh(&legacy, &effective_path)?;
@@ -3172,7 +3328,7 @@ pub fn probe_composite_package_input(
                         "current SkeletalMesh extraction",
                     )?;
                     let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                    repair_composite_skeletal_mesh_imports(
+                    let repair = repair_composite_skeletal_mesh_imports(
                         &asset,
                         &donor,
                         store,
@@ -3182,6 +3338,7 @@ pub fn probe_composite_package_input(
                     .with_context(|| {
                         format!("repairing composite SkeletalMesh {}", package.path)
                     })?;
+                    skeletal_donor_repairs.insert(package.package_id, repair);
                 } else if missing_store_dependencies != 0 {
                     bail!("resolved SkeletalMesh retains unresolved package-store dependencies");
                 }
@@ -3359,11 +3516,21 @@ pub fn probe_composite_package_input(
             }
         }
     }
-    let kind_summary = kinds
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
+    let donor_rebind_count = identity_recovery
+        .as_ref()
+        .map(|recovery| recovery.donor_rebinds.len())
+        .unwrap_or(0);
+    let mut kind_summary = kinds
         .into_iter()
         .map(|(kind, count)| format!("{count} {kind}"))
         .collect::<Vec<_>>()
         .join(", ");
+    if donor_rebind_count > 0 {
+        kind_summary = format!(
+            "{kind_summary}; {donor_rebind_count} stale dependency edge(s) rebound to the current game revision by serialized-role donor repair"
+        );
+    }
     Ok(ReplacementProbeSummary {
         container_count: inspection.containers.len(),
         package_count: inspection.packages.len(),
@@ -3562,6 +3729,44 @@ mod tests {
             packed_texture_kind: None,
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn routes_recovered_dependencies_by_structural_class() {
+        assert_eq!(
+            recovered_dependency_route("MIC_Hobbe_BattleAxe"),
+            Some(RecoveredDependencyRoute::BundledAlias(
+                "MaterialInstanceConstant"
+            ))
+        );
+        assert_eq!(
+            recovered_dependency_route("SM_FarmWeapShears_Scabbard"),
+            Some(RecoveredDependencyRoute::BundledAlias("StaticMesh"))
+        );
+        // Retired Unreal-editor default sidecars of a skeletal mesh route to
+        // the current-donor serialized-role repair.
+        assert_eq!(
+            recovered_dependency_route("SK_SE_Duchess_Dress_Skeleton"),
+            Some(RecoveredDependencyRoute::CurrentDonorRebind("Skeleton"))
+        );
+        assert_eq!(
+            recovered_dependency_route("SK_Iron_Boots_B_PhysicsAsset"),
+            Some(RecoveredDependencyRoute::CurrentDonorRebind("PhysicsAsset"))
+        );
+    }
+
+    #[test]
+    fn does_not_route_current_game_naming_or_plain_meshes() {
+        // The current game names engine Skeleton/PhysicsAsset packages with
+        // SKEL_/PA_ prefixes, and "Skeleton" also appears as an undead
+        // creature name; none of those may be treated as retired sidecars.
+        assert_eq!(recovered_dependency_route("SKEL_HumanoidSkeleton"), None);
+        assert_eq!(recovered_dependency_route("PA_HumanoidFull"), None);
+        assert_eq!(recovered_dependency_route("BP_Horse_Skeleton"), None);
+        assert_eq!(recovered_dependency_route("T_Iron_Boots_D"), None);
+        // A plain skeletal mesh is never a sidecar of another mesh.
+        assert_eq!(recovered_dependency_route("SK_Blades_Boots"), None);
+        assert_eq!(recovered_dependency_route("SK_Chainmail_Cuirass_f_Physics"), None);
     }
 
     #[test]

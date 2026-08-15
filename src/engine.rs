@@ -33,7 +33,7 @@ use crate::replacement::{
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
     inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
     inspect_texture_staged, recover_composite_package_identities, stage_input,
-    validate_texture_replacement_pair,
+    validate_texture_replacement_pair, verify_donor_rebinds_consumed,
 };
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
@@ -1663,6 +1663,7 @@ fn run_additive_update_with_dependency_policy(
         fs::write(&candidate_esp, rewritten)?;
     }
     let mut container_results = Vec::new();
+    let mut skeletal_donor_repairs = HashMap::new();
     for container in &container_inputs {
         let root = container_work.join(&container.name);
         let legacy = root.join("legacy");
@@ -1757,6 +1758,11 @@ fn run_additive_update_with_dependency_policy(
                     .join(package.package_id.to_string()),
             )?;
             expected_imports.insert(package.package_id, migration.expected_imports.clone());
+            if migration.kind == "skeletal-mesh"
+                && let Some(repair) = &migration.import_repair
+            {
+                skeletal_donor_repairs.insert(package.package_id, repair.clone());
+            }
             package_migrations.push(migration);
             if let Some(suppression) = suppression {
                 optional_dependency_suppressions.push(suppression);
@@ -1850,18 +1856,23 @@ fn run_additive_update_with_dependency_policy(
     if let Some(recovery) = &identity_recovery
         && !recovery.aliases.is_empty()
     {
+        let provider = recovery
+            .provider
+            .as_ref()
+            .context("identity alias provider is missing for persistent aliases")?;
         for source in [
-            &recovery.provider_utoc,
-            &recovery.provider_ucas,
-            &recovery.provider_pak,
+            &provider.provider_utoc,
+            &provider.provider_ucas,
+            &provider.provider_pak,
         ] {
             copy_file(source, &candidate_paks.join(source.file_name().unwrap()))?;
         }
         retoc.verify(
-            &candidate_paks.join(recovery.provider_utoc.file_name().unwrap()),
+            &candidate_paks.join(provider.provider_utoc.file_name().unwrap()),
             "additive identity alias provider",
         )?;
     }
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
 
     stage(
         callback,
@@ -2023,6 +2034,14 @@ fn run_additive_update_with_dependency_policy(
                 .as_ref()
                 .map(|recovery| recovery.aliases.len())
                 .unwrap_or(0),
+            "recoveredStaleDependencyRebindCount": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.donor_rebinds.len())
+                .unwrap_or(0),
+            "recoveredStaleDependencyRebinds": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.donor_rebinds.clone())
+                .unwrap_or_default(),
             "syncMapEntries": sync_entries,
             "syncMapResolutions": sync_map_resolutions,
         },
@@ -4124,6 +4143,7 @@ fn run_composite_package_update(
         body_setup_repairs: Vec<BodySetupRepair>,
     }
     let mut built = Vec::new();
+    let mut skeletal_donor_repairs = HashMap::new();
     stage(
         callback,
         2,
@@ -4218,6 +4238,11 @@ fn run_composite_package_update(
             )
             .with_context(|| format!("migrating composite package {}", package.path))?;
             expected_imports.insert(package.package_id, migration.expected_imports.clone());
+            if migration.kind == "skeletal-mesh"
+                && let Some(repair) = &migration.import_repair
+            {
+                skeletal_donor_repairs.insert(package.package_id, repair.clone());
+            }
             rows.push(json!({
                 "packageId": package.package_id,
                 "sourcePath": package.path,
@@ -4305,6 +4330,8 @@ fn run_composite_package_update(
         });
     }
 
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
+
     stage(
         callback,
         4,
@@ -4330,10 +4357,14 @@ fn run_composite_package_update(
     if let Some(recovery) = &identity_recovery
         && !recovery.aliases.is_empty()
     {
+        let provider = recovery
+            .provider
+            .as_ref()
+            .context("identity alias provider is missing for persistent aliases")?;
         for source in [
-            &recovery.provider_utoc,
-            &recovery.provider_ucas,
-            &recovery.provider_pak,
+            &provider.provider_utoc,
+            &provider.provider_ucas,
+            &provider.provider_pak,
         ] {
             copy_file(
                 source,
@@ -4403,6 +4434,10 @@ fn run_composite_package_update(
     let identity_alias_report = if let Some(recovery) = &identity_recovery
         && !recovery.aliases.is_empty()
     {
+        let provider = recovery
+            .provider
+            .as_ref()
+            .context("identity alias provider is missing for persistent aliases")?;
         let mut alias_packages = recovery
             .aliases
             .iter()
@@ -4415,7 +4450,7 @@ fn run_composite_package_update(
             .collect::<Vec<_>>();
         alias_packages.sort_by_key(|(package, _)| package.package_id);
         alias_packages.dedup_by_key(|(package, _)| package.package_id);
-        let alias_roundtrip = work.path().join("roundtrip").join(&recovery.provider_name);
+        let alias_roundtrip = work.path().join("roundtrip").join(&provider.provider_name);
         extract_composite_packages_exact(
             &retoc,
             verify_view.path(),
@@ -4424,22 +4459,22 @@ fn run_composite_package_update(
             "identity alias provider roundtrip",
         )?;
         let payload = verify_preserved_export_payloads(
-            &recovery.legacy_root,
+            &provider.legacy_root,
             &alias_roundtrip,
             &work
                 .path()
                 .join("payload-verification")
-                .join(&recovery.provider_name),
+                .join(&provider.provider_name),
         )?;
-        let candidate_utoc = output_directory.join(&recovery.relative_utoc);
+        let candidate_utoc = output_directory.join(&provider.relative_utoc);
         let candidate_ucas = candidate_utoc.with_extension("ucas");
         let candidate_pak = candidate_utoc.with_extension("pak");
-        copy_file(&recovery.provider_utoc, &candidate_utoc)?;
-        copy_file(&recovery.provider_ucas, &candidate_ucas)?;
-        copy_file(&recovery.provider_pak, &candidate_pak)?;
+        copy_file(&provider.provider_utoc, &candidate_utoc)?;
+        copy_file(&provider.provider_ucas, &candidate_ucas)?;
+        copy_file(&provider.provider_pak, &candidate_pak)?;
         Some(json!({
-            "name": recovery.provider_name,
-            "relativeUtoc": recovery.relative_utoc,
+            "name": provider.provider_name,
+            "relativeUtoc": provider.relative_utoc,
             "packageCount": alias_packages.len(),
             "aliases": recovery.aliases,
             "payloadEquivalence": payload,
@@ -4473,6 +4508,10 @@ fn run_composite_package_update(
                 .as_ref()
                 .map(|recovery| recovery.aliases.iter().map(|alias| alias.target_package.package_id).collect::<BTreeSet<_>>().len())
                 .unwrap_or(0),
+            "recoveredStaleDependencyRebindCount": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.donor_rebinds.len())
+                .unwrap_or(0),
             "classDrivenSystemWideRules": true,
             "modSpecificWhitelistUsed": false,
             "packagePathsAndIdsVerified": true,
@@ -4493,6 +4532,10 @@ fn run_composite_package_update(
         "unreal": {
             "containers": container_reports,
             "identityAliasProvider": identity_alias_report,
+            "staleDependencyRebinds": identity_recovery
+                .as_ref()
+                .map(|recovery| recovery.donor_rebinds.clone())
+                .unwrap_or_default(),
         },
         "output": {"directory": output_directory, "archive": output_archive},
         "verification": {

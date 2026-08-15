@@ -3923,7 +3923,10 @@ pub fn probe_identity_alias_recovery(
         Some(recovery) => IdentityAliasRecoveryProbeSummary {
             api: IDENTITY_ALIAS_RECOVERY_PROBE_API.to_owned(),
             status: "recovered".to_owned(),
-            provider_name: Some(recovery.provider_name.clone()),
+            provider_name: recovery
+                .provider
+                .as_ref()
+                .map(|provider| provider.provider_name.clone()),
             alias_count: recovery.aliases.len(),
             suppression_count: recovery.suppressions.len(),
             aliases: recovery

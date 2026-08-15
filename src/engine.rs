@@ -28,7 +28,8 @@ use crate::replacement::{
     HETEROGENEOUS_REPLACEMENT_ADAPTER, MIXED_ARMOR_REPLACEMENT_ADAPTER, ProvenHeterogeneousAsset,
     TEXTURE_REPLACEMENT_ADAPTER, canonical_additive_static_mesh_path, canonical_package_path,
     classify_heterogeneous_asset, composite_effective_package_path,
-    extract_composite_packages_exact, extract_source_packages_exact,
+    extract_composite_packages_exact, extract_current_packages_batched,
+    extract_source_packages_exact,
     extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
     inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
@@ -3442,6 +3443,7 @@ fn run_heterogeneous_replacement_update(
                 container.name
             ),
         );
+        let mut pending_textures = Vec::new();
         for package in &container.packages {
             let source_asset = find_additive_static_mesh_asset(&legacy, &package.path)?;
             match classify_heterogeneous_asset(&source_asset)? {
@@ -3472,20 +3474,35 @@ fn run_heterogeneous_replacement_update(
                     classifications.insert(package.package_id, "texture2d");
                     texture_count += 1;
                     source.asset = canonical_additive_static_mesh_path(&package.path)?;
-                    let current_package = current_packages_by_id
-                        .get(&package.package_id)
-                        .context("heterogeneous current package inventory lost an identity")?;
-                    let donor_root = current_stock.join(package.package_id.to_string());
-                    let donor_asset =
-                        extract_current_package(&retoc, stock_input, &donor_root, current_package)?;
-                    let donor = inspect_texture_asset(&donor_asset)?;
-                    texture_assets.push(validate_texture_replacement_pair(
-                        source,
-                        &donor,
-                        &package.path,
-                    )?);
+                    pending_textures.push((package, Box::new(source)));
                 }
             }
+        }
+        // One batched donor extraction per container reads the current package
+        // store once instead of once per Texture2D donor.
+        let donor_targets = pending_textures
+            .iter()
+            .map(|(package, _)| {
+                Ok(current_packages_by_id
+                    .get(&package.package_id)
+                    .context("heterogeneous current package inventory lost an identity")?
+                    .clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let donor_assets = extract_current_packages_batched(
+            &retoc,
+            stock_input,
+            &current_stock.join("donors"),
+            &donor_targets,
+            &format!("heterogeneous current donor extraction {}", container.name),
+        )?;
+        for ((package, source), donor_asset) in pending_textures.into_iter().zip(donor_assets) {
+            let donor = inspect_texture_asset(&donor_asset)?;
+            texture_assets.push(validate_texture_replacement_pair(
+                *source,
+                &donor,
+                &package.path,
+            )?);
         }
         texture_assets.sort_by_key(|asset| asset.asset.to_ascii_lowercase());
         let body_setup_repairs = repair_legacy_body_setups(&legacy)?;

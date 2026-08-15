@@ -3559,6 +3559,14 @@ fn run_heterogeneous_replacement_update(
             }
         }
 
+        stage(
+            callback,
+            5,
+            &format!(
+                "Verifying the rebuilt {} roundtrip against current Zen metadata",
+                container.name
+            ),
+        );
         let roundtrip_view = create_isolated_stock_view(&game.root)?;
         for source in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
             copy_file(

@@ -350,6 +350,11 @@ fn discover_diagnostic_containers(
             .path()
             .strip_prefix(root)
             .map_err(|_| anyhow::anyhow!("mixed replacement file escaped its candidate root"))?;
+        // Passive documentation is inert and must not abort the diagnostic;
+        // the adapter-side container discovery applies the same allowance.
+        if is_passive_documentation_path(relative) {
+            continue;
+        }
         let extension = relative
             .extension()
             .and_then(|value| value.to_str())
@@ -4071,6 +4076,26 @@ mod tests {
             "exact-replacement-via-root-alias"
         );
         assert_eq!(serialized["rootAliasReplacementCount"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn diagnostic_container_discovery_tolerates_passive_documentation_only() {
+        let retoc = RetocTool::materialize().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("readme.txt"), b"docs").unwrap();
+        // Passive documentation must not abort the diagnostic; with no
+        // container triples left the discovery reports that honestly.
+        let error = discover_diagnostic_containers(root.path(), &retoc)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no container triples"), "{error}");
+
+        // A functional loose file still fails closed.
+        fs::write(root.path().join("loader.lua"), b"script").unwrap();
+        let error = discover_diagnostic_containers(root.path(), &retoc)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not Unreal-container-only"), "{error}");
     }
 
     #[test]

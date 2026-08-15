@@ -581,6 +581,149 @@ fn evaluate_additive_policy(
     }
 }
 
+pub const MAGICLOADER_SYNCMAP_KEY_GATE_API: &str = "tes4-syncmap-plugin-key-gate-v1";
+
+/// Bounded SyncMap key gate for the MagicLoader worldspace lane: exactly one SyncMap INI,
+/// non-empty, unique keys, every key's 24-bit local FormID owned by the single staged ESP.
+/// Package-target closure is enforced separately by the update lane's layered resolver.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagicLoaderSyncMapGate {
+    pub api: String,
+    pub status: String,
+    pub entry_count: usize,
+    pub plugin_owned_key_count: usize,
+    pub blockers: Vec<String>,
+}
+
+pub fn inspect_magicloader_syncmap_gate(
+    input: &Path,
+    candidate_root: Option<&str>,
+) -> Result<MagicLoaderSyncMapGate> {
+    let (_staged, root, _scan_mode) = inspect_staged_plugin_input(input, candidate_root)?;
+    let mut gate = MagicLoaderSyncMapGate {
+        api: MAGICLOADER_SYNCMAP_KEY_GATE_API.to_owned(),
+        status: "blocked".to_owned(),
+        entry_count: 0,
+        plugin_owned_key_count: 0,
+        blockers: Vec::new(),
+    };
+    let esp_paths = bounded_tree_paths(&root, |path| {
+        plugin_kind(path).as_deref() == Some("esp")
+    })?;
+    let [esp_path] = esp_paths.as_slice() else {
+        gate.blockers.push(format!(
+            "requires-exactly-one-staged-esp:found-{}",
+            esp_paths.len()
+        ));
+        return Ok(gate);
+    };
+    let ini_paths = bounded_tree_paths(&root, |path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("ini"))
+            && direct_sync_map_ini(&normalize_relative(
+                path.strip_prefix(&root).unwrap_or(path),
+            ))
+    })?;
+    let [ini_path] = ini_paths.as_slice() else {
+        gate.blockers.push(format!(
+            "requires-exactly-one-syncmap-ini:found-{}",
+            ini_paths.len()
+        ));
+        return Ok(gate);
+    };
+    let esp_relative = normalize_relative(esp_path.strip_prefix(&root).unwrap_or(esp_path));
+    let payload = bounded_plugin_payload(esp_path, &esp_relative)?;
+    let plugin = read_plugin_bytes(&payload, &esp_relative)?;
+    let plugin_index = plugin.masters.len() as u8;
+    let owned_local_ids = plugin
+        .records
+        .iter()
+        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+        .map(|record| record.form_id & 0x00ff_ffff)
+        .collect::<HashSet<_>>();
+    let ini_relative = normalize_relative(ini_path.strip_prefix(&root).unwrap_or(ini_path));
+    let ini_payload = bounded_file_payload(ini_path, &ini_relative, MAX_PLUGIN_BYTES)?;
+    let entries = read_sync_map_bytes(&ini_payload, &ini_relative)?;
+    gate.entry_count = entries.len();
+    if entries.is_empty() {
+        gate.blockers.push("syncmap-declares-no-meshes-entries".to_owned());
+    }
+    let mut seen = HashSet::new();
+    for entry in &entries {
+        let local_id =
+            u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)
+                .with_context(|| format!("SyncMap key {} is not hexadecimal", entry.key))?;
+        if !seen.insert(local_id) {
+            gate.blockers.push(format!(
+                "syncmap-key-duplicates-plugin-local-id:0x{local_id:06X}"
+            ));
+            continue;
+        }
+        if owned_local_ids.contains(&local_id) {
+            gate.plugin_owned_key_count += 1;
+        } else {
+            gate.blockers
+                .push(format!("syncmap-key-not-plugin-owned:0x{local_id:06X}"));
+        }
+    }
+    gate.blockers.sort();
+    gate.blockers.dedup();
+    if gate.blockers.is_empty() {
+        gate.status = "proven".to_owned();
+    }
+    Ok(gate)
+}
+
+pub const MAGICLOADER_WORLDSPACE_PLUGIN_POLICY: &str = "tes4-magicloader-worldspace-policy-v1";
+
+/// Plugin policy for the MagicLoader worldspace lane: one structurally sound full ESP
+/// directly under Data with Oblivion.esm first. Master overrides (including worldspace
+/// domains) are allowed here because the lane validates them through the current-master
+/// semantic gate and the undelete-and-disable deletion policy instead of the additive
+/// inventory contract.
+pub fn evaluate_magicloader_worldspace_policy(report: &PluginSetReport) -> PluginPolicyEvaluation {
+    let mut blockers = report.blockers.clone();
+    if report.artifacts.len() != 1 {
+        blockers.push("requires-exactly-one-plugin".to_owned());
+    }
+    if let Some(plugin) = report.artifacts.first().filter(|_| report.artifacts.len() == 1) {
+        if plugin.kind != "esp" {
+            blockers.push("requires-one-full-esp-not-esm-or-esl".to_owned());
+        }
+        if plugin.master_flag {
+            blockers.push("esp-header-declares-master-file".to_owned());
+        }
+        if plugin.light_plugin_flag {
+            blockers.push("esp-header-declares-light-plugin".to_owned());
+        }
+        if !direct_game_data_plugin(&plugin.relative_path) {
+            blockers.push("esp-is-not-directly-under-content-dev-obvdata-data".to_owned());
+        }
+        if plugin.parse_status != "parsed" {
+            blockers.push("esp-could-not-be-parsed".to_owned());
+        }
+        if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
+            blockers.push("requires-oblivion-esm-as-first-master".to_owned());
+        }
+        blockers.extend(plugin.structural_blockers.iter().cloned());
+    }
+    blockers.sort();
+    blockers.dedup();
+    PluginPolicyEvaluation {
+        id: MAGICLOADER_WORLDSPACE_PLUGIN_POLICY.to_owned(),
+        compatible: blockers.is_empty(),
+        mutation_policy: if blockers.is_empty() {
+            "undelete-and-disable-witness-deletion-stubs-and-preserve-every-other-record-byte"
+                .to_owned()
+        } else {
+            "report-only".to_owned()
+        },
+        blockers,
+    }
+}
+
 fn bounded_file_payload(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>> {
     let file = fs::File::open(path).with_context(|| format!("opening bounded payload {label}"))?;
     let declared_bytes = file.metadata()?.len();

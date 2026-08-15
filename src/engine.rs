@@ -18,9 +18,12 @@ use crate::install_plan::{
     resolve_staged_install_view, supports_logical_install_publication, verify_install_trees_match,
 };
 use crate::plugin::{
-    ADDITIVE_CONTRACT_API, PLUGIN_MANIFEST_API, PLUGIN_PRESERVATION_API,
-    PLUGIN_SEMANTIC_REWRITE_API, inspect_plugin_set, resolve_installed_master_records,
-    verify_plugin_set_preserved, verify_plugin_set_with_rewritten_esp,
+    ADDITIVE_CONTRACT_API, MAGICLOADER_WORLDSPACE_PLUGIN_POLICY, PLUGIN_MANIFEST_API,
+    PLUGIN_PRESERVATION_API, PLUGIN_SEMANTIC_REWRITE_API, UNDELETE_DISABLE_POLICY_API,
+    WORLDSPACE_SEMANTIC_GATE_API, WorldspaceLaneEvaluation,
+    evaluate_magicloader_worldspace_policy, evaluate_worldspace_lane_semantics,
+    inspect_plugin_set, resolve_installed_master_records, verify_plugin_set_preserved,
+    verify_plugin_set_with_rewritten_esp,
 };
 use crate::preflight::{PreflightRequest, analyze};
 use crate::replacement::{
@@ -38,7 +41,7 @@ use crate::replacement::{
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
     Record, SyncMapEntry, merge_inventory_addition, package_to_game_path, read_plugin,
-    read_sync_map, record_editor_id, rewrite_plugin_records, sorted_form_ids,
+    read_sync_map, record_editor_id, rewrite_plugin_records_with_flag_updates, sorted_form_ids,
     validate_inventory_addition,
 };
 use crate::uasset::{
@@ -795,6 +798,184 @@ fn resolve_sync_map_entries(
     }
     Ok(resolutions)
 }
+/// Structural fail-closed parse of a MagicLoader JSON sidecar. MagicLoader itself accepts
+/// trailing commas, so they are normalized (outside string literals only) before the strict
+/// parse; the sidecar bytes shipped to the candidate are never modified.
+fn validate_magic_loader_sidecar(payload: &[u8]) -> Result<()> {
+    let text = std::str::from_utf8(payload).context("sidecar is not UTF-8")?;
+    let mut normalized = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    let chars = text.chars().collect::<Vec<_>>();
+    for (index, character) in chars.iter().copied().enumerate() {
+        if in_string {
+            normalized.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            normalized.push(character);
+            continue;
+        }
+        if character == ',' {
+            let next_meaningful = chars[index + 1..]
+                .iter()
+                .copied()
+                .find(|value| !value.is_whitespace());
+            if matches!(next_meaningful, Some('}') | Some(']')) {
+                continue;
+            }
+        }
+        normalized.push(character);
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&normalized).context("sidecar is not structurally valid JSON")?;
+    let object = value
+        .as_object()
+        .context("sidecar root is not a JSON object")?;
+    if object.is_empty() {
+        bail!("sidecar declares no configuration entries");
+    }
+    Ok(())
+}
+
+/// SyncMap resolution across the layered package domain: bundled mod packages first
+/// (exact path, then unique object leaf), then exact stock-game package paths. Stock
+/// targets never use leaf aliasing; anything unresolved or ambiguous fails closed.
+fn resolve_sync_map_entries_layered(
+    entries: &[SyncMapEntry],
+    owned_records: &[&Record],
+    bundled_packages: &[String],
+    stock_packages: &[PackageStoreEntry],
+) -> Result<Vec<SyncMapResolution>> {
+    let bundled = bundled_packages
+        .iter()
+        .map(|source| Ok((source, package_to_game_path(source)?)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut stock_by_game_path = HashMap::<String, Vec<&PackageStoreEntry>>::new();
+    for entry in stock_packages {
+        if let Ok(game_path) = package_to_game_path(&entry.path) {
+            stock_by_game_path
+                .entry(game_path.to_ascii_lowercase())
+                .or_default()
+                .push(entry);
+        }
+    }
+    let mut resolutions = Vec::new();
+    let mut resolved_form_ids = HashSet::new();
+    for entry in entries {
+        let local_id = u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
+        if !resolved_form_ids.insert(local_id) {
+            bail!("multiple SyncMap entries reference plugin-owned ESP FormID 0x{local_id:06X}");
+        }
+        let mut matching_records = owned_records
+            .iter()
+            .copied()
+            .filter(|record| record.form_id & 0x00FF_FFFF == local_id);
+        let record = matching_records.next().with_context(|| {
+            format!(
+                "SyncMap key {} has no matching plugin-owned ESP FormID",
+                entry.key
+            )
+        })?;
+        if matching_records.next().is_some() {
+            bail!(
+                "SyncMap key {} is ambiguous across multiple plugin-owned ESP records with local FormID 0x{local_id:06X}",
+                entry.key
+            );
+        }
+        let exact_bundled = bundled
+            .iter()
+            .filter(|(_, game_path)| game_path.eq_ignore_ascii_case(&entry.package_path))
+            .collect::<Vec<_>>();
+        let (source_path, game_path, resolution, directory_alias_allowed) =
+            match exact_bundled.as_slice() {
+                [(source_path, game_path)] => (
+                    (*source_path).clone(),
+                    game_path.clone(),
+                    "exact-package-path-bundled",
+                    false,
+                ),
+                [] => {
+                    let object_name = entry
+                        .object_path
+                        .rsplit('.')
+                        .next()
+                        .and_then(|value| value.rsplit('/').next())
+                        .filter(|value| !value.is_empty())
+                        .with_context(|| format!("SyncMap key {} has no object name", entry.key))?;
+                    let leaf_bundled = bundled
+                        .iter()
+                        .filter(|(_, game_path)| {
+                            game_path
+                                .rsplit('/')
+                                .next()
+                                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(object_name))
+                        })
+                        .collect::<Vec<_>>();
+                    match leaf_bundled.as_slice() {
+                        [(source_path, game_path)] => (
+                            (*source_path).clone(),
+                            game_path.clone(),
+                            "unique-object-leaf-bundled",
+                            true,
+                        ),
+                        [] => {
+                            let stock = stock_by_game_path
+                                .get(&entry.package_path.to_ascii_lowercase())
+                                .map(Vec::as_slice)
+                                .unwrap_or_default();
+                            match stock {
+                                [stock_entry] => (
+                                    stock_entry.path.clone(),
+                                    package_to_game_path(&stock_entry.path)?,
+                                    "exact-package-path-stock",
+                                    false,
+                                ),
+                                [] => bail!(
+                                    "SyncMap object {} resolves in neither the bundled packages nor the current stock inventory",
+                                    entry.object_path
+                                ),
+                                _ => bail!(
+                                    "SyncMap path {} is ambiguous across multiple stock package paths",
+                                    entry.package_path
+                                ),
+                            }
+                        }
+                        _ => bail!(
+                            "SyncMap object {} is ambiguous across {} bundled package paths",
+                            entry.object_path,
+                            leaf_bundled.len()
+                        ),
+                    }
+                }
+                _ => bail!(
+                    "SyncMap path {} is ambiguous across {} bundled package paths",
+                    entry.package_path,
+                    exact_bundled.len()
+                ),
+            };
+        resolutions.push(SyncMapResolution {
+            key: entry.key.clone(),
+            local_form_id: entry.local_form_id.clone(),
+            editor_id: record_editor_id(record),
+            declared_object_path: entry.object_path.clone(),
+            rebuilt_package_path: game_path,
+            rebuilt_inventory_path: source_path,
+            resolution: resolution.to_owned(),
+            directory_alias_allowed,
+        });
+    }
+    Ok(resolutions)
+}
+
 fn portable_archive_path(output_directory: &Path) -> Result<PathBuf> {
     let parent = output_directory
         .parent()
@@ -823,6 +1004,7 @@ fn run_direct_update(
     // The adapter comes from preflight. Refuse unknown names instead of guessing which conversion is close enough.
     match request.adapter.as_str() {
         "native-additive-syncmap-v1" => run_additive_update(request, callback),
+        MAGICLOADER_WORLDSPACE_ADAPTER => run_magicloader_worldspace_update(request, callback),
         ARMOR_REPLACEMENT_ADAPTER => run_armor_replacement_update(request, callback),
         MIXED_ARMOR_REPLACEMENT_ADAPTER => run_mixed_armor_replacement_update(request, callback),
         TEXTURE_REPLACEMENT_ADAPTER => run_texture_replacement_update(request, callback),
@@ -1260,6 +1442,28 @@ fn run_logical_install_update(
     })
 }
 
+/// The guarded MagicLoader + multi-master worldspace ESP + SyncMap + additive IoStore lane.
+pub const MAGICLOADER_WORLDSPACE_ADAPTER: &str = "native-magicloader-worldspace-syncmap-v1";
+
+/// Which proven ESP + SyncMap + IoStore lane the shared additive engine body runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EspSyncLane {
+    /// Inventory-additive ESP policy; master overrides merge current-master inventory rows.
+    AdditiveSyncmap,
+    /// MagicLoader sidecar + multi-master worldspace ESP; overrides pass the three-way
+    /// current-master semantic gate and witness-shaped deletion stubs are undeleted-and-disabled.
+    MagicLoaderWorldspace,
+}
+
+impl EspSyncLane {
+    fn adapter_id(self) -> &'static str {
+        match self {
+            EspSyncLane::AdditiveSyncmap => "native-additive-syncmap-v1",
+            EspSyncLane::MagicLoaderWorldspace => MAGICLOADER_WORLDSPACE_ADAPTER,
+        }
+    }
+}
+
 fn run_additive_update(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
@@ -1272,10 +1476,40 @@ fn run_additive_update(
     Ok(outcome)
 }
 
+fn run_magicloader_worldspace_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let (outcome, deferred_dependencies) = run_esp_sync_lane_update(
+        request,
+        callback,
+        true,
+        EspSyncLane::MagicLoaderWorldspace,
+    )?;
+    if !deferred_dependencies.is_empty() {
+        bail!("direct MagicLoader worldspace update unexpectedly deferred runtime dependencies");
+    }
+    Ok(outcome)
+}
+
 fn run_additive_update_with_dependency_policy(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
     install_runtime_dependencies: bool,
+) -> Result<(UpdateOutcome, Vec<crate::dependencies::DependencyCandidate>)> {
+    run_esp_sync_lane_update(
+        request,
+        callback,
+        install_runtime_dependencies,
+        EspSyncLane::AdditiveSyncmap,
+    )
+}
+
+fn run_esp_sync_lane_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+    install_runtime_dependencies: bool,
+    lane: EspSyncLane,
 ) -> Result<(UpdateOutcome, Vec<crate::dependencies::DependencyCandidate>)> {
     let mod_input = fs::canonicalize(&request.mod_input)
         .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
@@ -1352,12 +1586,40 @@ fn run_additive_update_with_dependency_policy(
                 .saturating_sub(plugin_set.plugin_count)
         );
     }
-    if !plugin_set.additive_syncmap_v1.compatible {
+    let lane_plugin_policy = match lane {
+        EspSyncLane::AdditiveSyncmap => plugin_set.additive_syncmap_v1.clone(),
+        EspSyncLane::MagicLoaderWorldspace => evaluate_magicloader_worldspace_policy(&plugin_set),
+    };
+    if !lane_plugin_policy.compatible {
         bail!(
-            "native additive plugin policy failed: {}",
-            plugin_set.additive_syncmap_v1.blockers.join(", ")
+            "{} plugin policy failed: {}",
+            lane_plugin_policy.id,
+            lane_plugin_policy.blockers.join(", ")
         );
     }
+    let magic_loader_dir = mod_data.join("MagicLoader");
+    let magic_loader_files = if lane == EspSyncLane::MagicLoaderWorldspace {
+        let files = if magic_loader_dir.is_dir() {
+            files_with_extension(&magic_loader_dir, "json")?
+        } else {
+            Vec::new()
+        };
+        if files.is_empty() {
+            bail!("the MagicLoader worldspace lane requires at least one MagicLoader JSON sidecar");
+        }
+        for file in &files {
+            let payload = fs::read(file)?;
+            validate_magic_loader_sidecar(&payload).with_context(|| {
+                format!(
+                    "MagicLoader sidecar failed the structural parse: {}",
+                    file.file_name().unwrap_or_default().to_string_lossy()
+                )
+            })?;
+        }
+        files
+    } else {
+        Vec::new()
+    };
     let esp_files = files_with_extension(&mod_data, "esp")?;
     if esp_files.len() != 1 {
         bail!(
@@ -1421,63 +1683,113 @@ fn run_additive_update_with_dependency_policy(
         .iter()
         .map(|record| record.form_id)
         .collect::<Vec<_>>();
-    let current_records =
-        resolve_installed_master_records(&plugin, &game_data, &target_record_ids)?;
+    let esp_name = esp_files[0]
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("plugin.esp")
+        .to_owned();
+    let source_esp_bytes = fs::read(&esp_files[0])?;
     let mut override_results = Vec::new();
     let mut plugin_replacements = HashMap::new();
-    let mut referenced_master_ids = Vec::new();
-    for override_record in overrides {
-        let current = current_records
-            .get(&override_record.form_id)
-            .with_context(|| {
-                format!(
-                    "installed master chain has no override target 0x{:08X}",
-                    override_record.form_id
-                )
-            })?;
-        if current.record.kind != override_record.kind {
-            bail!(
-                "master override 0x{:08X} is {}/{} in staged/installed data",
-                override_record.form_id,
-                override_record.kind,
-                current.record.kind
-            );
-        }
-        let (merged, mut result) =
-            merge_inventory_addition(override_record, &current.record, plugin_index)?;
-        if !result.preserved_current_master_entries.is_empty() {
-            plugin_replacements.insert(override_record.form_id, merged);
-        }
-        for addition in result
-            .added_inventory_entries
-            .iter_mut()
-            .chain(&mut result.preserved_current_master_entries)
-        {
-            let item_form_id =
-                u32::from_str_radix(addition.item_form_id.trim_start_matches("0x"), 16)?;
-            addition.reference_validated = match addition.reference_scope.as_str() {
-                "plugin-owned" => owned_record_ids.contains(&item_form_id),
-                "current-master" => {
-                    referenced_master_ids.push(item_form_id);
-                    true
+    let mut flag_update_form_ids = HashSet::new();
+    let mut current_records = HashMap::new();
+    let mut worldspace_evaluation: Option<WorldspaceLaneEvaluation> = None;
+    match lane {
+        EspSyncLane::AdditiveSyncmap => {
+            current_records =
+                resolve_installed_master_records(&plugin, &game_data, &target_record_ids)?;
+            let mut referenced_master_ids = Vec::new();
+            for override_record in overrides {
+                let current = current_records
+                    .get(&override_record.form_id)
+                    .with_context(|| {
+                        format!(
+                            "installed master chain has no override target 0x{:08X}",
+                            override_record.form_id
+                        )
+                    })?;
+                if current.record.kind != override_record.kind {
+                    bail!(
+                        "master override 0x{:08X} is {}/{} in staged/installed data",
+                        override_record.form_id,
+                        override_record.kind,
+                        current.record.kind
+                    );
                 }
-                _ => false,
-            };
-            if !addition.reference_validated {
+                let (merged, mut result) =
+                    merge_inventory_addition(override_record, &current.record, plugin_index)?;
+                if !result.preserved_current_master_entries.is_empty() {
+                    plugin_replacements.insert(override_record.form_id, merged);
+                }
+                for addition in result
+                    .added_inventory_entries
+                    .iter_mut()
+                    .chain(&mut result.preserved_current_master_entries)
+                {
+                    let item_form_id =
+                        u32::from_str_radix(addition.item_form_id.trim_start_matches("0x"), 16)?;
+                    addition.reference_validated = match addition.reference_scope.as_str() {
+                        "plugin-owned" => owned_record_ids.contains(&item_form_id),
+                        "current-master" => {
+                            referenced_master_ids.push(item_form_id);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !addition.reference_validated {
+                        bail!(
+                            "inventory override {} adds unresolved {} inventory reference {}",
+                            result.form_id,
+                            addition.reference_scope,
+                            addition.item_form_id
+                        );
+                    }
+                }
+                override_results.push(result);
+            }
+            referenced_master_ids.sort_unstable();
+            referenced_master_ids.dedup();
+            resolve_installed_master_records(&plugin, &game_data, &referenced_master_ids)
+                .context("resolving inventory references through the installed master chain")?;
+        }
+        EspSyncLane::MagicLoaderWorldspace => {
+            let _ = &target_record_ids;
+            let evaluation = evaluate_worldspace_lane_semantics(
+                &plugin,
+                &source_esp_bytes,
+                &esp_name,
+                &game_data,
+            )?;
+            if evaluation.semantic_gate.status != "proven" {
                 bail!(
-                    "inventory override {} adds unresolved {} inventory reference {}",
-                    result.form_id,
-                    addition.reference_scope,
-                    addition.item_form_id
+                    "the current-master semantic gate is blocked: {}",
+                    evaluation.semantic_gate.blockers.join(", ")
                 );
             }
+            match evaluation.deleted_override_policy.status.as_str() {
+                "not-applicable" | "provable" => {}
+                _ => bail!(
+                    "the undelete-and-disable deletion policy is blocked: {}",
+                    evaluation.deleted_override_policy.blockers.join(", ")
+                ),
+            }
+            let policy = &evaluation.deleted_override_policy;
+            if policy.status == "provable"
+                && (policy.transformable_count != policy.deletion_stub_count
+                    || evaluation.deletion_replacements.len() != policy.deletion_stub_count)
+            {
+                bail!(
+                    "undelete-and-disable count invariant failed: {} stub(s), {} transformable, {} replacement(s)",
+                    policy.deletion_stub_count,
+                    policy.transformable_count,
+                    evaluation.deletion_replacements.len()
+                );
+            }
+            flag_update_form_ids = evaluation.deletion_replacements.keys().copied().collect();
+            plugin_replacements = evaluation.deletion_replacements.clone();
+            worldspace_evaluation = Some(evaluation);
         }
-        override_results.push(result);
     }
-    referenced_master_ids.sort_unstable();
-    referenced_master_ids.dedup();
-    resolve_installed_master_records(&plugin, &game_data, &referenced_master_ids)
-        .context("resolving inventory references through the installed master chain")?;
     let dependency_candidates = scan_dependencies(&request.dependency_inputs, Some(&mod_input));
     let installed_dependencies = installed_state(&game.root);
     let ue4ss_available = installed_dependencies.ue4ss.installed
@@ -1651,15 +1963,34 @@ fn run_additive_update_with_dependency_policy(
         .context("ESP is outside the selected mod root")?;
     let candidate_esp = candidate_root.join(esp_relative);
     if !plugin_replacements.is_empty() {
-        let source_bytes = fs::read(&esp_files[0])?;
-        let rewritten = rewrite_plugin_records(
-            &source_bytes,
+        let rewritten = rewrite_plugin_records_with_flag_updates(
+            &source_esp_bytes,
             &plugin_replacements,
-            esp_files[0]
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("plugin.esp"),
+            &flag_update_form_ids,
+            &esp_name,
         )?;
+        if lane == EspSyncLane::MagicLoaderWorldspace {
+            // Byte-roundtrip proof: splicing the original deletion stubs back into the
+            // candidate must reproduce the source plugin exactly, so nothing outside the
+            // N transformed records and their GRUP size headers changed.
+            let originals = plugin
+                .records
+                .iter()
+                .filter(|record| plugin_replacements.contains_key(&record.form_id))
+                .map(|record| (record.form_id, record.clone()))
+                .collect::<HashMap<_, _>>();
+            let restored = rewrite_plugin_records_with_flag_updates(
+                &rewritten,
+                &originals,
+                &flag_update_form_ids,
+                &esp_name,
+            )?;
+            if restored != source_esp_bytes {
+                bail!(
+                    "undelete-and-disable byte-roundtrip proof failed; the rewrite touched bytes outside the transformed records"
+                );
+            }
+        }
         fs::write(&candidate_esp, rewritten)?;
     }
     let mut container_results = Vec::new();
@@ -1899,20 +2230,77 @@ fn run_additive_update_with_dependency_policy(
     {
         bail!("ESP header identity changed during inventory merge");
     }
-    for (form_id, current) in &current_records {
-        let candidate_override = candidate_plugin
-            .records
-            .iter()
-            .find(|record| record.form_id == *form_id)
-            .with_context(|| format!("rewritten ESP lost override 0x{form_id:08X}"))?;
-        validate_inventory_addition(candidate_override, &current.record, plugin_index)?;
+    match lane {
+        EspSyncLane::AdditiveSyncmap => {
+            for (form_id, current) in &current_records {
+                let candidate_override = candidate_plugin
+                    .records
+                    .iter()
+                    .find(|record| record.form_id == *form_id)
+                    .with_context(|| format!("rewritten ESP lost override 0x{form_id:08X}"))?;
+                validate_inventory_addition(candidate_override, &current.record, plugin_index)?;
+            }
+        }
+        EspSyncLane::MagicLoaderWorldspace => {
+            for (form_id, replacement) in &plugin_replacements {
+                let candidate_record = candidate_plugin
+                    .records
+                    .iter()
+                    .find(|record| record.form_id == *form_id)
+                    .with_context(|| format!("rewritten ESP lost override 0x{form_id:08X}"))?;
+                if candidate_record.flags != replacement.flags
+                    || candidate_record.kind != replacement.kind
+                    || candidate_record.subrecords.len() != replacement.subrecords.len()
+                    || candidate_record
+                        .subrecords
+                        .iter()
+                        .zip(&replacement.subrecords)
+                        .any(|(actual, expected)| {
+                            actual.kind != expected.kind || actual.data != expected.data
+                        })
+                {
+                    bail!(
+                        "rewritten override 0x{form_id:08X} does not match the planned undelete-and-disable record"
+                    );
+                }
+            }
+            // The final candidate must itself pass the semantic gate with zero deletion stubs.
+            let candidate_bytes = fs::read(&candidate_esp)?;
+            let final_evaluation = evaluate_worldspace_lane_semantics(
+                &candidate_plugin,
+                &candidate_bytes,
+                &esp_name,
+                &game_data,
+            )?;
+            if final_evaluation.semantic_gate.status != "proven" {
+                bail!(
+                    "the rewritten candidate fails the current-master semantic gate: {}",
+                    final_evaluation.semantic_gate.blockers.join(", ")
+                );
+            }
+            if final_evaluation.deleted_override_policy.deletion_stub_count != 0 {
+                bail!(
+                    "the rewritten candidate still carries {} deleted master override(s)",
+                    final_evaluation.deleted_override_policy.deletion_stub_count
+                );
+            }
+        }
     }
     let sync_entries = read_sync_map(&sync_files[0])?;
     if sync_entries.is_empty() {
         bail!("SyncMap contains no [Meshes] entries");
     }
-    let sync_map_resolutions =
-        resolve_sync_map_entries(&sync_entries, &owned_records, &original_packages)?;
+    let sync_map_resolutions = match lane {
+        EspSyncLane::AdditiveSyncmap => {
+            resolve_sync_map_entries(&sync_entries, &owned_records, &original_packages)?
+        }
+        EspSyncLane::MagicLoaderWorldspace => resolve_sync_map_entries_layered(
+            &sync_entries,
+            &owned_records,
+            &original_packages,
+            &current_game_store,
+        )?,
+    };
     let dependency_plan: DependencyReport =
         check_or_install(&game.root, dependency_candidates.clone(), false)?;
     let body_setup_repair_count = container_results
@@ -1946,8 +2334,16 @@ fn run_additive_update_with_dependency_policy(
     ];
     if plugin_replacements.is_empty() {
         fix_apis.push(PLUGIN_PRESERVATION_API);
+    } else if lane == EspSyncLane::MagicLoaderWorldspace {
+        fix_apis.push(UNDELETE_DISABLE_POLICY_API);
     } else {
         fix_apis.push(PLUGIN_SEMANTIC_REWRITE_API);
+    }
+    if lane == EspSyncLane::MagicLoaderWorldspace {
+        fix_apis.extend([
+            MAGICLOADER_WORLDSPACE_PLUGIN_POLICY,
+            WORLDSPACE_SEMANTIC_GATE_API,
+        ]);
     }
     if identity_recovery
         .as_ref()
@@ -1970,8 +2366,15 @@ fn run_additive_update_with_dependency_policy(
     fix_apis.sort_unstable();
     fix_apis.dedup();
     let mut report = json!({
-        "schema": "obr-additive-mod-update-report",
-        "version": 7,
+        "schema": match lane {
+            EspSyncLane::AdditiveSyncmap => "obr-additive-mod-update-report",
+            EspSyncLane::MagicLoaderWorldspace => "obr-magicloader-worldspace-update-report",
+        },
+        "version": match lane {
+            EspSyncLane::AdditiveSyncmap => 7,
+            EspSyncLane::MagicLoaderWorldspace => 1,
+        },
+        "adapter": lane.adapter_id(),
         "implementation": "native-rust",
         "fixApis": fix_apis,
         "generatedAt": chrono::Utc::now().to_rfc3339(),
@@ -2070,6 +2473,40 @@ fn run_additive_update_with_dependency_policy(
             "transactionPolicy": "all payloads are validated and staged before commit; any commit failure restores every changed destination",
         },
     });
+    if lane == EspSyncLane::MagicLoaderWorldspace {
+        let evaluation = worldspace_evaluation
+            .as_ref()
+            .context("the MagicLoader worldspace lane lost its semantic evaluation")?;
+        report["identity"]["espSemanticInventoryMerge"] = json!(false);
+        report["identity"]["espUndeleteDisableRewrite"] = json!(!plugin_replacements.is_empty());
+        report["identity"]["espUndeleteDisableCount"] = json!(plugin_replacements.len());
+        report["identity"]["worldspaceSemanticGate"] =
+            serde_json::to_value(&evaluation.semantic_gate)?;
+        report["identity"]["deletedOverridePolicy"] =
+            serde_json::to_value(&evaluation.deleted_override_policy)?;
+        let magic_loader_runtime_installed = {
+            let path = game.root.join(r"MagicLoader\MagicLoader.exe");
+            fs::read(&path)
+                .ok()
+                .is_some_and(|bytes| bytes.starts_with(b"MZ"))
+        };
+        let sidecars = magic_loader_files
+            .iter()
+            .map(|file| {
+                Ok(json!({
+                    "name": file.file_name().unwrap_or_default().to_string_lossy(),
+                    "bytes": fs::metadata(file)?.len(),
+                    "sha256": sha256_file(file)?,
+                    "bytePreserved": true,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        report["magicLoader"] = json!({
+            "sidecars": sidecars,
+            "runtimeInstalled": magic_loader_runtime_installed,
+            "runtimePolicy": "The updater never installs an unverified MagicLoader payload; MagicLoader 2 must be installed in the game root before this mod is run.",
+        });
+    }
     fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
 
     stage(callback, 6, "Creating portable candidate archive");
@@ -2092,7 +2529,7 @@ fn run_additive_update_with_dependency_policy(
         );
         return Ok((
             UpdateOutcome {
-                adapter: "native-additive-syncmap-v1".to_owned(),
+                adapter: lane.adapter_id().to_owned(),
                 output_directory,
                 output_archive,
                 report_path,
@@ -2145,7 +2582,7 @@ fn run_additive_update_with_dependency_policy(
     );
     Ok((
         UpdateOutcome {
-            adapter: "native-additive-syncmap-v1".to_owned(),
+            adapter: lane.adapter_id().to_owned(),
             output_directory,
             output_archive,
             report_path,

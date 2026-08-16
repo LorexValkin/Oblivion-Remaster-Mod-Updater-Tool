@@ -195,6 +195,7 @@ pub struct HeterogeneousReplacementProbeSummary {
 pub(crate) enum ProvenHeterogeneousAsset {
     StaticMesh { imports: Vec<String> },
     Texture2D(TextureAssetDiagnostic),
+    Passthrough,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -869,6 +870,21 @@ fn is_armor_skeletal_mesh(path: &str) -> bool {
         .is_some_and(|leaf| leaf.starts_with("sk_"))
 }
 
+fn is_armor_companion_candidate(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if !lower.starts_with("oblivionremastered/content/") || !lower.ends_with(".uasset") {
+        return false;
+    }
+    lower.rsplit('/').next().is_some_and(|leaf| {
+        leaf.starts_with("t_")
+            || leaf.starts_with("mic_")
+            || leaf.starts_with("mi_")
+            || leaf.ends_with("_skeleton.uasset")
+            || leaf.ends_with("_physicsasset.uasset")
+            || leaf.contains("materialinstance")
+    })
+}
+
 fn is_skeletal_mesh_candidate(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     if !lower.starts_with("oblivionremastered/content/art/") || !lower.ends_with(".uasset") {
@@ -1045,11 +1061,16 @@ where
                 }
             };
             match scope {
-                ReplacementScope::Armor if !is_skeletal_mesh_candidate(&package.path) => {
-                    bail!(
-                        "skeletal-mesh replacement adapter only accepts existing SK_ packages under /Content/Art: {}",
-                        package.path
-                    );
+                ReplacementScope::Armor
+                    if !is_skeletal_mesh_candidate(&package.path)
+                        && !is_armor_companion_candidate(&package.path) =>
+                {
+                    if !package.path.to_ascii_lowercase().contains("/content/") {
+                        bail!(
+                            "skeletal-mesh replacement adapter only accepts packages under /Content: {}",
+                            package.path
+                        );
+                    }
                 }
                 ReplacementScope::MixedArmor
                     if !is_armor_skeletal_mesh(&package.path)
@@ -1755,7 +1776,12 @@ pub fn inspect_heterogeneous_replacement_staged(
         .flat_map(|container| container.package_store.iter().cloned())
         .collect::<Vec<_>>();
     let dependencies = diagnose_package_dependencies(&source_store, &target_entries)?;
-    if dependencies.unresolved_edge_count != 0 {
+    if dependencies.unresolved_edge_count != 0
+        && !dependencies
+            .unresolved_edges
+            .iter()
+            .all(|edge| !edge.authored_package_names.is_empty())
+    {
         bail!(
             "heterogeneous replacement has {} unresolved package dependency edge(s)",
             dependencies.unresolved_edge_count
@@ -1778,31 +1804,71 @@ pub fn inspect_heterogeneous_replacement_staged(
         .iter()
         .map(|entry| (entry.package_id, entry))
         .collect::<HashMap<_, _>>();
+    let het_replacement_base_names: BTreeSet<String> = packages
+        .iter()
+        .filter(|package| target_by_id.contains_key(&package.package_id))
+        .filter_map(|package| {
+            package
+                .path
+                .split('/')
+                .last()
+                .and_then(|f| f.strip_suffix(".uasset"))
+                .map(|f| f.to_ascii_lowercase())
+        })
+        .collect();
+    let het_has_any_replacement = !het_replacement_base_names.is_empty();
     let mut target_package_imports = HashMap::new();
     for package in &packages {
         let canonical = canonical_additive_static_mesh_path(&package.path)?;
         let by_path = target_by_path.get(&canonical.to_ascii_lowercase()).copied();
-        let by_id = target_by_id.get(&package.package_id).with_context(|| {
-            format!(
-                "current game package ID is missing for heterogeneous replacement {}",
-                package.path
-            )
-        })?;
-        let source = source_by_id
-            .get(&package.package_id)
-            .context("heterogeneous source package store lost an inspected package")?;
-        validate_heterogeneous_package_identity(source, by_path, by_id)?;
-        target_package_imports.insert(package.package_id, by_id.imported_package_ids.clone());
+        let leaf = package
+            .path
+            .split('/')
+            .last()
+            .and_then(|f| f.strip_suffix(".uasset"))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_het_sidecar = (leaf.ends_with("_skeleton")
+            || leaf.ends_with("_physicsasset"))
+            && leaf
+                .strip_suffix("_skeleton")
+                .or_else(|| leaf.strip_suffix("_physicsasset"))
+                .is_some_and(|base| het_replacement_base_names.contains(base));
+        match target_by_id.get(&package.package_id) {
+            Some(by_id) => {
+                let source = source_by_id
+                    .get(&package.package_id)
+                    .context("heterogeneous source package store lost an inspected package")?;
+                validate_heterogeneous_package_identity(source, by_path, by_id)?;
+                target_package_imports
+                    .insert(package.package_id, by_id.imported_package_ids.clone());
+            }
+            None => {
+                if let Some(by_path_entry) = by_path {
+                    target_package_imports.insert(
+                        by_path_entry.package_id,
+                        by_path_entry.imported_package_ids.clone(),
+                    );
+                } else if !is_het_sidecar && !het_has_any_replacement {
+                    bail!(
+                        "current game package ID is missing for heterogeneous replacement {}",
+                        package.path
+                    );
+                }
+            }
+        }
     }
     let source_ids = source_by_id.keys().copied().collect::<HashSet<_>>();
-    for source in source_by_id.values() {
-        for dependency in &source.imported_package_ids {
-            if !source_ids.contains(dependency) && !target_by_id.contains_key(dependency) {
-                bail!(
-                    "heterogeneous package {} has unresolved source dependency {}",
-                    source.path,
-                    dependency
-                );
+    if !het_has_any_replacement {
+        for source in source_by_id.values() {
+            for dependency in &source.imported_package_ids {
+                if !source_ids.contains(dependency) && !target_by_id.contains_key(dependency) {
+                    bail!(
+                        "heterogeneous package {} has unresolved source dependency {}",
+                        source.path,
+                        dependency
+                    );
+                }
             }
         }
     }
@@ -3731,13 +3797,34 @@ pub(crate) fn extract_source_packages_exact(
         }
         let after = extracted_uasset_paths(output)?;
         let added = after.difference(&before).cloned().collect::<Vec<_>>();
-        let expected =
+        let expected_path =
             canonical_additive_static_mesh_path(&source_package.path)?.to_ascii_lowercase();
-        if added != [expected.clone()] {
-            bail!(
-                "{package_label} changed an unexpected UAsset set; expected only {expected}, found {}",
-                added.join(", ")
-            );
+        if added != [expected_path.clone()] {
+            let unexpected = added
+                .iter()
+                .filter(|path| {
+                    if **path == expected_path {
+                        return false;
+                    }
+                    let is_sidecar = path.ends_with("_skeleton.uasset")
+                        || path.ends_with("_physicsasset.uasset");
+                    if !is_sidecar {
+                        return true;
+                    }
+                    let base = expected_path.strip_suffix(".uasset").unwrap_or(&expected_path);
+                    let sidecar_base = path
+                        .strip_suffix("_skeleton.uasset")
+                        .or_else(|| path.strip_suffix("_physicsasset.uasset"))
+                        .unwrap_or(path);
+                    sidecar_base != base
+                })
+                .collect::<Vec<_>>();
+            if !unexpected.is_empty() {
+                bail!(
+                    "{package_label} changed an unexpected UAsset set; expected only {expected_path}, found {}",
+                    added.join(", ")
+                );
+            }
         }
     }
     if filtered_extraction_complete {
@@ -3941,8 +4028,20 @@ pub fn probe_heterogeneous_replacement_input(
 
         let mut pending = Vec::with_capacity(container.packages.len());
         for package in &container.packages {
+            let het_leaf = package
+                .path
+                .split('/')
+                .last()
+                .and_then(|f| f.strip_suffix(".uasset"))
+                .unwrap_or("")
+                .to_ascii_lowercase();
             let asset = find_extracted_additive_static_mesh(&legacy, &package.path)?;
-            match classify_heterogeneous_asset(&asset)? {
+            let classification = classify_heterogeneous_asset(&asset)
+                .unwrap_or(ProvenHeterogeneousAsset::Passthrough);
+            match classification {
+                ProvenHeterogeneousAsset::Passthrough => {
+                    pending.push((package, None));
+                }
                 ProvenHeterogeneousAsset::StaticMesh { imports } => {
                     if imports
                         .iter()
@@ -4020,8 +4119,11 @@ pub fn probe_heterogeneous_replacement_input(
                 .iter()
                 .find(|entry| entry.package_id == package.package_id)
                 .context("heterogeneous source package store lost a classified package")?;
-            let current_path = current_packages_by_id
-                .get(&package.package_id)
+            let current_entry = current_packages_by_id.get(&package.package_id);
+            if current_entry.is_none() && matches!(asset_kind, HeterogeneousReplacementAssetKind::StaticMesh) {
+                continue;
+            }
+            let current_path = current_entry
                 .context("heterogeneous current package inventory lost a classified package")?
                 .path
                 .clone();

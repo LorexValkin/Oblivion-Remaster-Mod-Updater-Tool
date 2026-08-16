@@ -4472,7 +4472,18 @@ fn run_heterogeneous_replacement_update(
         let mut pending_textures = Vec::new();
         for package in &container.packages {
             let source_asset = find_additive_static_mesh_asset(&legacy, &package.path)?;
-            match classify_heterogeneous_asset(&source_asset)? {
+            let het_is_passthrough =
+                !current_packages_by_id.contains_key(&package.package_id);
+            let het_classification = if het_is_passthrough {
+                classify_heterogeneous_asset(&source_asset)
+                    .unwrap_or(ProvenHeterogeneousAsset::Passthrough)
+            } else {
+                classify_heterogeneous_asset(&source_asset)?
+            };
+            match het_classification {
+                ProvenHeterogeneousAsset::Passthrough => {
+                    classifications.insert(package.package_id, "passthrough");
+                }
                 ProvenHeterogeneousAsset::StaticMesh { imports } => {
                     classifications.insert(package.package_id, "static-mesh");
                     static_mesh_count += 1;
@@ -4629,9 +4640,12 @@ fn run_heterogeneous_replacement_update(
         )?;
         for package in &rebuilt_packages {
             let asset = find_additive_static_mesh_asset(&verify_legacy, &package.path)?;
-            let actual = match classify_heterogeneous_asset(&asset)? {
+            let actual = match classify_heterogeneous_asset(&asset)
+                .unwrap_or(ProvenHeterogeneousAsset::Passthrough)
+            {
                 ProvenHeterogeneousAsset::StaticMesh { .. } => "static-mesh",
                 ProvenHeterogeneousAsset::Texture2D(_) => "texture2d",
+                ProvenHeterogeneousAsset::Passthrough => "passthrough",
             };
             let expected = classifications
                 .get(&package.package_id)

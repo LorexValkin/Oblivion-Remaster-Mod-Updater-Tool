@@ -1108,6 +1108,7 @@ fn nested_adapter_owns_logical_destinations(
     if !matches!(
         nested_adapter,
         "native-additive-syncmap-v1"
+            | MIXED_COMPOSITE_ADAPTER
             | ARMOR_REPLACEMENT_ADAPTER
             | MIXED_ARMOR_REPLACEMENT_ADAPTER
             | TEXTURE_REPLACEMENT_ADAPTER
@@ -1150,7 +1151,9 @@ fn nested_logical_candidate_root(
     logical_source_root: &Path,
     outcome: &UpdateOutcome,
 ) -> Result<PathBuf> {
-    let candidate = if nested_adapter == "native-additive-syncmap-v1" {
+    let candidate = if nested_adapter == "native-additive-syncmap-v1"
+        || nested_adapter == MIXED_COMPOSITE_ADAPTER
+    {
         outcome.output_directory.join(
             logical_source_root
                 .file_name()
@@ -2026,28 +2029,81 @@ fn run_esp_sync_lane_update(
         });
     // Byte-preserved passthrough script plane: UE4SS Lua files ride along in
     // the wholesale candidate copy and are disclosed; they require the UE4SS
-    // runtime but never require the SyncMap injector by themselves.
-    let script_files = WalkDir::new(&mod_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|value| value.eq_ignore_ascii_case("lua"))
-        })
-        .map(|entry| {
-            entry
-                .path()
-                .strip_prefix(&mod_root)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
-        .collect::<Vec<_>>();
+    // runtime but never require the SyncMap injector by themselves. The mixed
+    // lane additionally requires every staged file to belong to a recognized
+    // plane so nothing rides along unconverted and undisclosed.
+    let mut script_files = Vec::new();
+    let mut unplaced_components = Vec::new();
+    for entry in WalkDir::new(&mod_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&mod_root)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        let lower = relative.to_ascii_lowercase();
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let binaries_plane = lower.starts_with("binaries/");
+        if extension == "lua" && (binaries_plane || lane != EspSyncLane::MixedComposite) {
+            script_files.push(relative.clone());
+        }
+        if lane != EspSyncLane::MixedComposite {
+            continue;
+        }
+        let placed = if lower.starts_with("content/dev/obvdata/data/") {
+            match extension.as_str() {
+                "esp" => {
+                    // Units cover direct-Data plugins; SyncMap-mirror copies are
+                    // recognized by the plugin-set inspection.
+                    true
+                }
+                "ini" => lower.starts_with("content/dev/obvdata/data/syncmap/"),
+                "json" => lower.starts_with("content/dev/obvdata/data/magicloader/"),
+                _ => matches!(extension.as_str(), "txt" | "md"),
+            }
+        } else if lower.starts_with("content/paks/") {
+            // Containers must form the discovered complete triples.
+            matches!(extension.as_str(), "pak" | "ucas" | "utoc")
+                && utoc_files.iter().any(|utoc| {
+                    utoc.parent().is_some_and(|parent| {
+                        entry.path().parent() == Some(parent)
+                            && utoc
+                                .file_stem()
+                                .zip(entry.path().file_stem())
+                                .is_some_and(|(left, right)| {
+                                    left.eq_ignore_ascii_case(right.to_string_lossy().as_ref())
+                                })
+                    })
+                })
+        } else if binaries_plane {
+            // UE4SS passthrough plane: preserved byte-identically, disclosed.
+            true
+        } else {
+            matches!(
+                extension.as_str(),
+                "txt" | "md" | "pdf" | "rtf" | "png" | "jpg" | "jpeg" | "url"
+            )
+        };
+        if !placed {
+            unplaced_components.push(relative);
+        }
+    }
+    if !unplaced_components.is_empty() {
+        unplaced_components.sort();
+        bail!(
+            "mixed-plane components without a proven conversion capability: {}",
+            unplaced_components.join(", ")
+        );
+    }
     let injector_required = lane != EspSyncLane::MixedComposite || !sync_files.is_empty();
     let ue4ss_required = injector_required || !script_files.is_empty();
     if (ue4ss_required && !ue4ss_available) || (injector_required && !injector_available) {

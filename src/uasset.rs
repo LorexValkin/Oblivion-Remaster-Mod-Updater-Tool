@@ -3545,8 +3545,8 @@ pub fn classify_composite_package_asset(
 /// qualifies only when its single top-level export decodes to one of these
 /// classes; every other additive class stays report-only.
 fn additive_engine_data_class(root_classes: &[String]) -> Option<&'static str> {
-    const ENGINE_DATA_CLASSES: [&str; 4] =
-        ["AnimSequence", "AnimMontage", "Skeleton", "PhysicsAsset"];
+    const ENGINE_DATA_CLASSES: [&str; 5] =
+        ["AnimSequence", "AnimMontage", "Skeleton", "PhysicsAsset", "Material"];
     if root_classes.len() != 1 {
         return None;
     }

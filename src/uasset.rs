@@ -2660,8 +2660,22 @@ pub fn prove_blueprint_alias_role(
             .map(|(_, object)| *object)
             .collect::<Vec<_>>()
     };
+    let consumer_stem = consumer_asset
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let (role, required_export_name) =
-        if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
+        if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant")
+            && consumer_stem.starts_with("sm_")
+        {
+            // The consumer is itself a StaticMesh package ("Oblivion Blade of
+            // Nulgath", Nexus 4640: SM_OBON_scabbard imports its retired
+            // MIC). The only accepted role is the mesh's own material slot:
+            // the single serialized reference must sit inside the export
+            // named after the consumer mesh itself.
+            ("static-mesh-material-slot", consumer_stem.as_str())
+        } else if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
             ("blood-splatter-material", "bloodsplatter")
         } else if expected_class.eq_ignore_ascii_case("StaticMesh") {
             ("scabbard-static-mesh", "scabbard")

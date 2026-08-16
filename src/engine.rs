@@ -1302,13 +1302,45 @@ fn run_logical_install_update(
     let nested_report_sha256 = sha256_file(&nested_outcome.report_path)?;
     let logical_candidate_root =
         nested_logical_candidate_root(nested_adapter, resolved.view.root(), &nested_outcome)?;
-    let excluded_logical_paths = nested_outcome
+    let mut excluded_logical_paths = nested_outcome
         .report_path
         .strip_prefix(&logical_candidate_root)
         .ok()
         .map(Path::to_path_buf)
         .into_iter()
         .collect::<Vec<_>>();
+    // Identity alias providers and temporary providers are added to the
+    // candidate by the inner update lane and must be excluded from the
+    // reconstruction proof so the file-count invariant stays satisfied.
+    for entry in WalkDir::new(&logical_candidate_root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry
+            .path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if (name.starts_with("obr_identityaliases_")
+            || name.starts_with("obr_temporaryproviders_"))
+            && matches!(
+                entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "utoc" | "ucas" | "pak"
+            )
+        {
+            if let Ok(relative) = entry.path().strip_prefix(&logical_candidate_root) {
+                excluded_logical_paths.push(relative.to_path_buf());
+            }
+        }
+    }
 
     callback(
         8,

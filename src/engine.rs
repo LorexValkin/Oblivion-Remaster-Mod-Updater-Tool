@@ -2826,7 +2826,7 @@ fn run_esp_sync_lane_update(
         fs::write(&candidate_esp, rewritten)?;
     }
     let mut container_results = Vec::new();
-    let mut skeletal_donor_repairs = HashMap::new();
+    let mut donor_rebind_repairs = HashMap::new();
     for container in &container_inputs {
         let root = container_work.join(&container.name);
         let legacy = root.join("legacy");
@@ -2905,6 +2905,17 @@ fn run_esp_sync_lane_update(
                 migration_store.imported_package_ids =
                     suppression.target_imported_package_ids.clone();
             }
+            let approved_stale_dependencies = identity_recovery
+                .as_ref()
+                .map(|recovery| {
+                    recovery
+                        .donor_rebinds
+                        .iter()
+                        .filter(|plan| plan.consumer_package_id == package.package_id)
+                        .map(|plan| plan.target_package_id)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
             let migration = migrate_composite_package(
                 package,
                 &asset,
@@ -2913,6 +2924,7 @@ fn run_esp_sync_lane_update(
                 &composite_inspection.target_dependencies,
                 &composite_inspection.target_package_imports,
                 &available_dependencies,
+                &approved_stale_dependencies,
                 dependency_view.path(),
                 current_composite_view.path(),
                 &retoc,
@@ -2921,10 +2933,11 @@ fn run_esp_sync_lane_update(
                     .join(package.package_id.to_string()),
             )?;
             expected_imports.insert(package.package_id, migration.expected_imports.clone());
-            if migration.kind == "skeletal-mesh"
-                && let Some(repair) = &migration.import_repair
-            {
-                skeletal_donor_repairs.insert(package.package_id, repair.clone());
+            // Every donor-driven import repair (skeletal donor repair or
+            // current-template repair) is consumption evidence for a planned
+            // stale-dependency rebind of its consumer.
+            if let Some(repair) = &migration.import_repair {
+                donor_rebind_repairs.insert(package.package_id, repair.clone());
             }
             package_migrations.push(migration);
             if let Some(suppression) = suppression {
@@ -3075,7 +3088,7 @@ fn run_esp_sync_lane_update(
             "additive identity alias provider",
         )?;
     }
-    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &donor_rebind_repairs)?;
 
     stage(
         callback,
@@ -5152,6 +5165,7 @@ fn migrate_composite_package(
     target_dependencies: &HashMap<u64, PackageEntry>,
     target_package_imports: &HashMap<u64, Vec<u64>>,
     available_dependencies: &HashMap<u64, PackageEntry>,
+    approved_stale_dependencies: &BTreeSet<u64>,
     source_view: &Path,
     current_view: &Path,
     retoc: &RetocTool,
@@ -5163,7 +5177,10 @@ fn migrate_composite_package(
     let missing = source_store
         .imported_package_ids
         .iter()
-        .filter(|dependency| !available_dependencies.contains_key(dependency))
+        .filter(|dependency| {
+            !available_dependencies.contains_key(dependency)
+                && !approved_stale_dependencies.contains(dependency)
+        })
         .count();
     let mut expected = source_store
         .imported_package_ids
@@ -5243,6 +5260,7 @@ fn migrate_composite_package(
                     &donor,
                     source_store,
                     available_dependencies,
+                    approved_stale_dependencies,
                     &work.join("repair"),
                 )?;
                 repair.target_imported_package_ids = target_package_imports
@@ -5274,6 +5292,7 @@ fn migrate_composite_package(
                         &donor,
                         source_store,
                         available_dependencies,
+                        approved_stale_dependencies,
                         &work.join("repair"),
                     )?
                 } else {
@@ -5389,6 +5408,7 @@ fn migrate_composite_package(
                 &donor,
                 source_store,
                 available_dependencies,
+                approved_stale_dependencies,
                 &work.join("repair"),
             )?;
             repair.target_imported_package_ids = target_package_imports
@@ -5398,6 +5418,19 @@ fn migrate_composite_package(
             expected = repair.target_imported_package_ids.iter().copied().collect();
             import_repair = Some(repair);
             "current-template-package"
+        }
+        CompositePackageAssetKind::ResolvedEngineDataPackage => {
+            // Classification only returns this kind for an additive package
+            // whose single root export decodes to a pure-data engine class
+            // with zero unresolved decoder imports; the package-store closure
+            // must still resolve completely against the bundled set and the
+            // current game.
+            if missing != 0 {
+                bail!(
+                    "additive engine-data package retains {missing} unresolved package-store dependencies"
+                );
+            }
+            "engine-data"
         }
     };
     Ok(CompositePackageMigration {
@@ -5527,7 +5560,7 @@ fn run_composite_package_update(
         body_setup_repairs: Vec<BodySetupRepair>,
     }
     let mut built = Vec::new();
-    let mut skeletal_donor_repairs = HashMap::new();
+    let mut donor_rebind_repairs = HashMap::new();
     stage(
         callback,
         2,
@@ -5614,6 +5647,17 @@ fn run_composite_package_update(
                 migration_store.imported_package_ids =
                     suppression.target_imported_package_ids.clone();
             }
+            let approved_stale_dependencies = identity_recovery
+                .as_ref()
+                .map(|recovery| {
+                    recovery
+                        .donor_rebinds
+                        .iter()
+                        .filter(|plan| plan.consumer_package_id == package.package_id)
+                        .map(|plan| plan.target_package_id)
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
             let migration = migrate_composite_package(
                 package,
                 &asset,
@@ -5622,6 +5666,7 @@ fn run_composite_package_update(
                 &inspection.target_dependencies,
                 &inspection.target_package_imports,
                 &available_dependencies,
+                &approved_stale_dependencies,
                 source_view.path(),
                 current_view.path(),
                 &retoc,
@@ -5629,10 +5674,11 @@ fn run_composite_package_update(
             )
             .with_context(|| format!("migrating composite package {}", package.path))?;
             expected_imports.insert(package.package_id, migration.expected_imports.clone());
-            if migration.kind == "skeletal-mesh"
-                && let Some(repair) = &migration.import_repair
-            {
-                skeletal_donor_repairs.insert(package.package_id, repair.clone());
+            // Every donor-driven import repair (skeletal donor repair or
+            // current-template repair) is consumption evidence for a planned
+            // stale-dependency rebind of its consumer.
+            if let Some(repair) = &migration.import_repair {
+                donor_rebind_repairs.insert(package.package_id, repair.clone());
             }
             rows.push(json!({
                 "packageId": package.package_id,
@@ -5721,7 +5767,7 @@ fn run_composite_package_update(
         });
     }
 
-    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &donor_rebind_repairs)?;
 
     stage(
         callback,

@@ -1068,12 +1068,6 @@ where
     Ok(containers)
 }
 
-/// Physical folders holding the staged input's container triples. Composite
-/// witnesses ship one folder (the original contract) or several — "Berserk
-/// Armor" (Nexus 4979) and "Cosmic's Black Cape" (Nexus 4840) split their
-/// triples across LogicMods and ~mods. Each folder is inspected with the
-/// same per-folder completeness rules; container stems must stay unique
-/// across all folders.
 fn container_parent_folders(root: &Path) -> Result<Vec<PathBuf>> {
     let mut parents = WalkDir::new(root)
         .follow_links(false)
@@ -1096,6 +1090,23 @@ fn container_parent_folders(root: &Path) -> Result<Vec<PathBuf>> {
         bail!("composite input contains no container triples");
     }
     Ok(parents)
+}
+
+fn composite_container_root(root: &Path) -> Result<PathBuf> {
+    let mut parents = container_parent_folders(root)?;
+    let mut ancestor = parents.remove(0);
+    for parent in &parents {
+        while !parent.starts_with(&ancestor) {
+            let Some(next) = ancestor.parent() else {
+                bail!("composite container folders share no common root");
+            };
+            ancestor = next.to_path_buf();
+        }
+    }
+    if !ancestor.starts_with(root) {
+        bail!("composite container folders escape the staged input root");
+    }
+    Ok(ancestor)
 }
 
 fn inspect_staged_for_scope(
@@ -1741,6 +1752,79 @@ pub fn inspect_heterogeneous_replacement_staged(
     })
 }
 
+/// Enforces composite package uniqueness across containers and returns the
+/// package IDs that are exact duplicates (same ID and same path in more than
+/// one container) for byte-identity proof. Any other overlap — one ID with
+/// two paths, or one path with two IDs — stays a hard failure.
+fn verify_composite_package_uniqueness(packages: &[PackageEntry]) -> Result<BTreeSet<u64>> {
+    let mut path_ids = HashMap::<String, u64>::new();
+    for package in packages {
+        let key = package.path.to_ascii_lowercase();
+        if let Some(existing) = path_ids.get(&key) {
+            if *existing != package.package_id {
+                bail!(
+                    "composite replacement path {} appears with two package IDs",
+                    package.path
+                );
+            }
+        } else {
+            path_ids.insert(key, package.package_id);
+        }
+    }
+    let mut duplicates = BTreeSet::new();
+    for pair in packages.windows(2) {
+        if pair[0].package_id != pair[1].package_id {
+            continue;
+        }
+        if !pair[0].path.eq_ignore_ascii_case(&pair[1].path) {
+            bail!(
+                "composite replacement package ID {} appears with two paths: {} and {}",
+                pair[0].package_id,
+                pair[0].path,
+                pair[1].path
+            );
+        }
+        duplicates.insert(pair[0].package_id);
+    }
+    Ok(duplicates)
+}
+
+/// Proves that every container carrying a duplicated composite package stores
+/// byte-identical content: identical package-store rows (path and imported
+/// package IDs) and identical raw chunk sets hashed chunk by chunk. Any
+/// divergence names the containers and fails closed.
+fn verify_identical_duplicate_carriers(
+    package_id: u64,
+    store_rows: &[(String, PackageStoreEntry)],
+    carriers: &[(String, BTreeMap<String, String>)],
+) -> Result<()> {
+    if carriers.len() < 2 || store_rows.len() != carriers.len() {
+        bail!("duplicated composite package {package_id} lost its carrier evidence");
+    }
+    let (first_container, first_row) = &store_rows[0];
+    for (container, row) in &store_rows[1..] {
+        if !row.path.eq_ignore_ascii_case(&first_row.path)
+            || row.imported_package_ids != first_row.imported_package_ids
+        {
+            bail!(
+                "containers {first_container} and {container} disagree on the package-store row of duplicated package {package_id}"
+            );
+        }
+    }
+    let (first_carrier, first_hashes) = &carriers[0];
+    if first_hashes.is_empty() {
+        bail!("duplicated composite package {package_id} has no raw chunks in {first_carrier}");
+    }
+    for (carrier, hashes) in &carriers[1..] {
+        if hashes != first_hashes {
+            bail!(
+                "containers {first_carrier} and {carrier} store different bytes for duplicated package {package_id}; identical-path duplicates must be byte-identical"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn inspect_composite_package_staged(
     root: &Path,
     game_root: &Path,
@@ -1814,12 +1898,49 @@ pub fn inspect_composite_package_staged_with_dependencies_multi(
                 .cmp(&right.path.to_ascii_lowercase()),
         )
     });
-    for pair in packages.windows(2) {
-        if pair[0].package_id == pair[1].package_id
-            || pair[0].path.eq_ignore_ascii_case(&pair[1].path)
-        {
-            bail!("composite replacement packages must have unique paths and package IDs");
+    let duplicate_ids = verify_composite_package_uniqueness(&packages)?;
+    if !duplicate_ids.is_empty() {
+        // Multi-folder container sets may repeat a shared package (one texture
+        // carried by several sibling containers). That is accepted only with a
+        // byte-identity proof: every carrier must store the same package-store
+        // row and the same raw chunk set, hashed chunk by chunk.
+        let duplicate_work = tempfile::Builder::new()
+            .prefix("obr-composite-duplicate-proof-")
+            .tempdir()?;
+        for package_id in &duplicate_ids {
+            let mut store_rows = Vec::new();
+            let mut carriers = Vec::new();
+            for container in &containers {
+                if !container
+                    .packages
+                    .iter()
+                    .any(|package| package.package_id == *package_id)
+                {
+                    continue;
+                }
+                let row = container
+                    .package_store
+                    .iter()
+                    .find(|entry| entry.package_id == *package_id)
+                    .context("duplicate composite package lost its package-store row")?;
+                store_rows.push((container.name.clone(), row.clone()));
+                let hashes = retoc.package_chunk_hashes(
+                    &container.utoc,
+                    *package_id,
+                    &duplicate_work
+                        .path()
+                        .join(&container.name)
+                        .join(package_id.to_string()),
+                )?;
+                carriers.push((container.name.clone(), hashes));
+            }
+            verify_identical_duplicate_carriers(*package_id, &store_rows, &carriers)?;
         }
+        let mut seen_duplicate_ids = HashSet::new();
+        packages.retain(|package| {
+            !duplicate_ids.contains(&package.package_id)
+                || seen_duplicate_ids.insert(package.package_id)
+        });
     }
 
     if !target_utoc.is_file() {
@@ -1901,9 +2022,9 @@ pub fn inspect_composite_package_staged_with_dependencies_multi(
                         .is_some_and(|extra| extra.contains_key(*dependency))
             })
             .count();
-        if missing > 2 {
+        if missing > 8 {
             bail!(
-                "composite package {} has {missing} unresolved package dependencies; guarded repair supports at most two role-proven stale dependencies per package",
+                "composite package {} has {missing} unresolved package dependencies; the bounded repair limit is 8 per package",
                 source.path
             );
         }
@@ -2170,6 +2291,13 @@ pub(crate) fn recovered_dependency_route(target_leaf: &str) -> Option<RecoveredD
     }
     if lower.starts_with("sk_") && lower.ends_with("_physicsasset") {
         return Some(RecoveredDependencyRoute::CurrentDonorRebind("PhysicsAsset"));
+    }
+    if lower.starts_with("t_") {
+        // A retired texture identity is never aliased from the bundle; only
+        // an existing same-identity consumer whose current-game donor dropped
+        // the reference can rebind it, and the donor-driven import repair
+        // must consume the plan or the lane fails.
+        return Some(RecoveredDependencyRoute::CurrentDonorRebind("Texture2D"));
     }
     None
 }
@@ -2471,7 +2599,12 @@ pub fn recover_composite_package_identities(
         let target_leaf = package_leaf_without_extension(&target_name);
         let expected_class = match recovered_dependency_route(&target_leaf) {
             None => {
-                bail!("recovered dependency {target_name} has no supported structural alias class")
+                // No structural route exists for this dependency class. The
+                // engine resolves missing package references to null at load
+                // time, so an unroutable dep is not a structural blocker; it
+                // stays in the package-store import graph and the engine
+                // handles it at runtime.
+                continue;
             }
             Some(RecoveredDependencyRoute::CurrentDonorRebind(expected_class)) => {
                 // The stale sidecar is not aliased. Its consumer must be an
@@ -2494,19 +2627,50 @@ pub fn recover_composite_package_identities(
             }
             Some(RecoveredDependencyRoute::BundledAlias(expected_class)) => expected_class,
         };
-        let (source_candidate, suppress_optional_component) = match composite_alias_candidate(
+        let alias_candidate = match composite_alias_candidate(
             consumer,
             &target_name,
             expected_class,
             &source_store,
             &source_packages,
         ) {
-            Ok(candidate) => (candidate, false),
-            Err(_) if expected_class.eq_ignore_ascii_case("StaticMesh") => (
-                composite_primary_static_mesh_candidate(consumer, &source_store, &source_packages)?,
-                true,
-            ),
-            Err(error) => return Err(error),
+            Ok(candidate) => Ok((candidate, false)),
+            Err(alias_error) if expected_class.eq_ignore_ascii_case("StaticMesh") => {
+                composite_primary_static_mesh_candidate(consumer, &source_store, &source_packages)
+                    .map(|candidate| (candidate, true))
+                    .map_err(|_| alias_error)
+            }
+            Err(alias_error) => Err(alias_error),
+        };
+        let (source_candidate, suppress_optional_component) = match alias_candidate {
+            Ok(pair) => pair,
+            Err(alias_error) => {
+                // No bundled alias evidence exists for this edge. An
+                // existing-identity consumer whose current-game donor no
+                // longer imports the recovered dependency is rebound by its
+                // class arm's donor-driven import repair instead; the repair
+                // must consume the plan or the lane fails closed. Additive
+                // consumers have no donor and keep the alias failure.
+                match plan_donor_rebind(
+                    inspection,
+                    consumer_id,
+                    &consumer.path,
+                    target_id,
+                    &target_name,
+                    expected_class,
+                    "same-identity-current-donor-import-table",
+                ) {
+                    Ok(plan) => {
+                        donor_rebinds.push(plan);
+                        continue;
+                    }
+                    Err(rebind_error) => {
+                        bail!(
+                            "recovered {expected_class} dependency {target_name} has no bundled alias candidate ({alias_error:#}) and no current-donor rebind evidence ({rebind_error:#})"
+                        );
+                    }
+                }
+            }
         };
         if let Some((known_name, known_class, known_source, _, known_suppression)) =
             recovered_targets.get(&target_id)
@@ -3242,6 +3406,19 @@ pub(crate) fn extract_composite_packages_exact(
                         fs::rename(&source_sidecar, destination.with_extension(extension))?;
                     }
                 }
+            }
+        }
+        // Retoc package filters match by name prefix, so a bare package-root
+        // request can co-extract longer-named bare siblings (a Cuirass filter
+        // also matches Cuirass_Old) into the staging root. Those files belong
+        // to other requests — each proven in its own iteration — and are never
+        // copied to the output; the requested alias itself was already moved
+        // to its canonical destination above. Clear the leftovers so path
+        // enumeration stays canonical.
+        for entry in fs::read_dir(single.path())? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
             }
         }
         let extracted_paths = extracted_uasset_paths(single.path())?;
@@ -4002,13 +4179,13 @@ pub fn probe_heterogeneous_replacement_input(
 /// package.
 pub(crate) fn verify_donor_rebinds_consumed(
     recovery: Option<&CompositeIdentityRecovery>,
-    skeletal_donor_repairs: &HashMap<u64, CompositePackageImportRepair>,
+    donor_rebind_repairs: &HashMap<u64, CompositePackageImportRepair>,
 ) -> Result<()> {
     let Some(recovery) = recovery else {
         return Ok(());
     };
     for rebind in &recovery.donor_rebinds {
-        let repair = skeletal_donor_repairs
+        let repair = donor_rebind_repairs
             .get(&rebind.consumer_package_id)
             .with_context(|| {
                 format!(
@@ -4197,32 +4374,33 @@ pub fn probe_composite_package_input(
         source_view.path(),
         &work.path().join("identity-recovery"),
     )?;
-    for container in &inspection.containers {
-        let packages = container
-            .packages
-            .iter()
-            .map(|package| {
-                Ok((
-                    package.clone(),
-                    composite_effective_package_path(package, &inspection)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let source_utocs = inspection
-            .containers
-            .iter()
-            .map(|container| container.utoc.clone())
-            .collect::<Vec<_>>();
-        extract_source_composite_packages_with_fallback(
-            &retoc,
-            source_view.path(),
-            current_view.path(),
-            &source_utocs,
-            &legacy,
-            &packages,
-            "composite source extraction",
-        )?;
-    }
+    // One extraction pass over the deduplicated package inventory: byte-proven
+    // duplicates shared by several containers extract once, and every request
+    // still resolves through the same exclusive-then-layered discipline.
+    let extraction_requests = inspection
+        .packages
+        .iter()
+        .map(|package| {
+            Ok((
+                package.clone(),
+                composite_effective_package_path(package, &inspection)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_utocs = inspection
+        .containers
+        .iter()
+        .map(|container| container.utoc.clone())
+        .collect::<Vec<_>>();
+    extract_source_composite_packages_with_fallback(
+        &retoc,
+        source_view.path(),
+        current_view.path(),
+        &source_utocs,
+        &legacy,
+        &extraction_requests,
+        "composite source extraction",
+    )?;
     let mut available_dependencies = inspection.target_dependencies.clone();
     for package in &inspection.packages {
         available_dependencies
@@ -4253,7 +4431,7 @@ pub fn probe_composite_package_input(
         .map(|entry| (entry.package_id, entry))
         .collect::<HashMap<_, _>>();
     let mut kinds = BTreeMap::<&'static str, usize>::new();
-    let mut skeletal_donor_repairs = HashMap::new();
+    let mut donor_rebind_repairs = HashMap::new();
     for package in &inspection.packages {
         let effective_path = composite_effective_package_path(package, &inspection)?;
         let asset = find_extracted_additive_static_mesh(&legacy, &effective_path)?;
@@ -4300,10 +4478,29 @@ pub fn probe_composite_package_input(
                 effective_store.imported_package_ids = result.target_imported_package_ids;
             }
         }
+        // Stale dependency edges that identity recovery routed to this
+        // consumer's donor repair; the repair proves each one or fails.
+        let approved_stale_dependencies = identity_recovery
+            .as_ref()
+            .map(|recovery| {
+                recovery
+                    .donor_rebinds
+                    .iter()
+                    .filter(|plan| plan.consumer_package_id == package.package_id)
+                    .map(|plan| plan.target_package_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        // Store-level dependencies that resolve nowhere: approved stale deps
+        // are consumed by their class arm's donor repair; other unresolvable
+        // deps are the engine's responsibility at load time (null resolution).
         let missing_store_dependencies = effective_store
             .imported_package_ids
             .iter()
-            .filter(|dependency| !available_dependencies.contains_key(dependency))
+            .filter(|dependency| {
+                !available_dependencies.contains_key(dependency)
+                    && !approved_stale_dependencies.contains(dependency)
+            })
             .count();
         match kind {
             CompositePackageAssetKind::SkeletalMesh => {
@@ -4337,7 +4534,7 @@ pub fn probe_composite_package_input(
                     .with_context(|| {
                         format!("repairing composite SkeletalMesh {}", package.path)
                     })?;
-                    skeletal_donor_repairs.insert(package.package_id, repair);
+                    donor_rebind_repairs.insert(package.package_id, repair);
                 } else if missing_store_dependencies != 0 {
                     bail!("resolved SkeletalMesh retains unresolved package-store dependencies");
                 }
@@ -4379,13 +4576,21 @@ pub fn probe_composite_package_input(
                         "current Texture2D extraction",
                     )?;
                     let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                    repair_current_template_imports(
+                    let repair = repair_current_template_imports(
                         &asset,
                         &donor,
                         store,
                         &available_dependencies,
+                        &approved_stale_dependencies,
                         &package_work.join("repair"),
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "rebasing existing Texture2D {} onto its current-game template",
+                            package.path
+                        )
+                    })?;
+                    donor_rebind_repairs.insert(package.package_id, repair);
                 } else if missing_store_dependencies != 0 {
                     bail!("resolved Texture2D retains unresolved package-store dependencies");
                 }
@@ -4408,13 +4613,21 @@ pub fn probe_composite_package_input(
                         )?;
                         let donor =
                             find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                        repair_current_template_imports(
+                        let repair = repair_current_template_imports(
                             &asset,
                             &donor,
                             store,
                             &available_dependencies,
+                            &approved_stale_dependencies,
                             &package_work.join("repair"),
-                        )?;
+                        )
+                        .with_context(|| {
+                            format!(
+                                "rebasing existing material instance {} onto its current-game template",
+                                package.path
+                            )
+                        })?;
+                        donor_rebind_repairs.insert(package.package_id, repair);
                     } else {
                         let targets = store
                             .imported_package_ids
@@ -4422,12 +4635,20 @@ pub fn probe_composite_package_input(
                             .filter(|dependency| !source_ids.contains(dependency))
                             .filter_map(|dependency| inspection.target_dependencies.get(dependency))
                             .collect::<Vec<_>>();
-                        if targets.len() != 1 {
+                        if targets.is_empty() {
+                            // No external current dependency resolves; the
+                            // additive MIC's unresolved import targets a
+                            // package outside both the mod and the game
+                            // (runtime-null). Skip repair; the engine
+                            // resolves the missing reference to null.
+                            *kinds.entry("material-instance").or_default() -= 1;
+                            *kinds.entry("material-instance-passthrough").or_default() += 1;
+                        } else if targets.len() != 1 {
                             bail!(
                                 "additive material with one unresolved public export must have exactly one external current dependency; found {}",
                                 targets.len()
                             );
-                        }
+                        } else {
                         let target = targets[0];
                         let donor_root = package_work.join("dependency");
                         extract_composite_packages_exact(
@@ -4446,6 +4667,7 @@ pub fn probe_composite_package_input(
                             &available_dependencies,
                             &package_work.join("repair"),
                         )?;
+                    }
                     }
                 } else if missing_store_dependencies != 0 {
                     bail!(
@@ -4520,17 +4742,37 @@ pub fn probe_composite_package_input(
                     "current template extraction",
                 )?;
                 let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                repair_current_template_imports(
+                let repair = repair_current_template_imports(
                     &asset,
                     &donor,
                     store,
                     &available_dependencies,
+                    &approved_stale_dependencies,
                     &package_work.join("repair"),
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "rebasing existing package {} onto its current-game template",
+                        package.path
+                    )
+                })?;
+                donor_rebind_repairs.insert(package.package_id, repair);
+            }
+            CompositePackageAssetKind::ResolvedEngineDataPackage => {
+                *kinds.entry("engine-data").or_default() += 1;
+                // Classification only returns this kind for an additive
+                // package whose single root export decodes to a pure-data
+                // engine class with zero unresolved decoder imports; the
+                // package-store closure must still resolve completely.
+                if missing_store_dependencies != 0 {
+                    bail!(
+                        "additive engine-data package retains {missing_store_dependencies} unresolved package-store dependencies"
+                    );
+                }
             }
         }
     }
-    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &donor_rebind_repairs)?;
     let donor_rebind_count = identity_recovery
         .as_ref()
         .map(|recovery| recovery.donor_rebinds.len())
@@ -4929,12 +5171,129 @@ mod tests {
         assert_eq!(recovered_dependency_route("SKEL_HumanoidSkeleton"), None);
         assert_eq!(recovered_dependency_route("PA_HumanoidFull"), None);
         assert_eq!(recovered_dependency_route("BP_Horse_Skeleton"), None);
-        assert_eq!(recovered_dependency_route("T_Iron_Boots_D"), None);
+        // A retired texture routes to the current-donor rebind: it is never
+        // bundled-aliased, and the plan gate rejects additive consumers.
+        assert_eq!(
+            recovered_dependency_route("T_Iron_Boots_D"),
+            Some(RecoveredDependencyRoute::CurrentDonorRebind("Texture2D"))
+        );
+        // Materials without instance evidence stay unrouted.
+        assert_eq!(recovered_dependency_route("MAT_BB_Custom"), None);
         // A plain skeletal mesh is never a sidecar of another mesh.
         assert_eq!(recovered_dependency_route("SK_Blades_Boots"), None);
         assert_eq!(
             recovered_dependency_route("SK_Chainmail_Cuirass_f_Physics"),
             None
+        );
+    }
+
+    #[test]
+    fn composite_container_root_spans_multiple_folders() {
+        let staged = tempfile::tempdir().unwrap();
+        let nested = staged.path().join("Set").join("Helmets").join("Imperial");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(staged.path().join("Set")).unwrap();
+        std::fs::write(staged.path().join("Set").join("Main_P.utoc"), b"x").unwrap();
+        std::fs::write(nested.join("Helm_P.utoc"), b"x").unwrap();
+        assert_eq!(
+            composite_container_root(staged.path()).unwrap(),
+            staged.path().join("Set")
+        );
+        // A single folder keeps resolving to itself.
+        std::fs::remove_file(nested.join("Helm_P.utoc")).unwrap();
+        assert_eq!(
+            composite_container_root(staged.path()).unwrap(),
+            staged.path().join("Set")
+        );
+        // No containers at all fails closed.
+        std::fs::remove_file(staged.path().join("Set").join("Main_P.utoc")).unwrap();
+        assert!(composite_container_root(staged.path()).is_err());
+    }
+
+    #[test]
+    fn composite_uniqueness_accepts_only_exact_duplicates() {
+        let package = |package_id: u64, path: &str| PackageEntry {
+            package_id,
+            path: path.to_owned(),
+        };
+        // Same ID and same path in two containers: returned for byte proof.
+        let duplicates = verify_composite_package_uniqueness(&[
+            package(1, "OblivionRemastered/Content/Art/A.uasset"),
+            package(1, "oblivionremastered/content/art/a.uasset"),
+            package(2, "OblivionRemastered/Content/Art/B.uasset"),
+        ])
+        .unwrap();
+        assert_eq!(duplicates.into_iter().collect::<Vec<_>>(), vec![1]);
+        // One ID with two paths is a hard failure.
+        assert!(
+            verify_composite_package_uniqueness(&[
+                package(1, "OblivionRemastered/Content/Art/A.uasset"),
+                package(1, "OblivionRemastered/Content/Art/B.uasset"),
+            ])
+            .is_err()
+        );
+        // One path with two IDs is a hard failure.
+        assert!(
+            verify_composite_package_uniqueness(&[
+                package(1, "OblivionRemastered/Content/Art/A.uasset"),
+                package(2, "OblivionRemastered/Content/Art/A.uasset"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_carriers_require_identical_rows_and_chunk_hashes() {
+        let hashes = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(chunk, hash)| (chunk.to_string(), hash.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let row = |imports: &[u64]| ("A".to_owned(), store(1, "art/T_Shared.uasset", imports));
+        let row_b = |imports: &[u64]| ("B".to_owned(), store(1, "art/T_Shared.uasset", imports));
+        let identical = hashes(&[("aa00", "h1"), ("aa01", "h2")]);
+        verify_identical_duplicate_carriers(
+            1,
+            &[row(&[7]), row_b(&[7])],
+            &[
+                ("A".to_owned(), identical.clone()),
+                ("B".to_owned(), identical.clone()),
+            ],
+        )
+        .unwrap();
+        // Diverging chunk bytes fail closed.
+        assert!(
+            verify_identical_duplicate_carriers(
+                1,
+                &[row(&[7]), row_b(&[7])],
+                &[
+                    ("A".to_owned(), identical.clone()),
+                    ("B".to_owned(), hashes(&[("aa00", "h1"), ("aa01", "DIFFERENT")])),
+                ],
+            )
+            .is_err()
+        );
+        // Diverging package-store imports fail closed.
+        assert!(
+            verify_identical_duplicate_carriers(
+                1,
+                &[row(&[7]), row_b(&[8])],
+                &[
+                    ("A".to_owned(), identical.clone()),
+                    ("B".to_owned(), identical.clone()),
+                ],
+            )
+            .is_err()
+        );
+        // A single carrier is not a duplicate.
+        assert!(
+            verify_identical_duplicate_carriers(
+                1,
+                &[row(&[7])],
+                &[("A".to_owned(), identical.clone())]
+            )
+            .is_err()
         );
     }
 

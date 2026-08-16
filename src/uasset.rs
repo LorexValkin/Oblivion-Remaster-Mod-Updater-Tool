@@ -129,6 +129,10 @@ pub struct CompositePackageImportRepair {
     pub repaired_import_count: usize,
     pub repaired_targets: Vec<String>,
     pub retired_physics_asset: bool,
+    /// Serialized material-slot references nulled because the same-identity
+    /// current-game donor carries the same slot names with null references
+    /// (the current game retired the mesh's material imports entirely).
+    pub retired_material_slot_count: usize,
     pub stale_create_dependencies_removed: usize,
     pub source_imported_package_ids: Vec<u64>,
     pub missing_source_imported_package_ids: Vec<u64>,
@@ -196,6 +200,11 @@ pub enum CompositePackageAssetKind {
     MaterialInstanceConstant,
     ResolvedAuthoredPackage,
     CurrentTemplatePackage,
+    /// An additive package whose single root export decodes to a pure-data
+    /// engine class (AnimSequence, AnimMontage, Skeleton, PhysicsAsset) with
+    /// every decoder import resolved. Existing identities never take this
+    /// kind; they stay on the current-template contract.
+    ResolvedEngineDataPackage,
 }
 
 fn package_name_leaf(package_name: &str) -> Result<&str> {
@@ -1618,6 +1627,274 @@ fn select_material_slot_targets(
         .collect()
 }
 
+/// Finds the one serialized material array of a skeletal mesh while allowing
+/// a MIX of resolved and unresolved slot references, and returns only the
+/// slots that reference unresolved imports. Resolved slots must decode as
+/// MaterialInstanceConstant imports (the same sanity the resolved-only scan
+/// enforces); at least one slot must reference an unresolved pair object or
+/// the scan reports no array. This is the composite-lane evidence that an
+/// unresolved import plays a MATERIAL role: its serialized slot name then
+/// selects the current donor's material for the same slot.
+fn serialized_mixed_material_slots(
+    document: &Value,
+    pairs: &[(usize, usize)],
+) -> Result<(SerializedMaterialArray, Vec<usize>)> {
+    const MATERIAL_BYTES: usize = 40;
+    const MAX_MATERIALS: i32 = 64;
+    let names = document
+        .get("NameMap")
+        .and_then(Value::as_array)
+        .context("source UAsset JSON has no NameMap")?;
+    let imports = document
+        .get("Imports")
+        .and_then(Value::as_array)
+        .context("source UAsset JSON has no Imports")?;
+    let unresolved_objects = pairs
+        .iter()
+        .map(|(_, object)| *object)
+        .collect::<BTreeSet<_>>();
+    let bytes = skeletal_mesh_export_bytes(document)?;
+    let mut matches = Vec::new();
+    for offset in 4..bytes.len().saturating_sub(MATERIAL_BYTES) {
+        let Some(count) = little_i32(&bytes, offset - 4) else {
+            continue;
+        };
+        if !(1..=MAX_MATERIALS).contains(&count) {
+            continue;
+        }
+        let Some(end) = offset.checked_add(count as usize * MATERIAL_BYTES) else {
+            continue;
+        };
+        if end > bytes.len() {
+            continue;
+        }
+        let mut unresolved_slots = Vec::new();
+        let mut slot_offsets = Vec::new();
+        let mut valid = true;
+        for slot in 0..count as usize {
+            let entry = offset + slot * MATERIAL_BYTES;
+            let (Some(reference), Some(name_index), Some(name_number)) = (
+                little_i32(&bytes, entry),
+                little_i32(&bytes, entry + 4),
+                little_i32(&bytes, entry + 8),
+            ) else {
+                valid = false;
+                break;
+            };
+            let Some(slot_name) = usize::try_from(name_index)
+                .ok()
+                .and_then(|index| names.get(index))
+                .and_then(Value::as_str)
+            else {
+                valid = false;
+                break;
+            };
+            if !(0..=16).contains(&name_number) {
+                valid = false;
+                break;
+            }
+            if reference == 0 {
+                continue;
+            }
+            let Some(object_index) = reference
+                .checked_neg()
+                .and_then(|value| value.checked_sub(1))
+                .and_then(|value| usize::try_from(value).ok())
+            else {
+                valid = false;
+                break;
+            };
+            if unresolved_objects.contains(&object_index) {
+                unresolved_slots.push(MaterialSlotEvidence {
+                    object_import_index: object_index,
+                    slot_name: slot_name.to_owned(),
+                });
+                slot_offsets.push(entry);
+                continue;
+            }
+            let resolved_material = imports.get(object_index).is_some_and(|import| {
+                import.get("ClassName").and_then(Value::as_str) == Some("MaterialInstanceConstant")
+            });
+            if !resolved_material {
+                valid = false;
+                break;
+            }
+        }
+        if valid && !unresolved_slots.is_empty() {
+            matches.push((
+                SerializedMaterialArray {
+                    offset,
+                    slots: unresolved_slots,
+                },
+                slot_offsets,
+            ));
+        }
+    }
+    matches.sort_by(|left, right| {
+        left.0
+            .slots
+            .iter()
+            .map(|slot| (slot.object_import_index, slot.slot_name.as_str()))
+            .cmp(
+                right
+                    .0
+                    .slots
+                    .iter()
+                    .map(|slot| (slot.object_import_index, slot.slot_name.as_str())),
+            )
+            .then(left.0.offset.cmp(&right.0.offset))
+    });
+    matches.dedup_by(|left, right| left.0.slots == right.0.slots);
+    if matches.len() != 1 {
+        bail!(
+            "skeletal mesh must expose exactly one serialized material array covering its unresolved imports; found {}",
+            matches.len()
+        );
+    }
+    Ok(matches.remove(0))
+}
+
+/// Proves that the current-game donor mesh retired the given material slot
+/// names: its own serialized material array must carry every one of those
+/// slot names with a NULL object reference. The donor is read-only evidence;
+/// nothing is mutated.
+fn donor_retires_material_slots(donor: &Value, slot_names: &BTreeSet<String>) -> Result<()> {
+    const MATERIAL_BYTES: usize = 40;
+    const MAX_MATERIALS: i32 = 64;
+    let names = donor
+        .get("NameMap")
+        .and_then(Value::as_array)
+        .context("donor UAsset JSON has no NameMap")?;
+    let bytes = skeletal_mesh_export_bytes(donor)?;
+    let wanted = slot_names
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    for offset in 4..bytes.len().saturating_sub(MATERIAL_BYTES) {
+        let Some(count) = little_i32(&bytes, offset - 4) else {
+            continue;
+        };
+        if !(1..=MAX_MATERIALS).contains(&count) {
+            continue;
+        }
+        let Some(end) = offset.checked_add(count as usize * MATERIAL_BYTES) else {
+            continue;
+        };
+        if end > bytes.len() {
+            continue;
+        }
+        let mut null_names = BTreeSet::new();
+        let mut valid = true;
+        for slot in 0..count as usize {
+            let entry = offset + slot * MATERIAL_BYTES;
+            let (Some(reference), Some(name_index), Some(name_number)) = (
+                little_i32(&bytes, entry),
+                little_i32(&bytes, entry + 4),
+                little_i32(&bytes, entry + 8),
+            ) else {
+                valid = false;
+                break;
+            };
+            let Some(slot_name) = usize::try_from(name_index)
+                .ok()
+                .and_then(|index| names.get(index))
+                .and_then(Value::as_str)
+            else {
+                valid = false;
+                break;
+            };
+            if !(0..=16).contains(&name_number) {
+                valid = false;
+                break;
+            }
+            if reference == 0 {
+                null_names.insert(slot_name.to_ascii_lowercase());
+            }
+        }
+        if valid && wanted.is_subset(&null_names) {
+            return Ok(());
+        }
+    }
+    bail!(
+        "current donor does not retire material slot(s) [{}] with null serialized references; donor-proven material retirement is unavailable",
+        slot_names
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Nulls the serialized material-slot references of unresolved imports whose
+/// retirement the current donor proved, removes their create-before
+/// dependencies, and reports the evidence. The caller rebinds the now-inert
+/// import table entries to a live donor target so no unresolved marker
+/// remains in the rebuilt package.
+fn retire_unresolved_material_slots(
+    document: &mut Value,
+    array: &SerializedMaterialArray,
+    slot_offsets: &[usize],
+) -> Result<Vec<RetiredPhysicsAssetEvidence>> {
+    let mut bytes = skeletal_mesh_export_bytes(document)?;
+    let mut evidence = Vec::new();
+    let mut removed_references = Vec::new();
+    for (slot, entry) in array.slots.iter().zip(slot_offsets) {
+        let expected = -i32::try_from(slot.object_import_index)? - 1;
+        if little_i32(&bytes, *entry) != Some(expected) {
+            bail!(
+                "serialized material slot {} changed during migration",
+                slot.slot_name
+            );
+        }
+        bytes[*entry..*entry + 4].copy_from_slice(&0_i32.to_le_bytes());
+        removed_references.push(i64::from(expected));
+        evidence.push(RetiredPhysicsAssetEvidence {
+            object_import_index: slot.object_import_index,
+            reference_offset: Some(*entry),
+            removed_dependency_count: 0,
+            already_retired: false,
+        });
+    }
+    let export = document
+        .get_mut("Exports")
+        .and_then(Value::as_array_mut)
+        .context("source UAsset JSON has no mutable Exports")?
+        .iter_mut()
+        .filter(|export| {
+            export
+                .get("ObjectName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with("sk_"))
+        })
+        .collect::<Vec<_>>();
+    if export.len() != 1 {
+        bail!("replacement UAsset must contain exactly one mutable SK_ export");
+    }
+    let export = export.into_iter().next().unwrap();
+    if let Some(dependencies) = export
+        .get_mut("CreateBeforeSerializationDependencies")
+        .and_then(Value::as_array_mut)
+    {
+        for (index, reference) in removed_references.iter().enumerate() {
+            let removed = dependencies
+                .iter()
+                .filter(|value| value.as_i64() == Some(*reference))
+                .count();
+            dependencies.retain(|value| value.as_i64() != Some(*reference));
+            evidence[index].removed_dependency_count = removed;
+        }
+    }
+    let encoded = Value::String(BASE64.encode(&bytes));
+    if export.get("Data").and_then(Value::as_str).is_some() {
+        export["Data"] = encoded;
+    } else if export.get("Extras").and_then(Value::as_str).is_some() {
+        export["Extras"] = encoded;
+    } else {
+        bail!("skeletal mesh export has neither raw Data nor structured Extras to migrate");
+    }
+    Ok(evidence)
+}
+
 fn serialized_skeleton_import_index(
     document: &Value,
     pairs: &[(usize, usize)],
@@ -2207,76 +2484,164 @@ pub fn repair_composite_skeletal_mesh_imports(
     let donor: Value = serde_json::from_slice(&fs::read(&donor_json)?)?;
     let original_exports = validated_export_data(&document)?;
     let pairs = unresolved_import_pairs(&document)?;
-    if pairs.len() != 2 {
+    if pairs.is_empty() || pairs.len() > 4 {
         bail!(
-            "composite skeletal-mesh repair requires exactly two unresolved object imports (skeleton and physics); found {}",
+            "composite skeletal-mesh repair supports 1..=4 unresolved object imports; found {}",
             pairs.len()
         );
     }
-    let material_array = serialized_resolved_material_slots(&document)?;
-    let material_objects = material_array
-        .slots
-        .iter()
-        .map(|slot| slot.object_import_index)
-        .collect::<BTreeSet<_>>();
-    let skeleton_object_index =
-        serialized_skeleton_import_index(&document, &pairs, &material_objects)?;
-    let auxiliary = pairs
-        .iter()
-        .map(|(_, object)| *object)
-        .filter(|object| *object != skeleton_object_index)
-        .collect::<Vec<_>>();
-    if auxiliary.len() != 1 {
-        bail!("composite skeletal mesh does not expose exactly one physics candidate");
-    }
-    let (skeleton_package, skeleton_object) = resolved_import(&donor, "Skeleton")?;
-    let skeleton = target_for_path(
-        &skeleton_package,
-        &skeleton_object,
-        "Skeleton",
-        available_dependencies,
-    )?;
-    let donor_physics = resolved_imports(&donor, "PhysicsAsset")?;
-    if donor_physics.len() > 1 {
-        bail!("current stock donor has more than one PhysicsAsset import");
-    }
-    let active_physics = donor_physics
-        .first()
-        .map(|(package, object)| {
-            prove_serialized_object_property(
-                &document,
-                "PhysicsAsset",
-                SKELETAL_MESH_PHYSICS_ASSET_SCHEMA_INDEX,
-                auxiliary[0],
-                material_array.offset,
-            )?;
-            target_for_path(package, object, "PhysicsAsset", available_dependencies)
+    let mixed_material_array = serialized_mixed_material_slots(&document, &pairs).ok();
+    let material_pair_objects = mixed_material_array
+        .as_ref()
+        .map(|(array, _)| {
+            array
+                .slots
+                .iter()
+                .map(|slot| slot.object_import_index)
+                .collect::<BTreeSet<_>>()
         })
-        .transpose()?;
-    let retired = if active_physics.is_none() {
-        retire_obsolete_physics_asset(
-            &mut document,
-            &donor,
-            &pairs,
-            &material_array,
-            &material_objects,
-            skeleton_object_index,
-            0,
-        )?
+        .unwrap_or_default();
+    let all_pairs_are_materials = !material_pair_objects.is_empty()
+        && pairs
+            .iter()
+            .all(|(_, object)| material_pair_objects.contains(object));
+    let (mut patches, retired, retired_material_slots) = if all_pairs_are_materials {
+        // Donor-material role branch: every unresolved import is referenced
+        // by the mesh's one serialized material array, so each one is a
+        // retired material identity. When the current donor still imports
+        // materials, its material for the same normalized slot name is the
+        // proven successor. When the donor retired ALL material imports, the
+        // donor's own array must carry the same slot names with null
+        // references; the source slots are then retired the same way and the
+        // inert import entries rebind to the donor skeleton so no unresolved
+        // marker remains. Anything else fails closed.
+        let (array, slot_offsets) = mixed_material_array
+            .context("material-role repair lost its serialized slot evidence")?;
+        match current_material_candidates(&donor, available_dependencies) {
+            Ok((_, candidates)) => {
+                let targets =
+                    select_material_slot_targets(&array.slots, &candidates, &HashMap::new())?;
+                let mut target_by_object = HashMap::<usize, ImportTarget>::new();
+                for (slot, target) in array.slots.iter().zip(&targets) {
+                    if let Some(existing) = target_by_object.get(&slot.object_import_index)
+                        && existing.package_id != target.package_id
+                    {
+                        bail!(
+                            "one unresolved object import is used by incompatible material slots {} and {}",
+                            existing.object_name,
+                            slot.slot_name
+                        );
+                    }
+                    target_by_object.insert(slot.object_import_index, target.clone());
+                }
+                let patches = pairs
+                    .iter()
+                    .map(|(package, object)| {
+                        let target = target_by_object
+                            .get(object)
+                            .context("material pair lost its donor slot target")?;
+                        Ok(((*package, *object), target.clone()))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (patches, Vec::new(), 0_usize)
+            }
+            Err(_) => {
+                let slot_names = array
+                    .slots
+                    .iter()
+                    .map(|slot| slot.slot_name.clone())
+                    .collect::<BTreeSet<_>>();
+                donor_retires_material_slots(&donor, &slot_names)?;
+                let (skeleton_package, skeleton_object) = resolved_import(&donor, "Skeleton")?;
+                let skeleton = target_for_path(
+                    &skeleton_package,
+                    &skeleton_object,
+                    "Skeleton",
+                    available_dependencies,
+                )?;
+                let retired =
+                    retire_unresolved_material_slots(&mut document, &array, &slot_offsets)?;
+                let count = retired.len();
+                let patches = pairs
+                    .iter()
+                    .map(|(package, object)| ((*package, *object), skeleton.clone()))
+                    .collect::<Vec<_>>();
+                (patches, retired, count)
+            }
+        }
     } else {
-        Vec::new()
+        if pairs.len() != 2 {
+            bail!(
+                "composite skeletal-mesh repair requires exactly two unresolved object imports (skeleton and physics) when no serialized material-slot evidence covers them; found {}",
+                pairs.len()
+            );
+        }
+        let material_array = serialized_resolved_material_slots(&document)?;
+        let material_objects = material_array
+            .slots
+            .iter()
+            .map(|slot| slot.object_import_index)
+            .collect::<BTreeSet<_>>();
+        let skeleton_object_index =
+            serialized_skeleton_import_index(&document, &pairs, &material_objects)?;
+        let auxiliary = pairs
+            .iter()
+            .map(|(_, object)| *object)
+            .filter(|object| *object != skeleton_object_index)
+            .collect::<Vec<_>>();
+        if auxiliary.len() != 1 {
+            bail!("composite skeletal mesh does not expose exactly one physics candidate");
+        }
+        let (skeleton_package, skeleton_object) = resolved_import(&donor, "Skeleton")?;
+        let skeleton = target_for_path(
+            &skeleton_package,
+            &skeleton_object,
+            "Skeleton",
+            available_dependencies,
+        )?;
+        let donor_physics = resolved_imports(&donor, "PhysicsAsset")?;
+        if donor_physics.len() > 1 {
+            bail!("current stock donor has more than one PhysicsAsset import");
+        }
+        let active_physics = donor_physics
+            .first()
+            .map(|(package, object)| {
+                prove_serialized_object_property(
+                    &document,
+                    "PhysicsAsset",
+                    SKELETAL_MESH_PHYSICS_ASSET_SCHEMA_INDEX,
+                    auxiliary[0],
+                    material_array.offset,
+                )?;
+                target_for_path(package, object, "PhysicsAsset", available_dependencies)
+            })
+            .transpose()?;
+        let retired = if active_physics.is_none() {
+            retire_obsolete_physics_asset(
+                &mut document,
+                &donor,
+                &pairs,
+                &material_array,
+                &material_objects,
+                skeleton_object_index,
+                0,
+            )?
+        } else {
+            Vec::new()
+        };
+        let patches = pairs
+            .iter()
+            .map(|(package, object)| {
+                let target = if *object == skeleton_object_index {
+                    skeleton.clone()
+                } else {
+                    active_physics.clone().unwrap_or_else(|| skeleton.clone())
+                };
+                ((*package, *object), target)
+            })
+            .collect::<Vec<_>>();
+        (patches, retired, 0_usize)
     };
-    let mut patches = pairs
-        .iter()
-        .map(|(package, object)| {
-            let target = if *object == skeleton_object_index {
-                skeleton.clone()
-            } else {
-                active_physics.clone().unwrap_or_else(|| skeleton.clone())
-            };
-            ((*package, *object), target)
-        })
-        .collect::<Vec<_>>();
     patches.sort_by_key(|((package, object), _)| (*package, *object));
     {
         let imports = document
@@ -2342,7 +2707,9 @@ pub fn repair_composite_skeletal_mesh_imports(
         asset_kind: "skeletal-mesh".to_owned(),
         repaired_import_count: patches.len(),
         repaired_targets,
-        retired_physics_asset: retired.iter().any(|evidence| !evidence.already_retired),
+        retired_physics_asset: retired_material_slots == 0
+            && retired.iter().any(|evidence| !evidence.already_retired),
+        retired_material_slot_count: retired_material_slots,
         stale_create_dependencies_removed,
         source_imported_package_ids: source_store.imported_package_ids.clone(),
         missing_source_imported_package_ids: missing,
@@ -3035,6 +3402,65 @@ pub fn classify_composite_package_asset(
         .get("Exports")
         .and_then(Value::as_array)
         .context("composite package has no Exports")?;
+    // Behavioral export payloads (ClassExport, FunctionExport, ...) cannot be
+    // JSON-validated or import-repaired; a package carrying them is accepted
+    // ONLY as an untouched pass-through: a single BlueprintGeneratedClass
+    // root with zero unresolved decoder imports, preserved byte-for-byte by
+    // the container rebuild and proven by the roundtrip extraction. Any
+    // repair path that would mutate such a package still fails closed on its
+    // own payload validation.
+    let behavioral_export_types = exports
+        .iter()
+        .filter_map(|export| export.get("$type").and_then(Value::as_str))
+        .filter(|export_type| {
+            !export_type.contains("RawExport") && !export_type.contains("NormalExport")
+        })
+        .map(|export_type| {
+            export_type
+                .split(',')
+                .next()
+                .unwrap_or(export_type)
+                .rsplit('.')
+                .next()
+                .unwrap_or(export_type)
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
+    if !behavioral_export_types.is_empty() {
+        let root_classes = exports
+            .iter()
+            .filter(|export| export.get("OuterIndex").and_then(Value::as_i64) == Some(0))
+            .filter(|export| {
+                export
+                    .get("ClassIndex")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|index| index < 0)
+            })
+            .map(|export| export_class_name(&document, export))
+            .collect::<Result<Vec<_>>>()?;
+        let blueprint_generated_root = root_classes.len() == 1
+            && root_classes[0]
+                .to_ascii_lowercase()
+                .ends_with("blueprintgeneratedclass");
+        if !blueprint_generated_root {
+            bail!(
+                "composite package carries behavioral export type(s) [{}] without a single BlueprintGeneratedClass root (found roots [{}]); behavioral payloads outside authored Blueprints stay report-only",
+                behavioral_export_types
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                root_classes.join(", ")
+            );
+        }
+        let unresolved = unresolved_import_pairs(&document)?.len();
+        if unresolved != 0 {
+            bail!(
+                "authored Blueprint package with behavioral export payloads has {unresolved} unresolved decoder import(s); behavioral payloads cannot be import-repaired and stay report-only"
+            );
+        }
+        return Ok((CompositePackageAssetKind::ResolvedAuthoredPackage, 0));
+    }
     validated_export_data(&document)?;
     let classes = exports
         .iter()
@@ -3129,9 +3555,35 @@ pub fn classify_composite_package_asset(
             unresolved,
         ));
     }
+    if let Some(class) = additive_engine_data_class(&root_classes) {
+        if unresolved != 0 {
+            bail!(
+                "additive {class} package retains {unresolved} unresolved decoder import(s); additive engine-data packages must resolve completely against the bundled package set and the current game"
+            );
+        }
+        return Ok((CompositePackageAssetKind::ResolvedEngineDataPackage, 0));
+    }
     bail!(
-        "additive composite package has no independently supported primary export class; current-template repair is available only to existing package identities"
+        "additive composite package root class(es) [{}] are not among the proven structural classes (SkeletalMesh, StaticMesh, Texture2D, MaterialInstanceConstant, BlueprintGeneratedClass, Altar TES forms, AnimSequence, AnimMontage, Skeleton, PhysicsAsset); current-template repair is available only to existing package identities",
+        root_classes.join(", ")
     )
+}
+
+/// Additive engine-data classes: pure-data Unreal engine assets whose entire
+/// semantic content is their serialized payload — no behavioral script graph
+/// and no external contract beyond their resolved imports. A package
+/// qualifies only when its single top-level export decodes to one of these
+/// classes; every other additive class stays report-only.
+fn additive_engine_data_class(root_classes: &[String]) -> Option<&'static str> {
+    const ENGINE_DATA_CLASSES: [&str; 5] =
+        ["AnimSequence", "AnimMontage", "Skeleton", "PhysicsAsset", "Material"];
+    if root_classes.len() != 1 {
+        return None;
+    }
+    ENGINE_DATA_CLASSES
+        .iter()
+        .copied()
+        .find(|class| root_classes[0].eq_ignore_ascii_case(class))
 }
 
 fn resolved_import_semantics(document: &Value) -> Result<BTreeSet<String>> {
@@ -3225,6 +3677,7 @@ pub fn repair_current_template_imports(
     donor_asset: &Path,
     source_store: &PackageStoreEntry,
     available_dependencies: &HashMap<u64, PackageEntry>,
+    approved_stale_dependency_ids: &BTreeSet<u64>,
     work: &Path,
 ) -> Result<CompositePackageImportRepair> {
     fs::create_dir_all(work)?;
@@ -3322,8 +3775,17 @@ pub fn repair_current_template_imports(
     }
     let (missing, target_imported_package_ids) =
         replacement_dependency_sets(source_store, available_dependencies, &[]);
-    if !missing.is_empty() {
-        bail!("current-template repair retained unresolved package IDs");
+    // A recovered stale dependency the caller routed to this donor repair is
+    // accounted for by the donor's import table (the donor no longer imports
+    // it); any other unresolved package ID still fails closed.
+    let unapproved = missing
+        .iter()
+        .filter(|package_id| !approved_stale_dependency_ids.contains(package_id))
+        .count();
+    if unapproved != 0 {
+        bail!(
+            "current-template repair retained {unapproved} unresolved package ID(s) outside the approved stale-dependency plan"
+        );
     }
     Ok(CompositePackageImportRepair {
         asset: asset.to_string_lossy().replace('\\', "/"),
@@ -3335,6 +3797,7 @@ pub fn repair_current_template_imports(
             .cloned()
             .collect(),
         retired_physics_asset: false,
+        retired_material_slot_count: 0,
         stale_create_dependencies_removed: 0,
         source_imported_package_ids: source_store.imported_package_ids.clone(),
         missing_source_imported_package_ids: missing,
@@ -3465,6 +3928,7 @@ pub fn repair_single_external_import(
         repaired_import_count: pairs.len(),
         repaired_targets: vec![target.package_path],
         retired_physics_asset: false,
+        retired_material_slot_count: 0,
         stale_create_dependencies_removed: 0,
         source_imported_package_ids: source_store.imported_package_ids.clone(),
         missing_source_imported_package_ids: missing,
@@ -4444,6 +4908,37 @@ mod tests {
         assert!(game_package_path("Content/Items/SM_Item.uasset").is_err());
         assert!(game_package_path("Project/Content/Items/../Secrets/SM_Item.uasset").is_err());
         assert!(game_package_path("A/B/Content/Items/SM_Item.uasset").is_err());
+    }
+
+    #[test]
+    fn additive_engine_data_classes_require_one_pure_data_root() {
+        let roots = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            additive_engine_data_class(&roots(&["AnimSequence"])),
+            Some("AnimSequence")
+        );
+        assert_eq!(
+            additive_engine_data_class(&roots(&["AnimMontage"])),
+            Some("AnimMontage")
+        );
+        assert_eq!(
+            additive_engine_data_class(&roots(&["Skeleton"])),
+            Some("Skeleton")
+        );
+        assert_eq!(
+            additive_engine_data_class(&roots(&["PhysicsAsset"])),
+            Some("PhysicsAsset")
+        );
+        // Behavioral or unknown classes never qualify.
+        assert_eq!(additive_engine_data_class(&roots(&["AnimBlueprint"])), None);
+        assert_eq!(additive_engine_data_class(&roots(&["Blueprint"])), None);
+        assert_eq!(additive_engine_data_class(&roots(&["LevelSequence"])), None);
+        // More than one root export is never a pure-data package.
+        assert_eq!(
+            additive_engine_data_class(&roots(&["AnimSequence", "Skeleton"])),
+            None
+        );
+        assert_eq!(additive_engine_data_class(&roots(&[])), None);
     }
 
     fn fixture(path: &Path, duplicate_anchor: bool, payload_bytes: usize) -> Value {

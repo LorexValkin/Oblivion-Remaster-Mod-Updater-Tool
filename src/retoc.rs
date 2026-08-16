@@ -316,6 +316,56 @@ impl RetocTool {
         Ok(bytes)
     }
 
+    /// Hashes every raw chunk (export bundle, bulk, optional, memory-mapped)
+    /// that belongs to one package ID inside a container, keyed by the chunk
+    /// ID. Byte-identity of two carriers of the same package ID is proven by
+    /// comparing the returned maps: equal keys and equal SHA-256 values mean
+    /// the containers store the same authored content for that package.
+    pub fn package_chunk_hashes(
+        &self,
+        utoc: &Path,
+        package_id: u64,
+        work: &Path,
+    ) -> Result<BTreeMap<String, String>> {
+        fs::create_dir_all(work)?;
+        let list = self.run([
+            "list".into(),
+            "--path".into(),
+            "--package".into(),
+            utoc.as_os_str().to_owned(),
+        ])?;
+        Self::assert_success(&list, &format!("retoc list {}", utoc.display()))?;
+        let chunk_ids = parse_package_chunk_ids(&list.output, package_id)?;
+        if chunk_ids.is_empty() {
+            bail!(
+                "package ID {package_id} has no raw chunks in {}",
+                utoc.display()
+            );
+        }
+        let mut hashes = BTreeMap::new();
+        for chunk_id in chunk_ids {
+            let output = work.join(&chunk_id);
+            let get = self.run([
+                "get".into(),
+                utoc.as_os_str().to_owned(),
+                chunk_id.clone().into(),
+                output.as_os_str().to_owned(),
+            ])?;
+            Self::assert_success(
+                &get,
+                &format!("retoc get chunk {chunk_id} from {}", utoc.display()),
+            )?;
+            let bytes = fs::read(&output).with_context(|| {
+                format!(
+                    "retoc did not materialize chunk {chunk_id} from {}",
+                    utoc.display()
+                )
+            })?;
+            hashes.insert(chunk_id, sha256_bytes(&bytes));
+        }
+        Ok(hashes)
+    }
+
     pub fn package_store_entries(
         &self,
         utoc: &Path,
@@ -380,6 +430,31 @@ fn parse_package_entries(lines: &[String]) -> Result<Vec<PackageEntry>> {
             })
         })
         .collect()
+}
+
+/// Collects every raw chunk ID a container stores for one package ID. Bulk
+/// chunk rows do not repeat the package ID column, but every chunk ID of a
+/// package starts with the package ID's little-endian hex bytes, so all data
+/// chunk kinds (export bundles and every bulk variant) are matched by that
+/// authoritative prefix. Container bookkeeping chunks are excluded by kind.
+fn parse_package_chunk_ids(lines: &[String], package_id: u64) -> Result<Vec<String>> {
+    let prefix = package_id
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let row = Regex::new(
+        r"\s([0-9a-fA-F]{24})\s+(?:\d+|-)\s+(ExportBundleData|BulkData|OptionalBulkData|MemoryMappedBulkData)\s",
+    )?;
+    let mut chunk_ids = lines
+        .iter()
+        .filter_map(|line| row.captures(line))
+        .map(|captures| captures[1].to_ascii_lowercase())
+        .filter(|chunk_id| chunk_id.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    chunk_ids.sort();
+    chunk_ids.dedup();
+    Ok(chunk_ids)
 }
 
 fn parse_package_store_entries(lines: &[String]) -> Result<Vec<PackageStoreEntry>> {
@@ -474,6 +549,34 @@ mod tests {
                 path: "../../../OblivionRemastered/Content/Art/armor/Daedric/SK_Daedric_Cuirass_f.uasset".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn collects_all_package_chunk_ids_by_little_endian_prefix() {
+        let lines = [
+            "CL_IP_Helm_P bf598c9f12bb65b600000001 13143116776211241407 ExportBundleData ../../../OblivionRemastered/Content/Art/Armor/ImperialPalace/SM_ImperialPalace_Helmet_m.uasset".to_owned(),
+            "CL_IP_Helm_P 3930ebeb690c16df00000001 16075049569014722617 ExportBundleData ../../../OblivionRemastered/Content/Art/Armor/Blades/T_Blades_Cuirass_m_D.uasset".to_owned(),
+            "CL_IP_Helm_P 3930ebeb690c16df00000002 -                    BulkData             ../../../OblivionRemastered/Content/Art/Armor/Blades/T_Blades_Cuirass_m_D.ubulk".to_owned(),
+            "CL_IP_Helm_P 962993d3264f742800000006 -                    ContainerHeader      -".to_owned(),
+            "CL_IP_Helm_P bf598c9f12bb65b600000002 -                    BulkData             ../../../OblivionRemastered/Content/Art/Armor/ImperialPalace/SM_ImperialPalace_Helmet_m.ubulk".to_owned(),
+        ];
+        // 16075049569014722617 == 0xDF160C69EBEB3039 -> little-endian prefix 3930ebeb690c16df.
+        assert_eq!(
+            parse_package_chunk_ids(&lines, 16_075_049_569_014_722_617).unwrap(),
+            vec![
+                "3930ebeb690c16df00000001".to_owned(),
+                "3930ebeb690c16df00000002".to_owned()
+            ]
+        );
+        assert_eq!(
+            parse_package_chunk_ids(&lines, 13_143_116_776_211_241_407).unwrap(),
+            vec![
+                "bf598c9f12bb65b600000001".to_owned(),
+                "bf598c9f12bb65b600000002".to_owned()
+            ]
+        );
+        // The container header chunk belongs to no package.
+        assert!(parse_package_chunk_ids(&lines, 1).unwrap().is_empty());
     }
 
     #[test]

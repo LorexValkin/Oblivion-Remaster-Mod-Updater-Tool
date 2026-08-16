@@ -2186,6 +2186,13 @@ pub(crate) fn recovered_dependency_route(target_leaf: &str) -> Option<RecoveredD
     if lower.starts_with("sk_") && lower.ends_with("_physicsasset") {
         return Some(RecoveredDependencyRoute::CurrentDonorRebind("PhysicsAsset"));
     }
+    if lower.starts_with("t_") {
+        // A retired texture identity is never aliased from the bundle; only
+        // an existing same-identity consumer whose current-game donor dropped
+        // the reference can rebind it, and the donor-driven import repair
+        // must consume the plan or the lane fails.
+        return Some(RecoveredDependencyRoute::CurrentDonorRebind("Texture2D"));
+    }
     None
 }
 
@@ -2445,7 +2452,10 @@ pub fn recover_composite_package_identities(
         let target_leaf = package_leaf_without_extension(&target_name);
         let expected_class = match recovered_dependency_route(&target_leaf) {
             None => {
-                bail!("recovered dependency {target_name} has no supported structural alias class")
+                bail!(
+                    "recovered dependency {target_name} (consumer {}) has no supported structural route: its class prefix carries neither bundled-alias evidence (MIC_/SM_) nor current-donor rebind evidence (retired sidecars, textures); this dependency class stays report-only",
+                    consumer.path
+                )
             }
             Some(RecoveredDependencyRoute::CurrentDonorRebind(expected_class)) => {
                 // The stale sidecar is not aliased. Its consumer must be an
@@ -2468,19 +2478,50 @@ pub fn recover_composite_package_identities(
             }
             Some(RecoveredDependencyRoute::BundledAlias(expected_class)) => expected_class,
         };
-        let (source_candidate, suppress_optional_component) = match composite_alias_candidate(
+        let alias_candidate = match composite_alias_candidate(
             consumer,
             &target_name,
             expected_class,
             &source_store,
             &source_packages,
         ) {
-            Ok(candidate) => (candidate, false),
-            Err(_) if expected_class.eq_ignore_ascii_case("StaticMesh") => (
-                composite_primary_static_mesh_candidate(consumer, &source_store, &source_packages)?,
-                true,
-            ),
-            Err(error) => return Err(error),
+            Ok(candidate) => Ok((candidate, false)),
+            Err(alias_error) if expected_class.eq_ignore_ascii_case("StaticMesh") => {
+                composite_primary_static_mesh_candidate(consumer, &source_store, &source_packages)
+                    .map(|candidate| (candidate, true))
+                    .map_err(|_| alias_error)
+            }
+            Err(alias_error) => Err(alias_error),
+        };
+        let (source_candidate, suppress_optional_component) = match alias_candidate {
+            Ok(pair) => pair,
+            Err(alias_error) => {
+                // No bundled alias evidence exists for this edge. An
+                // existing-identity consumer whose current-game donor no
+                // longer imports the recovered dependency is rebound by its
+                // class arm's donor-driven import repair instead; the repair
+                // must consume the plan or the lane fails closed. Additive
+                // consumers have no donor and keep the alias failure.
+                match plan_donor_rebind(
+                    inspection,
+                    consumer_id,
+                    &consumer.path,
+                    target_id,
+                    &target_name,
+                    expected_class,
+                    "same-identity-current-donor-import-table",
+                ) {
+                    Ok(plan) => {
+                        donor_rebinds.push(plan);
+                        continue;
+                    }
+                    Err(rebind_error) => {
+                        bail!(
+                            "recovered {expected_class} dependency {target_name} has no bundled alias candidate ({alias_error:#}) and no current-donor rebind evidence ({rebind_error:#})"
+                        );
+                    }
+                }
+            }
         };
         if let Some((known_name, known_class, known_source, _, known_suppression)) =
             recovered_targets.get(&target_id)
@@ -3987,13 +4028,13 @@ pub fn probe_heterogeneous_replacement_input(
 /// package.
 pub(crate) fn verify_donor_rebinds_consumed(
     recovery: Option<&CompositeIdentityRecovery>,
-    skeletal_donor_repairs: &HashMap<u64, CompositePackageImportRepair>,
+    donor_rebind_repairs: &HashMap<u64, CompositePackageImportRepair>,
 ) -> Result<()> {
     let Some(recovery) = recovery else {
         return Ok(());
     };
     for rebind in &recovery.donor_rebinds {
-        let repair = skeletal_donor_repairs
+        let repair = donor_rebind_repairs
             .get(&rebind.consumer_package_id)
             .with_context(|| {
                 format!(
@@ -4229,7 +4270,7 @@ pub fn probe_composite_package_input(
         .map(|entry| (entry.package_id, entry))
         .collect::<HashMap<_, _>>();
     let mut kinds = BTreeMap::<&'static str, usize>::new();
-    let mut skeletal_donor_repairs = HashMap::new();
+    let mut donor_rebind_repairs = HashMap::new();
     for package in &inspection.packages {
         let effective_path = composite_effective_package_path(package, &inspection)?;
         let asset = find_extracted_additive_static_mesh(&legacy, &effective_path)?;
@@ -4281,6 +4322,19 @@ pub fn probe_composite_package_input(
             .iter()
             .filter(|dependency| !available_dependencies.contains_key(dependency))
             .count();
+        // Stale dependency edges that identity recovery routed to this
+        // consumer's donor repair; the repair proves each one or fails.
+        let approved_stale_dependencies = identity_recovery
+            .as_ref()
+            .map(|recovery| {
+                recovery
+                    .donor_rebinds
+                    .iter()
+                    .filter(|plan| plan.consumer_package_id == package.package_id)
+                    .map(|plan| plan.target_package_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         match kind {
             CompositePackageAssetKind::SkeletalMesh => {
                 *kinds.entry("skeletal-mesh").or_default() += 1;
@@ -4313,7 +4367,7 @@ pub fn probe_composite_package_input(
                     .with_context(|| {
                         format!("repairing composite SkeletalMesh {}", package.path)
                     })?;
-                    skeletal_donor_repairs.insert(package.package_id, repair);
+                    donor_rebind_repairs.insert(package.package_id, repair);
                 } else if missing_store_dependencies != 0 {
                     bail!("resolved SkeletalMesh retains unresolved package-store dependencies");
                 }
@@ -4355,13 +4409,15 @@ pub fn probe_composite_package_input(
                         "current Texture2D extraction",
                     )?;
                     let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                    repair_current_template_imports(
+                    let repair = repair_current_template_imports(
                         &asset,
                         &donor,
                         store,
                         &available_dependencies,
+                        &approved_stale_dependencies,
                         &package_work.join("repair"),
                     )?;
+                    donor_rebind_repairs.insert(package.package_id, repair);
                 } else if missing_store_dependencies != 0 {
                     bail!("resolved Texture2D retains unresolved package-store dependencies");
                 }
@@ -4384,13 +4440,15 @@ pub fn probe_composite_package_input(
                         )?;
                         let donor =
                             find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                        repair_current_template_imports(
+                        let repair = repair_current_template_imports(
                             &asset,
                             &donor,
                             store,
                             &available_dependencies,
+                            &approved_stale_dependencies,
                             &package_work.join("repair"),
                         )?;
+                        donor_rebind_repairs.insert(package.package_id, repair);
                     } else {
                         let targets = store
                             .imported_package_ids
@@ -4496,17 +4554,31 @@ pub fn probe_composite_package_input(
                     "current template extraction",
                 )?;
                 let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
-                repair_current_template_imports(
+                let repair = repair_current_template_imports(
                     &asset,
                     &donor,
                     store,
                     &available_dependencies,
+                    &approved_stale_dependencies,
                     &package_work.join("repair"),
                 )?;
+                donor_rebind_repairs.insert(package.package_id, repair);
+            }
+            CompositePackageAssetKind::ResolvedEngineDataPackage => {
+                *kinds.entry("engine-data").or_default() += 1;
+                // Classification only returns this kind for an additive
+                // package whose single root export decodes to a pure-data
+                // engine class with zero unresolved decoder imports; the
+                // package-store closure must still resolve completely.
+                if missing_store_dependencies != 0 {
+                    bail!(
+                        "additive engine-data package retains {missing_store_dependencies} unresolved package-store dependencies"
+                    );
+                }
             }
         }
     }
-    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &skeletal_donor_repairs)?;
+    verify_donor_rebinds_consumed(identity_recovery.as_ref(), &donor_rebind_repairs)?;
     let donor_rebind_count = identity_recovery
         .as_ref()
         .map(|recovery| recovery.donor_rebinds.len())
@@ -4782,7 +4854,14 @@ mod tests {
         assert_eq!(recovered_dependency_route("SKEL_HumanoidSkeleton"), None);
         assert_eq!(recovered_dependency_route("PA_HumanoidFull"), None);
         assert_eq!(recovered_dependency_route("BP_Horse_Skeleton"), None);
-        assert_eq!(recovered_dependency_route("T_Iron_Boots_D"), None);
+        // A retired texture routes to the current-donor rebind: it is never
+        // bundled-aliased, and the plan gate rejects additive consumers.
+        assert_eq!(
+            recovered_dependency_route("T_Iron_Boots_D"),
+            Some(RecoveredDependencyRoute::CurrentDonorRebind("Texture2D"))
+        );
+        // Materials without instance evidence stay unrouted.
+        assert_eq!(recovered_dependency_route("MAT_BB_Custom"), None);
         // A plain skeletal mesh is never a sidecar of another mesh.
         assert_eq!(recovered_dependency_route("SK_Blades_Boots"), None);
         assert_eq!(

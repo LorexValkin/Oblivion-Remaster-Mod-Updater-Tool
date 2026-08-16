@@ -196,6 +196,11 @@ pub enum CompositePackageAssetKind {
     MaterialInstanceConstant,
     ResolvedAuthoredPackage,
     CurrentTemplatePackage,
+    /// An additive package whose single root export decodes to a pure-data
+    /// engine class (AnimSequence, AnimMontage, Skeleton, PhysicsAsset) with
+    /// every decoder import resolved. Existing identities never take this
+    /// kind; they stay on the current-template contract.
+    ResolvedEngineDataPackage,
 }
 
 fn package_name_leaf(package_name: &str) -> Result<&str> {
@@ -3099,9 +3104,35 @@ pub fn classify_composite_package_asset(
             unresolved,
         ));
     }
+    if let Some(class) = additive_engine_data_class(&root_classes) {
+        if unresolved != 0 {
+            bail!(
+                "additive {class} package retains {unresolved} unresolved decoder import(s); additive engine-data packages must resolve completely against the bundled package set and the current game"
+            );
+        }
+        return Ok((CompositePackageAssetKind::ResolvedEngineDataPackage, 0));
+    }
     bail!(
-        "additive composite package has no independently supported primary export class; current-template repair is available only to existing package identities"
+        "additive composite package root class(es) [{}] are not among the proven structural classes (SkeletalMesh, StaticMesh, Texture2D, MaterialInstanceConstant, BlueprintGeneratedClass, Altar TES forms, AnimSequence, AnimMontage, Skeleton, PhysicsAsset); current-template repair is available only to existing package identities",
+        root_classes.join(", ")
     )
+}
+
+/// Additive engine-data classes: pure-data Unreal engine assets whose entire
+/// semantic content is their serialized payload — no behavioral script graph
+/// and no external contract beyond their resolved imports. A package
+/// qualifies only when its single top-level export decodes to one of these
+/// classes; every other additive class stays report-only.
+fn additive_engine_data_class(root_classes: &[String]) -> Option<&'static str> {
+    const ENGINE_DATA_CLASSES: [&str; 4] =
+        ["AnimSequence", "AnimMontage", "Skeleton", "PhysicsAsset"];
+    if root_classes.len() != 1 {
+        return None;
+    }
+    ENGINE_DATA_CLASSES
+        .iter()
+        .copied()
+        .find(|class| root_classes[0].eq_ignore_ascii_case(class))
 }
 
 fn resolved_import_semantics(document: &Value) -> Result<BTreeSet<String>> {
@@ -3195,6 +3226,7 @@ pub fn repair_current_template_imports(
     donor_asset: &Path,
     source_store: &PackageStoreEntry,
     available_dependencies: &HashMap<u64, PackageEntry>,
+    approved_stale_dependency_ids: &BTreeSet<u64>,
     work: &Path,
 ) -> Result<CompositePackageImportRepair> {
     fs::create_dir_all(work)?;
@@ -3292,8 +3324,17 @@ pub fn repair_current_template_imports(
     }
     let (missing, target_imported_package_ids) =
         replacement_dependency_sets(source_store, available_dependencies, &[]);
-    if !missing.is_empty() {
-        bail!("current-template repair retained unresolved package IDs");
+    // A recovered stale dependency the caller routed to this donor repair is
+    // accounted for by the donor's import table (the donor no longer imports
+    // it); any other unresolved package ID still fails closed.
+    let unapproved = missing
+        .iter()
+        .filter(|package_id| !approved_stale_dependency_ids.contains(package_id))
+        .count();
+    if unapproved != 0 {
+        bail!(
+            "current-template repair retained {unapproved} unresolved package ID(s) outside the approved stale-dependency plan"
+        );
     }
     Ok(CompositePackageImportRepair {
         asset: asset.to_string_lossy().replace('\\', "/"),
@@ -4414,6 +4455,37 @@ mod tests {
         assert!(game_package_path("Content/Items/SM_Item.uasset").is_err());
         assert!(game_package_path("Project/Content/Items/../Secrets/SM_Item.uasset").is_err());
         assert!(game_package_path("A/B/Content/Items/SM_Item.uasset").is_err());
+    }
+
+    #[test]
+    fn additive_engine_data_classes_require_one_pure_data_root() {
+        let roots = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            additive_engine_data_class(&roots(&["AnimSequence"])),
+            Some("AnimSequence")
+        );
+        assert_eq!(
+            additive_engine_data_class(&roots(&["AnimMontage"])),
+            Some("AnimMontage")
+        );
+        assert_eq!(
+            additive_engine_data_class(&roots(&["Skeleton"])),
+            Some("Skeleton")
+        );
+        assert_eq!(
+            additive_engine_data_class(&roots(&["PhysicsAsset"])),
+            Some("PhysicsAsset")
+        );
+        // Behavioral or unknown classes never qualify.
+        assert_eq!(additive_engine_data_class(&roots(&["AnimBlueprint"])), None);
+        assert_eq!(additive_engine_data_class(&roots(&["Blueprint"])), None);
+        assert_eq!(additive_engine_data_class(&roots(&["LevelSequence"])), None);
+        // More than one root export is never a pure-data package.
+        assert_eq!(
+            additive_engine_data_class(&roots(&["AnimSequence", "Skeleton"])),
+            None
+        );
+        assert_eq!(additive_engine_data_class(&roots(&[])), None);
     }
 
     fn fixture(path: &Path, duplicate_anchor: bool, payload_bytes: usize) -> Value {

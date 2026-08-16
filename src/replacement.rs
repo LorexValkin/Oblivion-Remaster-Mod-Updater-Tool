@@ -1695,6 +1695,62 @@ pub fn inspect_heterogeneous_replacement_staged(
     })
 }
 
+/// Pools per-container composite packages into one identity view. Authors
+/// sometimes cook the same package into more than one shipped container;
+/// under equal mount order that duplication is benign and every copy is
+/// preserved by the per-container rebuild, so entries whose package ID,
+/// case-insensitive path, and import set all agree are deduplicated here.
+/// Any partial identity overlap remains fail-closed.
+pub(crate) fn pool_unique_composite_packages(
+    packages: Vec<PackageEntry>,
+    package_store: &[PackageStoreEntry],
+) -> Result<Vec<PackageEntry>> {
+    let mut imports_by_id = HashMap::<u64, BTreeSet<u64>>::new();
+    for row in package_store {
+        let imports = row
+            .imported_package_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some(existing) = imports_by_id.get(&row.package_id) {
+            if *existing != imports {
+                bail!("composite replacement packages must have unique paths and package IDs");
+            }
+        } else {
+            imports_by_id.insert(row.package_id, imports);
+        }
+    }
+    let mut pooled: Vec<PackageEntry> = Vec::new();
+    let mut kept_by_id = HashMap::<u64, String>::new();
+    for package in packages {
+        match kept_by_id.get(&package.package_id) {
+            Some(kept_path) => {
+                if !kept_path.eq_ignore_ascii_case(&package.path) {
+                    bail!(
+                        "composite replacement packages must have unique paths and package IDs"
+                    );
+                }
+            }
+            None => {
+                kept_by_id.insert(package.package_id, package.path.clone());
+                pooled.push(package);
+            }
+        }
+    }
+    let mut sorted = pooled.clone();
+    sorted.sort_by(|left, right| {
+        left.path
+            .to_ascii_lowercase()
+            .cmp(&right.path.to_ascii_lowercase())
+    });
+    for pair in sorted.windows(2) {
+        if pair[0].path.eq_ignore_ascii_case(&pair[1].path) {
+            bail!("composite replacement packages must have unique paths and package IDs");
+        }
+    }
+    Ok(pooled)
+}
+
 pub fn inspect_composite_package_staged(
     root: &Path,
     game_root: &Path,
@@ -1706,26 +1762,19 @@ pub fn inspect_composite_package_staged(
         discover_containers_with_current(root, retoc, ReplacementScope::CompositePackage, || {
             Ok(retoc.package_store_entries(&target_utoc)?.1)
         })?;
-    let mut packages = containers
+    let pooled_store = containers
         .iter()
-        .flat_map(|container| container.packages.iter().cloned())
+        .flat_map(|container| container.package_store.iter().cloned())
         .collect::<Vec<_>>();
+    let packages = pool_unique_composite_packages(
+        containers
+            .iter()
+            .flat_map(|container| container.packages.iter().cloned())
+            .collect(),
+        &pooled_store,
+    )?;
     if packages.is_empty() || packages.len() > MAX_REPLACEMENT_PACKAGES {
         bail!("composite replacement input must contain 1..={MAX_REPLACEMENT_PACKAGES} packages");
-    }
-    packages.sort_by(|left, right| {
-        left.package_id.cmp(&right.package_id).then(
-            left.path
-                .to_ascii_lowercase()
-                .cmp(&right.path.to_ascii_lowercase()),
-        )
-    });
-    for pair in packages.windows(2) {
-        if pair[0].package_id == pair[1].package_id
-            || pair[0].path.eq_ignore_ascii_case(&pair[1].path)
-        {
-            bail!("composite replacement packages must have unique paths and package IDs");
-        }
     }
 
     if !target_utoc.is_file() {
@@ -4529,6 +4578,82 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composite_pool_tolerates_exact_cross_container_duplicates_only() {
+        let entry = |id: u64, path: &str| PackageEntry {
+            package_id: id,
+            path: path.to_owned(),
+        };
+        let store = |id: u64, path: &str, imports: &[u64]| PackageStoreEntry {
+            package_id: id,
+            path: path.to_owned(),
+            imported_package_ids: imports.to_vec(),
+        };
+        // The same authored package cooked into two shipped containers with one
+        // identity, path, and import set is benign equal-mount-order duplication.
+        let pooled = pool_unique_composite_packages(
+            vec![
+                entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                entry(20, "../../../Mod/Content/Forms/WeapItem.uasset"),
+                entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+            ],
+            &[
+                store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[20]),
+                store(20, "../../../Mod/Content/Forms/WeapItem.uasset", &[]),
+                store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[20]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(pooled.len(), 2);
+
+        // One package ID with two different paths is a real conflict.
+        assert!(
+            pool_unique_composite_packages(
+                vec![
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                    entry(10, "../../../Mod/Content/Forms/Other.uasset"),
+                ],
+                &[
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[]),
+                    store(10, "../../../Mod/Content/Forms/Other.uasset", &[]),
+                ],
+            )
+            .is_err()
+        );
+
+        // One path with two different package IDs is a real conflict.
+        assert!(
+            pool_unique_composite_packages(
+                vec![
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                    entry(11, "../../../Mod/Content/Forms/BP_ITEM.uasset"),
+                ],
+                &[
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[]),
+                    store(11, "../../../Mod/Content/Forms/BP_ITEM.uasset", &[]),
+                ],
+            )
+            .is_err()
+        );
+
+        // Identical identity and path but diverging import sets is a real conflict.
+        assert!(
+            pool_unique_composite_packages(
+                vec![
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                    entry(20, "../../../Mod/Content/Forms/WeapItem.uasset"),
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                ],
+                &[
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[20]),
+                    store(20, "../../../Mod/Content/Forms/WeapItem.uasset", &[]),
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[]),
+                ],
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn maps_any_valid_project_content_root_to_game_mount() {

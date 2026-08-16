@@ -103,63 +103,6 @@ fn updates_current_offhand_staves_fixture() {
 }
 
 #[test]
-#[ignore = "requires an installed game and a local plugin-only fixture archive"]
-fn updates_current_plugin_only_fixture() {
-    let required = |name: &str| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
-    };
-    let expected_byte_preserved = std::env::var("OBR_TEST_PLUGIN_ONLY_BYTE_PRESERVED")
-        .map(|value| value != "false")
-        .unwrap_or(true);
-    let expected_undelete_count = std::env::var("OBR_TEST_PLUGIN_ONLY_UNDELETE_COUNT")
-        .ok()
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .expect("invalid OBR_TEST_PLUGIN_ONLY_UNDELETE_COUNT")
-        })
-        .unwrap_or(0);
-    let mut log = Vec::new();
-    let outcome = run_update(
-        UpdateRequest {
-            adapter: "native-plugin-only-esp-v1".to_owned(),
-            mod_input: required("OBR_TEST_MOD"),
-            game_root: required("OBR_TEST_GAME"),
-            output_parent: required("OBR_TEST_OUTPUT"),
-            dependency_inputs: std::env::var_os("OBR_TEST_DEPENDENCY")
-                .map(PathBuf::from)
-                .into_iter()
-                .collect(),
-            installed_collision_exclusions: Vec::new(),
-            persist_settings: false,
-        },
-        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
-    )
-    .unwrap_or_else(|error| panic!("plugin-only update failed:\n{error:#}\n{}", log.join("\n")));
-    assert!(outcome.output_archive.is_file());
-    assert!(outcome.report_path.is_file());
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
-    assert_eq!(report["implementation"], "native-rust");
-    assert_eq!(report["schema"], "obr-plugin-only-update-report");
-    assert_eq!(report["adapter"], "native-plugin-only-esp-v1");
-    assert_eq!(report["identity"]["espBytePreserved"], expected_byte_preserved);
-    assert_eq!(
-        report["identity"]["espUndeleteDisableCount"],
-        expected_undelete_count
-    );
-    assert_eq!(report["laneEvaluation"]["status"], "proven");
-    let fix_apis = report["fixApis"].as_array().unwrap();
-    assert!(
-        fix_apis
-            .iter()
-            .any(|value| value == "tes4-plugin-only-lane-v1")
-    );
-}
-
-#[test]
 #[ignore = "requires an installed game and a local MagicLoader worldspace fixture"]
 fn updates_current_magicloader_worldspace_fixture() {
     let required = |name: &str| {
@@ -264,6 +207,103 @@ fn updates_current_magicloader_worldspace_fixture() {
     );
     assert_eq!(report["verification"]["dependencyCompleteExtraction"], true);
     assert_eq!(report["unreal"]["targetPathCollisionCount"], 0);
+}
+
+#[test]
+#[ignore = "requires an installed game, a local mod fixture, and an adapter id"]
+fn updates_current_selected_adapter_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let adapter = std::env::var("OBR_TEST_ADAPTER").expect("missing OBR_TEST_ADAPTER");
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: adapter.clone(),
+            mod_input: required("OBR_TEST_SELECTED_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "selected adapter update failed for {adapter}:\n{error:#}\n{}",
+            log.join("\n")
+        )
+    });
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    println!(
+        "selected-adapter fixture: adapter={} archive={} report={}",
+        outcome.adapter,
+        outcome.output_archive.display(),
+        outcome.report_path.display()
+    );
+}
+
+#[test]
+#[ignore = "requires an installed game and a local mixed-composite fixture"]
+fn updates_current_mixed_composite_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let expected_unit_count = std::env::var("OBR_TEST_MIXED_COMPOSITE_UNIT_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("invalid unit count"))
+        .unwrap_or(1);
+    let expected_sync_binding_count = std::env::var("OBR_TEST_MIXED_COMPOSITE_SYNC_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("invalid sync binding count"))
+        .unwrap_or(expected_unit_count);
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-mixed-composite-syncmap-v1".to_owned(),
+            mod_input: required("OBR_TEST_MIXED_COMPOSITE_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| {
+        panic!("mixed-composite update failed:\n{error:#}\n{}", log.join("\n"))
+    });
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    assert_eq!(outcome.adapter, "native-mixed-composite-syncmap-v1");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["schema"], "obr-mixed-composite-update-report");
+    assert_eq!(report["version"], 1);
+    assert_eq!(report["adapter"], "native-mixed-composite-syncmap-v1");
+    let units = report["identity"]["espUnits"].as_array().unwrap();
+    assert_eq!(units.len(), expected_unit_count);
+    let bindings = report["source"]["syncMapBindings"].as_array().unwrap();
+    assert_eq!(bindings.len(), expected_sync_binding_count);
+    assert_eq!(report["structurallyVerified"], true);
+    assert_eq!(report["runtimeVerified"], false);
+    assert_eq!(report["unreal"]["targetPathCollisionCount"], 0);
+    assert_eq!(
+        report["verification"]["packageDependencyGraphsPreserved"],
+        true
+    );
+    assert_eq!(report["verification"]["dependencyCompleteExtraction"], true);
+    assert_eq!(report["scriptPlane"]["policy"], "byte-preserved-passthrough");
+    if expected_sync_binding_count > 0 {
+        let resolutions = report["identity"]["syncMapResolutions"].as_array().unwrap();
+        assert!(!resolutions.is_empty());
+    }
 }
 
 #[test]
@@ -872,75 +912,4 @@ fn updates_current_heterogeneous_replacement_fixture() {
         report["verification"]["payloadsPreservedOutsideAllowedLinkageMetadata"],
         true
     );
-}
-
-#[test]
-#[ignore = "requires an installed game and a local legacy pak-only fixture archive"]
-fn publishes_current_legacy_pak_passthrough_fixture() {
-    let required = |name: &str| {
-        std::env::var_os(name)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
-    };
-    let mut log = Vec::new();
-    let outcome = run_update(
-        UpdateRequest {
-            adapter: "native-legacy-pak-passthrough-v1".to_owned(),
-            mod_input: required("OBR_TEST_PAK_MOD"),
-            game_root: required("OBR_TEST_GAME"),
-            output_parent: required("OBR_TEST_OUTPUT"),
-            dependency_inputs: Vec::new(),
-            installed_collision_exclusions: Vec::new(),
-            persist_settings: false,
-        },
-        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
-    )
-    .unwrap_or_else(|error| panic!("passthrough update failed:\n{error:#}\n{}", log.join("\n")));
-    assert!(outcome.output_archive.is_file());
-    assert!(outcome.report_path.is_file());
-    assert_eq!(outcome.adapter, "native-legacy-pak-passthrough-v1");
-    let report: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&outcome.report_path).unwrap()).unwrap();
-    assert_eq!(report["schema"], "obr-legacy-pak-passthrough-update-report");
-    assert_eq!(report["status"], "candidate_ready_for_runtime_test");
-    assert_eq!(report["structurallyVerified"], true);
-    assert_eq!(report["runtimeVerified"], false);
-    assert_eq!(report["verification"]["payloadBytePreserved"], true);
-    assert_eq!(report["verification"]["structurallyRebuilt"], false);
-    assert_eq!(report["verification"]["productionRuntimeGateRequired"], true);
-    assert_eq!(
-        report["identity"]["contentPlanes"],
-        serde_json::json!(["wwise-audio-media"])
-    );
-    let entry_count = report["identity"]["entryCount"].as_u64().unwrap();
-    assert!(entry_count > 0);
-    assert_eq!(
-        report["identity"]["matchedCurrentMediaCount"]
-            .as_u64()
-            .unwrap(),
-        entry_count
-    );
-    // Every published pak must byte-match the hash proven by the probe.
-    for pak in report["passthrough"]["paks"].as_array().unwrap() {
-        let candidate = outcome.output_directory.join(
-            pak["installRelativePath"]
-                .as_str()
-                .unwrap()
-                .replace('/', "\\"),
-        );
-        assert!(candidate.is_file(), "missing candidate pak {candidate:?}");
-        assert_eq!(
-            obr_mod_updater::archive::sha256_file(&candidate).unwrap(),
-            pak["pakSha256"].as_str().unwrap()
-        );
-        assert!(
-            pak["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|entry| entry["contentPlane"] == "wwise-audio-media"
-                    && entry["storedPayloadSha1Verified"] == true
-                    && entry["currentGameMediaPresent"] == true)
-        );
-    }
 }

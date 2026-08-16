@@ -4332,7 +4332,10 @@ fn migrate_composite_package(
     let missing = source_store
         .imported_package_ids
         .iter()
-        .filter(|dependency| !available_dependencies.contains_key(dependency))
+        .filter(|dependency| {
+            !available_dependencies.contains_key(dependency)
+                && !approved_stale_dependencies.contains(dependency)
+        })
         .count();
     let mut expected = source_store
         .imported_package_ids

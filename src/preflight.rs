@@ -2980,7 +2980,7 @@ fn analyze_internal(
     {
         (
             "plugin-only-lane-blocked",
-            "The plugin-only Data-plane lane could not prove every gate; the disclosed blockers name each unproven step.",
+            "The plugin-only Data-plane lane could not prove every gate; the disclosed blockers name each unproven step.".to_owned(),
         )
     } else if install_plan.is_some() {
         (

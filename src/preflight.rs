@@ -22,6 +22,7 @@ use crate::pak::{
     LEGACY_PAK_PASSTHROUGH_ADAPTER, PakPassthroughProbeSummary, WWISE_AUDIO_MEDIA_PLANE,
     probe_legacy_pak_passthrough_input,
 };
+use crate::plugin_only::{PLUGIN_ONLY_ADAPTER, evaluate_plugin_only_lane};
 use crate::plugin::{
     ADDITIVE_CONTRACT_API, AdditiveContractReport, MagicLoaderSyncMapGate, PLUGIN_MANIFEST_API,
     PluginSetReport, WORLDSPACE_MASTER_PROBE_API, WorldspaceMasterProbeReport,
@@ -425,11 +426,23 @@ impl InventoryBuilder {
             })
             .count();
         let incomplete = self.containers.len().saturating_sub(complete);
-        let candidate_roots = self
-            .data_roots
-            .intersection(&self.pak_roots)
-            .cloned()
-            .collect::<Vec<_>>();
+        let esp = *self.plugins.get("esp").unwrap_or(&0);
+        let plugin_total = self.plugins.values().sum::<usize>();
+        let has_plugins = plugin_total > 0;
+        let plugin_only_shape = has_plugins && self.containers.is_empty() && self.scripts == 0;
+        // A mod that ships IoStore containers binds its candidate root where the
+        // Data and Paks planes agree. A plugin-only mod has no Paks plane at all,
+        // so its canonical wrapper root is proven by the Data plane alone; other
+        // classifications keep the stricter two-plane binding so the logical
+        // install-plan analysis still runs for unrooted mixed layouts.
+        let candidate_roots = if plugin_only_shape && self.pak_roots.is_empty() {
+            self.data_roots.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.data_roots
+                .intersection(&self.pak_roots)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let roots = candidate_roots.len();
         let candidate_mod_root = (roots == 1).then(|| candidate_roots[0].clone());
         let magic_loader_total = self.magic_loader_configs_by_root.values().sum::<usize>();
@@ -440,9 +453,6 @@ impl InventoryBuilder {
             .unwrap_or(0);
         self.functional_or_unknown_loose +=
             magic_loader_total.saturating_sub(magic_loader_config_count);
-        let esp = *self.plugins.get("esp").unwrap_or(&0);
-        let plugin_total = self.plugins.values().sum::<usize>();
-        let has_plugins = plugin_total > 0;
         let syncmap_iostore_shape = roots == 1
             && esp == 1
             && plugin_total == 1
@@ -1349,6 +1359,42 @@ fn analyze_internal(
     let magicloader_worldspace_gate_ready =
         magic_loader_layout && magicloader_lane_blockers.is_empty();
     let requires_runtime = requires_runtime || magicloader_worldspace_gate_ready;
+    // Plugin-only lane: one ESP (plus optional SyncMap/MagicLoader sidecars and
+    // documentation), no IoStore containers, no scripts. The lane resolves the
+    // physical rooting into the canonical Data plane and proves master
+    // resolution plus the current-master semantic gate on that logical view.
+    let plugin_only_layout = inventory.as_ref().is_some_and(|value| {
+        value.classification == "plugin-only" && value.link_count == 0 && !value.scan_truncated
+    });
+    let plugin_only_lane = if plugin_only_layout {
+        progress("Evaluating the plugin-only Data-plane lane against the current game");
+        let mut lane = evaluate_plugin_only_lane(
+            &request.mod_input,
+            current_game_data.as_deref().filter(|_| game_valid),
+        );
+        if let Some(count) = inventory
+            .as_ref()
+            .map(|value| value.functional_or_unknown_loose_file_count)
+            .filter(|count| *count > 0)
+        {
+            lane.blockers.push(format!(
+                "functional-or-unknown-loose-files-outside-the-data-plane:count-{count}"
+            ));
+            lane.blockers.sort();
+            lane.blockers.dedup();
+            lane.status = "blocked".to_owned();
+        }
+        Some(lane)
+    } else {
+        None
+    };
+    let plugin_only_gate_ready = plugin_only_lane
+        .as_ref()
+        .is_some_and(|lane| lane.status == "proven");
+    let requires_runtime = requires_runtime
+        || plugin_only_lane
+            .as_ref()
+            .is_some_and(|lane| lane.status == "proven" && lane.sync_map_entry_count > 0);
     let (
         armor_probe,
         armor_probe_error,
@@ -2525,6 +2571,7 @@ fn analyze_internal(
     let pak_passthrough_can_update = pak_passthrough_shape
         && legacy_pak_passthrough_probe.is_some()
         && adapter_blockers.is_empty();
+    let plugin_only_can_update = plugin_only_gate_ready && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
         || magicloader_can_update
         || armor_can_update
@@ -2533,7 +2580,8 @@ fn analyze_internal(
         || additive_static_mesh_can_update
         || heterogeneous_replacement_can_update
         || composite_package_can_update
-        || pak_passthrough_can_update;
+        || pak_passthrough_can_update
+        || plugin_only_can_update;
     let logical_publication_adapter = install_plan
         .as_ref()
         .filter(|plan| supports_logical_install_publication(plan))
@@ -2701,7 +2749,7 @@ fn analyze_internal(
             .as_ref()
             .is_some_and(|value| value.compatible),
         evidence_level: "current-master-field-aware-validation".to_owned(),
-        description: "Binds the unique candidate root, ESP, SyncMap, and ordered installed full-master chain; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT, CREA, or NPC_ overrides that conflict with installed inventory or non-inventory semantics. Newly installed master rows are merged into the candidate without dropping the mod's additions.".to_owned(),
+        description: "Binds the unique candidate root, ESP, SyncMap, and ordered installed full-master chain; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT, CREA, or NPC_ overrides that conflict with installed inventory or non-inventory semantics. Newly installed master rows are merged into the candidate without dropping the mod's additions. Master overrides outside the inventory contract are accepted byte-preserved only when the per-subrecord three-way current-master semantic gate resolves every override identity and type, with authored, revert-risk, and merge-needed fields disclosed and witness-shaped deletion stubs proven by the undelete-and-disable policy.".to_owned(),
         blockers: additive_contract
             .as_ref()
             .map(|value| value.blockers.clone())
@@ -2717,6 +2765,22 @@ fn analyze_internal(
         } else {
             vec!["mod-layout-does-not-match-proven-additive-adapter".to_owned()]
         },
+    });
+    capabilities.push(Capability {
+        id: PLUGIN_ONLY_ADAPTER.to_owned(),
+        available: plugin_only_can_update,
+        evidence_level: "current-master-semantic-gate-on-canonical-data-plane-layout".to_owned(),
+        description: "Fail-closed lane for plugin-only mods: one full ESP plus optional SyncMap INI, MagicLoader JSON sidecars, and documentation, resolved from a canonical wrapper, Place-in-Data, or bare rooting into Content/Dev/ObvData/Data. Declared masters must resolve installed, and every master override must pass the per-subrecord three-way current-master semantic gate with authored, revert-risk, and merge-needed fields disclosed; witness-shaped REFR deletion stubs are rewritten as undeleted, initially disabled, player-opposite enable-parented overrides, and every other byte is preserved. The output is a runtime-test candidate; SyncMap package targets and the MagicLoader runtime remain disclosed runtime requirements.".to_owned(),
+        blockers: plugin_only_lane
+            .as_ref()
+            .map(|lane| {
+                if lane.blockers.is_empty() {
+                    adapter_blockers.clone()
+                } else {
+                    lane.blockers.clone()
+                }
+            })
+            .unwrap_or_else(|| vec!["mod-layout-does-not-match-plugin-only-lane".to_owned()]),
     });
     capabilities.push(Capability {
         id: ARMOR_REPLACEMENT_ADAPTER.to_owned(),
@@ -2807,6 +2871,7 @@ fn analyze_internal(
     });
     if !additive_shape
         && !magicloader_worldspace_gate_ready
+        && !plugin_only_gate_ready
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
         && composite_package_probe.is_none()
@@ -2842,12 +2907,17 @@ fn analyze_internal(
         Some(COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned())
     } else if pak_passthrough_can_update {
         Some(LEGACY_PAK_PASSTHROUGH_ADAPTER.to_owned())
+    } else if plugin_only_can_update {
+        Some(PLUGIN_ONLY_ADAPTER.to_owned())
     } else if logical_install_can_update {
         logical_publication_adapter.clone()
     } else {
         None
     };
     let mut disposition_blockers = adapter_blockers.clone();
+    if let Some(lane) = plugin_only_lane.as_ref().filter(|lane| lane.status != "proven") {
+        disposition_blockers.extend(lane.blockers.iter().cloned());
+    }
     if let Some(plugin) = plugin_compatibility.as_ref() {
         disposition_blockers.extend(plugin.blockers.iter().cloned());
     }
@@ -2903,6 +2973,14 @@ fn analyze_internal(
         (
             "plugin-structural-or-semantic-review-required",
             "Plugin structure or record semantics exceed the currently proven mutation policies.".to_owned(),
+        )
+    } else if plugin_only_lane
+        .as_ref()
+        .is_some_and(|lane| lane.status != "proven")
+    {
+        (
+            "plugin-only-lane-blocked",
+            "The plugin-only Data-plane lane could not prove every gate; the disclosed blockers name each unproven step.",
         )
     } else if install_plan.is_some() {
         (
@@ -3478,6 +3556,32 @@ mod tests {
         let inventory = scan_directory(&wrapped).unwrap();
         assert_eq!(inventory.classification, "additive-syncmap-iostore");
         assert_eq!(inventory.candidate_mod_root_count, 1);
+    }
+
+    #[test]
+    fn binds_plugin_only_candidate_root_from_the_data_plane() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp
+            .path()
+            .join(r"OblivionRemastered\Content\Dev\ObvData\Data");
+        fs::create_dir_all(data.join("SyncMap")).unwrap();
+        fs::create_dir_all(data.join("MagicLoader")).unwrap();
+        fs::write(data.join("Fixture.esp"), valid_plugin_bytes()).unwrap();
+        fs::write(
+            data.join(r"SyncMap\Fixture.ini"),
+            b"[Meshes]\n000800=../../../OblivionRemastered/Content/Fixture/SM_Fixture.SM_Fixture\n",
+        )
+        .unwrap();
+        fs::write(data.join(r"MagicLoader\Fixture.json"), b"{}").unwrap();
+
+        let inventory = scan_directory(temp.path()).unwrap();
+        assert_eq!(inventory.classification, "plugin-only");
+        assert_eq!(inventory.candidate_mod_root_count, 1);
+        assert_eq!(
+            inventory.candidate_mod_root.as_deref(),
+            Some("OblivionRemastered")
+        );
+        assert_eq!(inventory.magic_loader_config_count, 1);
     }
 
     #[test]

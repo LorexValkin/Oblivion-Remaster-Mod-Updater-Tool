@@ -1,9 +1,9 @@
 use crate::archive::{MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions, sha256_bytes};
 use crate::tes4::{
     COMPRESSED_RECORD, DELETED_RECORD, GROUP_CELL_TEMPORARY_CHILDREN, LIGHT_PLUGIN, MASTER_FILE,
-    Plugin, Record, UndeleteDisableEvidence, merge_inventory_addition, package_to_game_path,
-    read_plugin_bytes, read_sync_map_bytes, record_group_contexts,
-    supports_additive_inventory_record, undelete_and_disable_refr,
+    Plugin, Record, SelfSlotInference, UndeleteDisableEvidence, infer_self_slot,
+    merge_inventory_addition, package_to_game_path, read_plugin_bytes, read_sync_map_bytes,
+    record_group_contexts, supports_additive_inventory_record, undelete_and_disable_refr,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -345,6 +345,13 @@ fn analyze_parsed_plugin(
     let plugin_index = plugin.masters.len();
     let light_semantics = kind == "esl" || plugin.header_flags & LIGHT_PLUGIN != 0;
     let ordinary_form_ids = !light_semantics && plugin_index <= u8::MAX as usize;
+    let self_slot = ordinary_form_ids
+        .then(|| crate::tes4::infer_self_slot(plugin_index as u8, &plugin.records));
+    let owned_index = self_slot
+        .as_ref()
+        .and_then(SelfSlotInference::self_index)
+        .map(usize::from)
+        .unwrap_or(plugin_index);
 
     for record in &plugin.records {
         *record_type_counts.entry(record.kind.clone()).or_default() += 1;
@@ -367,7 +374,7 @@ fn analyze_parsed_plugin(
             *master_override_type_counts
                 .entry(record.kind.clone())
                 .or_default() += 1;
-        } else if source_index == plugin_index {
+        } else if source_index == owned_index {
             plugin_owned_record_count += 1;
             let local_id = record.form_id & 0x00ff_ffff;
             max_owned_local_id =
@@ -393,6 +400,26 @@ fn analyze_parsed_plugin(
     } else if plugin_index > u8::MAX as usize {
         structural_blockers.push("master-count-exceeds-full-plugin-index-space".to_owned());
     } else {
+        match self_slot.as_ref() {
+            Some(SelfSlotInference::Inferred { self_index, basis })
+                if *basis == crate::tes4::SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE =>
+            {
+                warnings.push(format!(
+                    "Record FormIDs use preserved self slot {self_index} beyond the {plugin_index} declared master(s); unique-only inference keeps those records plugin-owned without rewriting their authored identities"
+                ));
+            }
+            Some(SelfSlotInference::Ambiguous { candidates }) => {
+                structural_blockers.push(format!(
+                    "self-slot-inference-ambiguous:candidates-{}",
+                    candidates
+                        .iter()
+                        .map(|index| format!("0x{index:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            _ => {}
+        }
         if out_of_range_record_count > 0 {
             structural_blockers.push("record-form-ids-exceed-master-plugin-index-range".to_owned());
         }
@@ -427,6 +454,12 @@ fn analyze_parsed_plugin(
             "Plugin contains deleted records; semantic update requires a dedicated record adapter"
                 .to_owned(),
         );
+    }
+    if plugin.recovered_zero_size_group_count > 0 {
+        warnings.push(format!(
+            "{} zero-size GRUP header(s) were recovered as empty groups during parsing; the plugin bytes stay untouched and any record-rewriting transform refuses this shape",
+            plugin.recovered_zero_size_group_count
+        ));
     }
     structural_blockers.sort();
     structural_blockers.dedup();
@@ -556,15 +589,10 @@ fn evaluate_additive_policy(
         if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
             blockers.push("requires-oblivion-esm-as-first-master".to_owned());
         }
-        if plugin
-            .master_override_type_counts
-            .keys()
-            .any(|kind| !supports_additive_inventory_record(kind))
-        {
-            blockers.push(
-                "master-overrides-outside-supported-inventory-records-are-unsupported".to_owned(),
-            );
-        }
+        // Master overrides outside the CONT/CREA/NPC_ inventory contract are no
+        // longer a policy-level rejection: the additive contract routes them
+        // through the per-subrecord three-way current-master semantic gate and
+        // fails closed there when identity or type resolution is unproven.
         blockers.extend(plugin.structural_blockers.iter().cloned());
     }
     blockers.sort();
@@ -573,7 +601,8 @@ fn evaluate_additive_policy(
         id: ADDITIVE_PLUGIN_POLICY.to_owned(),
         compatible: blockers.is_empty(),
         mutation_policy: if blockers.is_empty() {
-            "merge-current-master-inventory-and-preserve-plugin-additions".to_owned()
+            "merge-current-master-inventory-gate-validate-other-master-overrides-and-preserve-plugin-additions"
+                .to_owned()
         } else {
             "report-only".to_owned()
         },
@@ -636,11 +665,17 @@ pub fn inspect_magicloader_syncmap_gate(
     let esp_relative = normalize_relative(esp_path.strip_prefix(&root).unwrap_or(esp_path));
     let payload = bounded_plugin_payload(esp_path, &esp_relative)?;
     let plugin = read_plugin_bytes(&payload, &esp_relative)?;
-    let plugin_index = plugin.masters.len() as u8;
+    let plugin_index = u8::try_from(plugin.masters.len())
+        .map_err(|_| anyhow::anyhow!("master count exceeds the full-plugin FormID index space"))?;
+    let Some(owned_index) = infer_self_slot(plugin_index, &plugin.records).self_index() else {
+        gate.blockers
+            .push("self-slot-inference-ambiguous".to_owned());
+        return Ok(gate);
+    };
     let owned_local_ids = plugin
         .records
         .iter()
-        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
         .map(|record| record.form_id & 0x00ff_ffff)
         .collect::<HashSet<_>>();
     let ini_relative = normalize_relative(ini_path.strip_prefix(&root).unwrap_or(ini_path));
@@ -1503,9 +1538,11 @@ fn case_insensitive_data_entries(
     Ok(entries)
 }
 
-/// Resolves records against the effective installed master chain. Requiring every master's own
-/// dependency list to be the exact preceding prefix keeps all embedded full-plugin FormIDs aligned
-/// with the staged plugin while still supporting arbitrary-length DLC/mod master chains.
+/// Resolves records against the effective installed master chain. When records must resolve
+/// through the chain, every master's own dependency list must be the exact preceding prefix so
+/// all embedded full-plugin FormIDs stay aligned with the staged plugin; when nothing resolves
+/// through the chain, name-based presence of each declared master is the complete requirement
+/// and every installed master keeps its own free master order.
 pub fn resolve_installed_master_records(
     plugin: &Plugin,
     game_data_dir: &Path,
@@ -1534,6 +1571,38 @@ pub fn resolve_installed_master_records(
         staged_identities.push((form_id, identity));
     }
     let data_entries = case_insensitive_data_entries(game_data_dir)?;
+    if wanted.is_empty() {
+        // Nothing in the staged plugin resolves through the chain, so raw
+        // FormID alignment is irrelevant. TES4 MAST entries name the defining
+        // plugin directly (the Unblivion lineage model), so name-based
+        // presence of every declared master as one direct regular TES4 Data
+        // file is the complete requirement; each installed master keeps its
+        // own free master order.
+        for declared_name in &plugin.masters {
+            let candidates = data_entries
+                .get(&declared_name.to_ascii_lowercase())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if candidates.len() != 1 {
+                bail!(
+                    "declared master {declared_name} requires one case-insensitive Data match; found {}",
+                    candidates.len()
+                );
+            }
+            let candidate = &candidates[0];
+            if !candidate.regular_file || candidate.symlink {
+                bail!("declared master {declared_name} is not a direct regular Data file");
+            }
+            let mut magic = [0_u8; 4];
+            fs::File::open(&candidate.path)
+                .and_then(|mut file| file.read_exact(&mut magic))
+                .with_context(|| format!("reading installed master {declared_name}"))?;
+            if &magic != b"TES4" {
+                bail!("installed master {declared_name} does not begin with a TES4 header");
+            }
+        }
+        return Ok(HashMap::new());
+    }
     let mut effective = BTreeMap::<CanonicalFormId, IndexedMasterRecord>::new();
     for (master_index, declared_name) in plugin.masters.iter().enumerate() {
         let candidates = data_entries
@@ -2221,6 +2290,24 @@ fn worldspace_master_probe_from_staged(
         return finish_worldspace_master_probe(report);
     }
 
+    let probe_self_slot = u8::try_from(plugin.masters.len())
+        .ok()
+        .map(|master_count| infer_self_slot(master_count, &plugin.records));
+    let probe_owned_index = probe_self_slot
+        .as_ref()
+        .and_then(SelfSlotInference::self_index)
+        .map(usize::from)
+        .unwrap_or(plugin.masters.len());
+    if let Some(SelfSlotInference::Ambiguous { candidates }) = probe_self_slot.as_ref() {
+        report.blockers.push(format!(
+            "self-slot-inference-ambiguous:candidates-{}",
+            candidates
+                .iter()
+                .map(|index| format!("0x{index:02X}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     let mut overrides = Vec::new();
     let mut wanted = BTreeSet::new();
     for record in &plugin.records {
@@ -2242,7 +2329,7 @@ fn worldspace_master_probe_from_staged(
             if record.flags & DELETED_RECORD != 0 {
                 report.deleted_master_override_count += 1;
             }
-        } else if source_index > plugin.masters.len() {
+        } else if source_index != probe_owned_index {
             report.blockers.push(format!(
                 "staged-plugin-record-index-out-of-range:0x{:08X}",
                 record.form_id
@@ -2486,20 +2573,23 @@ fn additive_contract_from_staged(
         match plugin_paths {
             Ok(paths) if paths.len() == 1 => {
                 let relative = normalize_relative(paths[0].strip_prefix(root).unwrap_or(&paths[0]));
-                let semantic_result = (|| -> Result<usize> {
+                let semantic_result = (|| -> Result<(usize, Option<String>)> {
                     let payload = bounded_plugin_payload(&paths[0], &relative)?;
                     let plugin = read_plugin_bytes(&payload, &relative)?;
                     let plugin_index = u8::try_from(plugin.masters.len())?;
+                    let owned_index = infer_self_slot(plugin_index, &plugin.records)
+                        .self_index()
+                        .context("self-slot inference is ambiguous")?;
                     let owned_ids = plugin
                         .records
                         .iter()
-                        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+                        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
                         .map(|record| record.form_id)
                         .collect::<HashSet<_>>();
                     for entry in &sync_entries {
                         let local_id =
                             u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
-                        let full_id = ((plugin_index as u32) << 24) | local_id;
+                        let full_id = ((owned_index as u32) << 24) | local_id;
                         if !owned_ids.contains(&full_id) {
                             bail!(
                                 "SyncMap local FormID {} has no plugin-owned record",
@@ -2517,6 +2607,49 @@ fn additive_contract_from_staged(
                         .iter()
                         .filter(|record| ((record.form_id >> 24) as u8) < plugin_index)
                         .collect::<Vec<_>>();
+                    let inventory_only = overrides.iter().all(|record| {
+                        supports_additive_inventory_record(&record.kind)
+                            && record.flags & DELETED_RECORD == 0
+                    });
+                    if !inventory_only {
+                        // Overrides outside the proven inventory-merge contract:
+                        // byte-preserved acceptance requires the per-subrecord
+                        // three-way current-master semantic gate to resolve every
+                        // override's identity and type, and every deletion stub to
+                        // satisfy the undelete-and-disable witness policy.
+                        let evaluation = evaluate_worldspace_lane_semantics(
+                            &plugin,
+                            &payload,
+                            &relative,
+                            game_data_dir,
+                        )?;
+                        let gate = &evaluation.semantic_gate;
+                        if gate.status != "proven" {
+                            bail!(
+                                "current-master-semantic-gate-blocked:{}",
+                                gate.blockers.join(",")
+                            );
+                        }
+                        let deletion = &evaluation.deleted_override_policy;
+                        match deletion.status.as_str() {
+                            "not-applicable" | "provable" => {}
+                            _ => bail!(
+                                "undelete-and-disable-policy-blocked:{}",
+                                deletion.blockers.join(",")
+                            ),
+                        }
+                        let disclosure = format!(
+                            "{} master override(s) outside the inventory contract validated byte-preserved through {}: {} identical, {} authored field(s), {} revert-risk field(s), {} merge-needed field(s), {} deletion stub(s) transformable by the guarded update lane",
+                            gate.evaluated_override_count,
+                            WORLDSPACE_SEMANTIC_GATE_API,
+                            gate.identical_override_count,
+                            gate.authored_field_change_count,
+                            gate.revert_risk_field_count,
+                            gate.merge_needed_field_count,
+                            deletion.transformable_count,
+                        );
+                        return Ok((overrides.len(), Some(disclosure)));
+                    }
                     let target_ids = overrides
                         .iter()
                         .map(|record| record.form_id)
@@ -2569,10 +2702,13 @@ fn additive_contract_from_staged(
                         game_data_dir,
                         &referenced_master_ids,
                     )?;
-                    Ok(overrides.len())
+                    Ok((overrides.len(), None))
                 })();
                 match semantic_result {
-                    Ok(count) => validated_master_override_count = count,
+                    Ok((count, disclosure)) => {
+                        validated_master_override_count = count;
+                        warnings.extend(disclosure);
+                    }
                     Err(error) => {
                         let mut detail = format!("{error:#}");
                         if let Some(path) = game_data_dir {
@@ -2876,6 +3012,64 @@ mod tests {
     }
 
     #[test]
+    fn treats_a_unique_preserved_self_slot_as_plugin_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[
+                    ("CELL", 0x0004_9E28),
+                    ("WEAP", 0x0200_0ED4),
+                    ("REFR", 0x0200_30F7),
+                ],
+                0x4C48,
+            ),
+        );
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.parse_status, "parsed");
+        assert_eq!(artifact.plugin_owned_record_count, 2);
+        assert_eq!(artifact.master_override_record_count, 1);
+        assert_eq!(artifact.out_of_range_record_count, 0);
+        assert!(artifact.structural_blockers.is_empty());
+        assert!(
+            artifact
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("preserved self slot 2"))
+        );
+    }
+
+    #[test]
+    fn fails_closed_and_names_ambiguous_self_slot_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("WEAP", 0x0100_0800), ("REFR", 0x0200_0801)],
+                0x802,
+            ),
+        );
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.out_of_range_record_count, 1);
+        assert!(
+            artifact
+                .structural_blockers
+                .contains(&"record-form-ids-exceed-master-plugin-index-range".to_owned())
+        );
+        assert!(
+            artifact
+                .structural_blockers
+                .contains(&"self-slot-inference-ambiguous:candidates-0x01,0x02".to_owned())
+        );
+    }
+
+    #[test]
     fn collapses_exact_path_bound_syncmap_esp_mirror_for_dependency_and_policy_analysis() {
         let temp = tempfile::tempdir().unwrap();
         let payload = plugin_bytes(
@@ -2924,7 +3118,9 @@ mod tests {
                 .blockers
                 .contains(&"case-insensitive-plugin-filename-collision".to_owned())
         );
-        assert!(report.additive_syncmap_v1.blockers.contains(
+        // Non-inventory master overrides are no longer a policy-level
+        // rejection; the additive contract's semantic gate decides them.
+        assert!(!report.additive_syncmap_v1.blockers.contains(
             &"master-overrides-outside-supported-inventory-records-are-unsupported".to_owned()
         ));
         assert!(
@@ -3427,6 +3623,146 @@ mod tests {
             blocker
                 == "installed-master-unmappable-record-collides-with-target-local-id:Base.esm:0x01001234"
         }));
+    }
+
+    #[test]
+    fn additive_contract_gates_non_inventory_master_overrides_through_current_master_semantics() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // One owned WEAP mapped by the SyncMap plus one CELL master override
+        // whose bytes match the installed master exactly: the worldspace
+        // parenting pattern that additive mods use to place their content.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("CELL", 0x0000_4499), ("WEAP", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_4499)], 0x900),
+        );
+
+        let (plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(
+            plugins.additive_syncmap_v1.compatible,
+            "policy blockers: {:?}",
+            plugins.additive_syncmap_v1.blockers
+        );
+        assert!(
+            contract.compatible,
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+        assert!(contract.current_master_checked);
+        assert_eq!(contract.validated_master_override_count, 1);
+        assert!(
+            contract
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(WORLDSPACE_SEMANTIC_GATE_API)),
+            "warnings: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn additive_contract_still_fails_closed_when_the_semantic_gate_cannot_resolve() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // The CELL override targets a record the installed master does not
+        // contain, so the gate must block the contract.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("CELL", 0x0000_4499), ("WEAP", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_9999)], 0x900),
+        );
+
+        let (_plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(!contract.compatible);
+        assert!(
+            contract
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("current-master-semantic-gate-blocked")),
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+    }
+
+    #[test]
+    fn additive_contract_accepts_installed_masters_with_free_master_order_when_nothing_resolves_through_them()
+     {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // The staged plugin owns one WEAP and overrides nothing, exactly like
+        // a standalone-weapon mod that declares the remaster's own base ESP as
+        // a late master.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm", "AltarESPMain.esp"],
+                &[("WEAP", 0x0200_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("STAT", 0x0000_0800)], 0x900),
+        );
+        // The installed base ESP declares its own master order, which is not a
+        // prefix of the staged plugin's chain. Nothing in the staged plugin
+        // resolves through it, so name-based presence is sufficient.
+        write_plugin(
+            data.path(),
+            "AltarESPMain.esp",
+            &plugin_bytes(
+                &["Oblivion.esm", "DLCFoo.esp"],
+                &[("STAT", 0x0200_0800)],
+                0x900,
+            ),
+        );
+
+        let (_plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(
+            contract.compatible,
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+        assert!(contract.current_master_checked);
     }
 
     fn raw_record(kind: &str, form_id: u32, flags: u32, data: &[u8]) -> Vec<u8> {

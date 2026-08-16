@@ -12,6 +12,7 @@ pub mod modlist;
 pub mod offhand_export;
 pub mod pak;
 pub mod plugin;
+pub mod plugin_only;
 pub mod preflight;
 pub mod replacement;
 pub mod retoc;

@@ -103,6 +103,63 @@ fn updates_current_offhand_staves_fixture() {
 }
 
 #[test]
+#[ignore = "requires an installed game and a local plugin-only fixture archive"]
+fn updates_current_plugin_only_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let expected_byte_preserved = std::env::var("OBR_TEST_PLUGIN_ONLY_BYTE_PRESERVED")
+        .map(|value| value != "false")
+        .unwrap_or(true);
+    let expected_undelete_count = std::env::var("OBR_TEST_PLUGIN_ONLY_UNDELETE_COUNT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("invalid OBR_TEST_PLUGIN_ONLY_UNDELETE_COUNT")
+        })
+        .unwrap_or(0);
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-plugin-only-esp-v1".to_owned(),
+            mod_input: required("OBR_TEST_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: std::env::var_os("OBR_TEST_DEPENDENCY")
+                .map(PathBuf::from)
+                .into_iter()
+                .collect(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| panic!("plugin-only update failed:\n{error:#}\n{}", log.join("\n")));
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["implementation"], "native-rust");
+    assert_eq!(report["schema"], "obr-plugin-only-update-report");
+    assert_eq!(report["adapter"], "native-plugin-only-esp-v1");
+    assert_eq!(report["identity"]["espBytePreserved"], expected_byte_preserved);
+    assert_eq!(
+        report["identity"]["espUndeleteDisableCount"],
+        expected_undelete_count
+    );
+    assert_eq!(report["laneEvaluation"]["status"], "proven");
+    let fix_apis = report["fixApis"].as_array().unwrap();
+    assert!(
+        fix_apis
+            .iter()
+            .any(|value| value == "tes4-plugin-only-lane-v1")
+    );
+}
+
+#[test]
 #[ignore = "requires an installed game and a local MagicLoader worldspace fixture"]
 fn updates_current_magicloader_worldspace_fixture() {
     let required = |name: &str| {

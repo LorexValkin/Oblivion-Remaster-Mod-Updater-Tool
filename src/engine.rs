@@ -42,9 +42,10 @@ use crate::replacement::{
 };
 use crate::retoc::{PackageEntry, PackageStoreEntry, RetocTool};
 use crate::tes4::{
-    Record, SyncMapEntry, merge_inventory_addition, package_to_game_path, read_plugin,
-    read_sync_map, record_editor_id, rewrite_plugin_records_with_flag_updates, sorted_form_ids,
-    validate_inventory_addition,
+    DELETED_RECORD, Record, SyncMapEntry, infer_self_slot, merge_inventory_addition,
+    package_to_game_path, read_plugin, read_sync_map, record_editor_id,
+    rewrite_plugin_records_with_flag_updates, sorted_form_ids,
+    supports_additive_inventory_record, validate_inventory_addition,
 };
 use crate::uasset::{
     BodySetupRepair, CompositePackageAssetKind, CompositePackageImportRepair, MaterialImportRepair,
@@ -1694,21 +1695,23 @@ fn run_esp_sync_lane_update(
         );
     }
     let plugin_index = plugin.masters.len() as u8;
+    let owned_index = infer_self_slot(plugin_index, &plugin.records)
+        .self_index()
+        .context("self-slot inference is ambiguous; the plugin's own record slot is unproven")?;
     let owned_records = plugin
         .records
         .iter()
-        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
         .collect::<Vec<_>>();
     let overrides = plugin
         .records
         .iter()
         .filter(|record| ((record.form_id >> 24) as u8) < plugin_index)
         .collect::<Vec<_>>();
-    if plugin
-        .records
-        .iter()
-        .any(|record| ((record.form_id >> 24) as u8) > plugin_index)
-    {
+    if plugin.records.iter().any(|record| {
+        let index = (record.form_id >> 24) as u8;
+        index > plugin_index && index != owned_index
+    }) {
         bail!("ESP contains records beyond its master/plugin index range");
     }
     let owned_record_ids = owned_records
@@ -1731,8 +1734,17 @@ fn run_esp_sync_lane_update(
     let mut flag_update_form_ids = HashSet::new();
     let mut current_records = HashMap::new();
     let mut worldspace_evaluation: Option<WorldspaceLaneEvaluation> = None;
-    match lane {
-        EspSyncLane::AdditiveSyncmap => {
+    // Overrides outside the proven inventory-merge contract (or carrying the
+    // deleted flag) leave the additive lane's merge path and must instead be
+    // proven byte-preserved by the same current-master semantic gate and
+    // undelete-and-disable policy the MagicLoader worldspace lane uses.
+    let semantic_gate_path = lane == EspSyncLane::MagicLoaderWorldspace
+        || overrides.iter().any(|record| {
+            !supports_additive_inventory_record(&record.kind)
+                || record.flags & DELETED_RECORD != 0
+        });
+    match (lane, semantic_gate_path) {
+        (EspSyncLane::AdditiveSyncmap, false) => {
             current_records =
                 resolve_installed_master_records(&plugin, &game_data, &target_record_ids)?;
             let mut referenced_master_ids = Vec::new();
@@ -1789,7 +1801,7 @@ fn run_esp_sync_lane_update(
             resolve_installed_master_records(&plugin, &game_data, &referenced_master_ids)
                 .context("resolving inventory references through the installed master chain")?;
         }
-        EspSyncLane::MagicLoaderWorldspace => {
+        _ => {
             let _ = &target_record_ids;
             let evaluation = evaluate_worldspace_lane_semantics(
                 &plugin,
@@ -2266,7 +2278,7 @@ fn run_esp_sync_lane_update(
         candidate_plugin
             .records
             .iter()
-            .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+            .filter(|record| (record.form_id >> 24) as u8 == owned_index)
             .map(|record| record.form_id),
     );
     ensure_same_set(&owned_ids, &candidate_owned_ids, "plugin-owned ESP FormIDs")?;
@@ -2278,8 +2290,8 @@ fn run_esp_sync_lane_update(
     {
         bail!("ESP header identity changed during inventory merge");
     }
-    match lane {
-        EspSyncLane::AdditiveSyncmap => {
+    match (lane, semantic_gate_path) {
+        (EspSyncLane::AdditiveSyncmap, false) => {
             for (form_id, current) in &current_records {
                 let candidate_override = candidate_plugin
                     .records
@@ -2289,7 +2301,7 @@ fn run_esp_sync_lane_update(
                 validate_inventory_addition(candidate_override, &current.record, plugin_index)?;
             }
         }
-        EspSyncLane::MagicLoaderWorldspace => {
+        _ => {
             for (form_id, replacement) in &plugin_replacements {
                 let candidate_record = candidate_plugin
                     .records

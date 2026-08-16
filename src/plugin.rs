@@ -589,15 +589,10 @@ fn evaluate_additive_policy(
         if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
             blockers.push("requires-oblivion-esm-as-first-master".to_owned());
         }
-        if plugin
-            .master_override_type_counts
-            .keys()
-            .any(|kind| !supports_additive_inventory_record(kind))
-        {
-            blockers.push(
-                "master-overrides-outside-supported-inventory-records-are-unsupported".to_owned(),
-            );
-        }
+        // Master overrides outside the CONT/CREA/NPC_ inventory contract are no
+        // longer a policy-level rejection: the additive contract routes them
+        // through the per-subrecord three-way current-master semantic gate and
+        // fails closed there when identity or type resolution is unproven.
         blockers.extend(plugin.structural_blockers.iter().cloned());
     }
     blockers.sort();
@@ -606,7 +601,8 @@ fn evaluate_additive_policy(
         id: ADDITIVE_PLUGIN_POLICY.to_owned(),
         compatible: blockers.is_empty(),
         mutation_policy: if blockers.is_empty() {
-            "merge-current-master-inventory-and-preserve-plugin-additions".to_owned()
+            "merge-current-master-inventory-gate-validate-other-master-overrides-and-preserve-plugin-additions"
+                .to_owned()
         } else {
             "report-only".to_owned()
         },
@@ -2577,7 +2573,7 @@ fn additive_contract_from_staged(
         match plugin_paths {
             Ok(paths) if paths.len() == 1 => {
                 let relative = normalize_relative(paths[0].strip_prefix(root).unwrap_or(&paths[0]));
-                let semantic_result = (|| -> Result<usize> {
+                let semantic_result = (|| -> Result<(usize, Option<String>)> {
                     let payload = bounded_plugin_payload(&paths[0], &relative)?;
                     let plugin = read_plugin_bytes(&payload, &relative)?;
                     let plugin_index = u8::try_from(plugin.masters.len())?;
@@ -2611,6 +2607,49 @@ fn additive_contract_from_staged(
                         .iter()
                         .filter(|record| ((record.form_id >> 24) as u8) < plugin_index)
                         .collect::<Vec<_>>();
+                    let inventory_only = overrides.iter().all(|record| {
+                        supports_additive_inventory_record(&record.kind)
+                            && record.flags & DELETED_RECORD == 0
+                    });
+                    if !inventory_only {
+                        // Overrides outside the proven inventory-merge contract:
+                        // byte-preserved acceptance requires the per-subrecord
+                        // three-way current-master semantic gate to resolve every
+                        // override's identity and type, and every deletion stub to
+                        // satisfy the undelete-and-disable witness policy.
+                        let evaluation = evaluate_worldspace_lane_semantics(
+                            &plugin,
+                            &payload,
+                            &relative,
+                            game_data_dir,
+                        )?;
+                        let gate = &evaluation.semantic_gate;
+                        if gate.status != "proven" {
+                            bail!(
+                                "current-master-semantic-gate-blocked:{}",
+                                gate.blockers.join(",")
+                            );
+                        }
+                        let deletion = &evaluation.deleted_override_policy;
+                        match deletion.status.as_str() {
+                            "not-applicable" | "provable" => {}
+                            _ => bail!(
+                                "undelete-and-disable-policy-blocked:{}",
+                                deletion.blockers.join(",")
+                            ),
+                        }
+                        let disclosure = format!(
+                            "{} master override(s) outside the inventory contract validated byte-preserved through {}: {} identical, {} authored field(s), {} revert-risk field(s), {} merge-needed field(s), {} deletion stub(s) transformable by the guarded update lane",
+                            gate.evaluated_override_count,
+                            WORLDSPACE_SEMANTIC_GATE_API,
+                            gate.identical_override_count,
+                            gate.authored_field_change_count,
+                            gate.revert_risk_field_count,
+                            gate.merge_needed_field_count,
+                            deletion.transformable_count,
+                        );
+                        return Ok((overrides.len(), Some(disclosure)));
+                    }
                     let target_ids = overrides
                         .iter()
                         .map(|record| record.form_id)
@@ -2663,10 +2702,13 @@ fn additive_contract_from_staged(
                         game_data_dir,
                         &referenced_master_ids,
                     )?;
-                    Ok(overrides.len())
+                    Ok((overrides.len(), None))
                 })();
                 match semantic_result {
-                    Ok(count) => validated_master_override_count = count,
+                    Ok((count, disclosure)) => {
+                        validated_master_override_count = count;
+                        warnings.extend(disclosure);
+                    }
                     Err(error) => {
                         let mut detail = format!("{error:#}");
                         if let Some(path) = game_data_dir {
@@ -3076,7 +3118,9 @@ mod tests {
                 .blockers
                 .contains(&"case-insensitive-plugin-filename-collision".to_owned())
         );
-        assert!(report.additive_syncmap_v1.blockers.contains(
+        // Non-inventory master overrides are no longer a policy-level
+        // rejection; the additive contract's semantic gate decides them.
+        assert!(!report.additive_syncmap_v1.blockers.contains(
             &"master-overrides-outside-supported-inventory-records-are-unsupported".to_owned()
         ));
         assert!(
@@ -3579,6 +3623,96 @@ mod tests {
             blocker
                 == "installed-master-unmappable-record-collides-with-target-local-id:Base.esm:0x01001234"
         }));
+    }
+
+    #[test]
+    fn additive_contract_gates_non_inventory_master_overrides_through_current_master_semantics() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // One owned WEAP mapped by the SyncMap plus one CELL master override
+        // whose bytes match the installed master exactly: the worldspace
+        // parenting pattern that additive mods use to place their content.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("CELL", 0x0000_4499), ("WEAP", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_4499)], 0x900),
+        );
+
+        let (plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(
+            plugins.additive_syncmap_v1.compatible,
+            "policy blockers: {:?}",
+            plugins.additive_syncmap_v1.blockers
+        );
+        assert!(
+            contract.compatible,
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+        assert!(contract.current_master_checked);
+        assert_eq!(contract.validated_master_override_count, 1);
+        assert!(
+            contract
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(WORLDSPACE_SEMANTIC_GATE_API)),
+            "warnings: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn additive_contract_still_fails_closed_when_the_semantic_gate_cannot_resolve() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // The CELL override targets a record the installed master does not
+        // contain, so the gate must block the contract.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("CELL", 0x0000_4499), ("WEAP", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_9999)], 0x900),
+        );
+
+        let (_plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(!contract.compatible);
+        assert!(
+            contract
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("current-master-semantic-gate-blocked")),
+            "contract blockers: {:?}",
+            contract.blockers
+        );
     }
 
     #[test]

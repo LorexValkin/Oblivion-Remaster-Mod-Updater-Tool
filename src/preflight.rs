@@ -2586,7 +2586,7 @@ fn analyze_internal(
             .as_ref()
             .is_some_and(|value| value.compatible),
         evidence_level: "current-master-field-aware-validation".to_owned(),
-        description: "Binds the unique candidate root, ESP, SyncMap, and ordered installed full-master chain; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT, CREA, or NPC_ overrides that conflict with installed inventory or non-inventory semantics. Newly installed master rows are merged into the candidate without dropping the mod's additions.".to_owned(),
+        description: "Binds the unique candidate root, ESP, SyncMap, and ordered installed full-master chain; rejects empty or duplicate mappings, unmapped plugin-local IDs, and CONT, CREA, or NPC_ overrides that conflict with installed inventory or non-inventory semantics. Newly installed master rows are merged into the candidate without dropping the mod's additions. Master overrides outside the inventory contract are accepted byte-preserved only when the per-subrecord three-way current-master semantic gate resolves every override identity and type, with authored, revert-risk, and merge-needed fields disclosed and witness-shaped deletion stubs proven by the undelete-and-disable policy.".to_owned(),
         blockers: additive_contract
             .as_ref()
             .map(|value| value.blockers.clone())

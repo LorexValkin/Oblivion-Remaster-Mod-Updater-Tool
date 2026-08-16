@@ -769,19 +769,26 @@ fn selects_active_game_mods(request: &PreflightRequest) -> bool {
 }
 
 fn is_direct_mod_container_path(path: &str) -> bool {
+    // The native publisher preserves each container's physical folder, which
+    // may be a direct child of Content/Paks or one level deeper (witness:
+    // ~mods/TorchWeapons, Mods/SuperSledgePak). Anything deeper stays
+    // fail-closed.
     let normalized = path.replace('\\', "/");
     let parts = normalized
         .split('/')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    parts.len() == 4
+    let safe_folder = |part: &str| {
+        !part.is_empty()
+            && !matches!(part, "." | "..")
+            && !part.contains(':')
+            && !part.chars().any(char::is_control)
+    };
+    matches!(parts.len(), 4 | 5)
         && parts[0].eq_ignore_ascii_case("Content")
         && parts[1].eq_ignore_ascii_case("Paks")
-        && !parts[2].is_empty()
-        && !matches!(parts[2], "." | "..")
-        && !parts[2].contains(':')
-        && !parts[2].chars().any(char::is_control)
-        && Path::new(parts[3])
+        && parts[2..parts.len() - 1].iter().all(|part| safe_folder(part))
+        && Path::new(parts[parts.len() - 1])
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
@@ -1154,7 +1161,7 @@ fn analyze_internal(
         .as_deref()
         .map(|path| validate_game_install(path, "preflight"));
     let game_valid = game.as_ref().is_some_and(|value| value.valid);
-    let (mixed_iostore_dependency_probe, _mixed_iostore_dependency_probe_error) =
+    let (mixed_iostore_dependency_probe, mixed_iostore_dependency_probe_error) =
         if magic_loader_layout || additive_layout {
             progress("Tracing mixed IoStore package identities and dependency closure");
             if let Some(game) = game.as_ref().filter(|value| value.valid) {
@@ -2184,10 +2191,19 @@ fn analyze_internal(
             "additive-container-layout",
             publishable_container_layout,
             true,
-            "Every additive container is in one direct child folder of Content/Paks, and the native publisher preserves that folder.",
-            "One or more additive containers are nested more deeply below Content/Paks or split across physical folders.",
+            "Every additive container sits in a preserved physical folder at most two levels below Content/Paks.",
+            if mixed_iostore_dependency_probe.is_some() {
+                "One or more additive containers are nested more than two levels below Content/Paks.".to_owned()
+            } else {
+                format!(
+                    "The additive container layout could not be inventoried: {}",
+                    mixed_iostore_dependency_probe_error
+                        .as_deref()
+                        .unwrap_or("the mixed IoStore probe did not run")
+                )
+            },
             Some(
-                "Place every complete container triple together in one direct child folder of Content/Paks.",
+                "Place every complete container triple in folders at most two levels below Content/Paks.",
             ),
         ));
         let layered_closure_disclosures = layered_additive_closure_disclosures(
@@ -2245,8 +2261,12 @@ fn analyze_internal(
                 message
             })
             .unwrap_or_else(|| {
-                "The additive package dependency closure could not be inspected against the current game."
-                    .to_owned()
+                format!(
+                    "The additive package dependency closure could not be inspected against the current game: {}",
+                    mixed_iostore_dependency_probe_error
+                        .as_deref()
+                        .unwrap_or("the mixed IoStore probe did not run")
+                )
             });
         checks.push(check(
             "additive-iostore-dependency-closure",
@@ -3215,10 +3235,18 @@ mod tests {
         assert!(is_direct_mod_container_path(
             "Content/Paks/Author Name/Fixture_P.utoc"
         ));
-        assert!(!is_direct_mod_container_path(
+        // One extra nesting level is a preserved publishable folder
+        // (witness: ~mods/TorchWeapons, Mods/SuperSledgePak).
+        assert!(is_direct_mod_container_path(
             "Content/Paks/~mods/Nested/Fixture_P.utoc"
         ));
+        assert!(!is_direct_mod_container_path(
+            "Content/Paks/~mods/Nested/Deeper/Fixture_P.utoc"
+        ));
         assert!(!is_direct_mod_container_path("Content/Paks/Fixture_P.utoc"));
+        assert!(!is_direct_mod_container_path(
+            "Content/Paks/~mods/../Fixture_P.utoc"
+        ));
     }
 
     fn layered_gate_mixed_report(

@@ -40,7 +40,7 @@ use crate::replacement::{
     extract_source_packages_exact,
     extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
-    inspect_composite_package_staged_with_dependencies,
+    inspect_composite_package_staged_with_dependencies_multi,
     inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
     inspect_texture_staged, recover_composite_package_identities, stage_input,
     validate_texture_replacement_pair, verify_donor_rebinds_consumed,
@@ -164,6 +164,7 @@ struct TextureContainerResult {
 #[derive(Clone, Debug)]
 struct ContainerInput {
     name: String,
+    source_directory: PathBuf,
     utoc: PathBuf,
     ucas: PathBuf,
     pak: PathBuf,
@@ -194,11 +195,13 @@ fn files_with_extension(directory: &Path, extension: &str) -> Result<Vec<PathBuf
 }
 
 fn has_direct_container_directory(root: &Path) -> bool {
+    // Containers may sit in a direct child folder of Content\Paks or one
+    // level deeper (witness: ~mods/TorchWeapons, Mods/SuperSledgePak).
     let paks = root.join(r"Content\Paks");
     paks.is_dir()
         && WalkDir::new(paks)
             .min_depth(2)
-            .max_depth(2)
+            .max_depth(3)
             .into_iter()
             .filter_map(Result::ok)
             .any(|entry| {
@@ -211,7 +214,16 @@ fn has_direct_container_directory(root: &Path) -> bool {
             })
 }
 
-fn find_single_container_directory(mod_root: &Path) -> Result<PathBuf> {
+/// Physical container folders of an additive mod: every distinct parent
+/// directory of a UTOC below Content\Paks. Witness shapes: one direct child
+/// folder (the original contract), one folder nested a single level deeper
+/// ("torch weapons", Nexus 3999: ~mods/TorchWeapons; "Super Sledge
+/// Standalone", Nexus 977: Mods/SuperSledgePak), and containers split across
+/// direct child folders ("Berserk Armor", Nexus 4979 and "Cosmic's Black
+/// Cape", Nexus 4840: LogicMods plus ~mods). The publisher preserves each
+/// folder exactly; anything deeper than two levels below Content\Paks stays
+/// fail-closed.
+fn find_container_directories(mod_root: &Path) -> Result<Vec<PathBuf>> {
     let paks = mod_root.join(r"Content\Paks");
     let mut utocs = WalkDir::new(&paks)
         .min_depth(1)
@@ -240,17 +252,17 @@ fn find_single_container_directory(mod_root: &Path) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
-    if parents.len() != 1 {
-        bail!(
-            "native additive scope requires every container triple in one physical folder; found {} folders",
-            parents.len()
-        );
+    for parent in &parents {
+        let relative = parent.strip_prefix(&paks)?;
+        let depth = relative.components().count();
+        if depth == 0 || depth > 2 {
+            bail!(
+                "native additive container folders must sit one or two levels below Content\\Paks: {}",
+                relative.display()
+            );
+        }
     }
-    let relative = parents[0].strip_prefix(&paks)?;
-    if relative.components().count() != 1 {
-        bail!("native additive container folder must be a direct child of Content\\Paks");
-    }
-    Ok(parents.remove(0))
+    Ok(parents)
 }
 
 fn find_mod_root(extracted: &Path) -> Result<PathBuf> {
@@ -1777,7 +1789,7 @@ fn run_esp_sync_lane_update(
         "the native additive adapter requires one canonical complete logical mod root; physical wrappers must enter through the guarded logical-install publication adapter",
     )?;
     let mod_data = mod_root.join(r"Content\Dev\ObvData\Data");
-    let mod_paks = find_single_container_directory(&mod_root)?;
+    let mod_container_directories = find_container_directories(&mod_root)?;
     // Inventory the complete staged input so a sibling ESP/ESM/ESL cannot be
     // silently dropped, then evaluate the mutation policy relative to the exact
     // mod root whose Content directories the engine will consume.
@@ -1844,7 +1856,10 @@ fn run_esp_sync_lane_update(
             sync_files.len()
         );
     }
-    let utoc_files = files_with_extension(&mod_paks, "utoc")?;
+    let mut utoc_files = Vec::new();
+    for directory in &mod_container_directories {
+        utoc_files.extend(files_with_extension(directory, "utoc")?);
+    }
     if utoc_files.is_empty() {
         bail!("mod contains no UTOC containers");
     }
@@ -2016,21 +2031,33 @@ fn run_esp_sync_lane_update(
     stage(callback, 3, "Checking that Unreal packages are additive");
     let mut container_inputs = Vec::new();
     let mut original_packages = Vec::new();
+    let mut container_names = HashSet::new();
     for utoc in utoc_files {
-        let name = utoc
+        let raw_stem = utoc
             .file_stem()
             .and_then(|value| value.to_str())
             .context("UTOC has no filename")?
             .to_owned();
-        let ucas = mod_paks.join(format!("{name}.ucas"));
-        let pak = mod_paks.join(format!("{name}.pak"));
+        // Publication name: an authored triple whose shared stem carries a
+        // redundant inner ".pak" extension is published under the cleaned
+        // stem so the container keeps its override suffix semantics.
+        let name = crate::replacement::normalized_container_publish_stem(&raw_stem);
+        if !container_names.insert(name.to_ascii_lowercase()) {
+            bail!("duplicate additive container name across folders: {name}");
+        }
+        let directory = utoc
+            .parent()
+            .context("UTOC has no parent directory")?
+            .to_path_buf();
+        let ucas = directory.join(format!("{raw_stem}.ucas"));
+        let pak = directory.join(format!("{raw_stem}.pak"));
         if !ucas.is_file() {
-            bail!("container is missing UCAS: {name}");
+            bail!("container is missing UCAS: {raw_stem}");
         }
         if !pak.is_file() {
-            bail!("container is missing PAK: {name}");
+            bail!("container is missing PAK: {raw_stem}");
         }
-        retoc.verify(&utoc, &format!("retoc verify source {name}"))?;
+        retoc.verify(&utoc, &format!("retoc verify source {raw_stem}"))?;
         let (_, package_store) = retoc.package_store_entries(&utoc)?;
         let packages = package_store
             .iter()
@@ -2039,6 +2066,7 @@ fn run_esp_sync_lane_update(
         original_packages.extend(packages.iter().cloned());
         container_inputs.push(ContainerInput {
             name,
+            source_directory: directory,
             utoc,
             ucas,
             pak,
@@ -2133,8 +2161,8 @@ fn run_esp_sync_lane_update(
     } else {
         None
     };
-    let composite_inspection = inspect_composite_package_staged_with_dependencies(
-        &mod_paks,
+    let composite_inspection = inspect_composite_package_staged_with_dependencies_multi(
+        &mod_container_directories,
         &game.root,
         &retoc,
         layered_dependency_support
@@ -2184,11 +2212,13 @@ fn run_esp_sync_lane_update(
             .context("mod root has no directory name")?,
     );
     copy_tree(&mod_root, &candidate_root)?;
-    let candidate_paks = candidate_root.join(
-        mod_paks
-            .strip_prefix(&mod_root)
-            .context("container folder is outside the selected mod root")?,
-    );
+    let candidate_container_directory = |source_directory: &Path| -> Result<PathBuf> {
+        Ok(candidate_root.join(
+            source_directory
+                .strip_prefix(&mod_root)
+                .context("container folder is outside the selected mod root")?,
+        ))
+    };
     let esp_relative = esp_files[0]
         .strip_prefix(&mod_root)
         .context("ESP is outside the selected mod root")?;
@@ -2389,8 +2419,22 @@ fn run_esp_sync_lane_update(
             dependency_edge_count,
             preserved: true,
         };
+        let candidate_directory = candidate_container_directory(&container.source_directory)?;
+        // The candidate tree was copied verbatim, so a container published
+        // under a normalized stem must not leave its authored spelling
+        // behind as a stale duplicate.
+        for original in [&container.utoc, &container.ucas, &container.pak] {
+            let copied = candidate_directory.join(
+                original
+                    .file_name()
+                    .context("source container has no filename")?,
+            );
+            if copied.is_file() {
+                fs::remove_file(&copied)?;
+            }
+        }
         for path in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
-            copy_file(path, &candidate_paks.join(path.file_name().unwrap()))?;
+            copy_file(path, &candidate_directory.join(path.file_name().unwrap()))?;
         }
         container_results.push(ContainerResult {
             name: container.name.clone(),
@@ -2402,9 +2446,15 @@ fn run_esp_sync_lane_update(
                 pak_sha256: sha256_file(&container.pak)?,
             },
             rebuilt: RebuiltHashes {
-                utoc_sha256: sha256_file(&candidate_paks.join(format!("{}.utoc", container.name)))?,
-                ucas_sha256: sha256_file(&candidate_paks.join(format!("{}.ucas", container.name)))?,
-                pak_sha256: sha256_file(&candidate_paks.join(format!("{}.pak", container.name)))?,
+                utoc_sha256: sha256_file(
+                    &candidate_directory.join(format!("{}.utoc", container.name)),
+                )?,
+                ucas_sha256: sha256_file(
+                    &candidate_directory.join(format!("{}.ucas", container.name)),
+                )?,
+                pak_sha256: sha256_file(
+                    &candidate_directory.join(format!("{}.pak", container.name)),
+                )?,
                 retoc_verified: true,
                 inventory_preserved: true,
             },
@@ -2422,15 +2472,35 @@ fn run_esp_sync_lane_update(
             .provider
             .as_ref()
             .context("identity alias provider is missing for persistent aliases")?;
+        // Deterministic provider placement: the candidate folder of the first
+        // container (sorted input order) whose package store holds a
+        // recovered consumer, so the alias provider mounts beside the
+        // packages that import it.
+        let consumer_ids = recovery
+            .aliases
+            .iter()
+            .map(|alias| alias.consumer_package_id)
+            .collect::<HashSet<_>>();
+        let provider_home = container_inputs
+            .iter()
+            .find(|container| {
+                container
+                    .package_store
+                    .iter()
+                    .any(|package| consumer_ids.contains(&package.package_id))
+            })
+            .or_else(|| container_inputs.first())
+            .context("identity alias provider has no host container folder")?;
+        let provider_directory = candidate_container_directory(&provider_home.source_directory)?;
         for source in [
             &provider.provider_utoc,
             &provider.provider_ucas,
             &provider.provider_pak,
         ] {
-            copy_file(source, &candidate_paks.join(source.file_name().unwrap()))?;
+            copy_file(source, &provider_directory.join(source.file_name().unwrap()))?;
         }
         retoc.verify(
-            &candidate_paks.join(provider.provider_utoc.file_name().unwrap()),
+            &provider_directory.join(provider.provider_utoc.file_name().unwrap()),
             "additive identity alias provider",
         )?;
     }

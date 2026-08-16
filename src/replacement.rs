@@ -856,6 +856,21 @@ fn discover_containers(
     })
 }
 
+/// Publication stem for a container triple: an authored stem carrying a
+/// redundant inner ".pak" extension keeps its override `_P` suffix by
+/// dropping that extension ("Flame Assassin Set", Nexus 4322 ships
+/// `FAssassin_Art_P.pak.utoc/.ucas/.pak`). Any other stem is returned
+/// unchanged.
+pub fn normalized_container_publish_stem(stem: &str) -> String {
+    let lower = stem.to_ascii_lowercase();
+    if let Some(cleaned) = lower.strip_suffix(".pak")
+        && cleaned.ends_with("_p")
+    {
+        return stem[..stem.len() - ".pak".len()].to_owned();
+    }
+    stem.to_owned()
+}
+
 fn discover_containers_with_current<F>(
     root: &Path,
     retoc: &RetocTool,
@@ -915,13 +930,20 @@ where
     // bare mount-root package actually needs identity resolution.
     let mut current_store_cache: Option<Option<Vec<PackageStoreEntry>>> = None;
     for utoc in utocs {
-        let name = utoc
+        let raw_stem = utoc
             .file_stem()
             .and_then(|value| value.to_str())
             .context("replacement UTOC filename is not UTF-8")?
             .to_owned();
-        if !name.to_ascii_lowercase().ends_with("_p") {
-            bail!("replacement container must use an override _P suffix: {name}");
+        let name = normalized_container_publish_stem(&raw_stem);
+        // A container without the override suffix is only tolerated in the
+        // composite scope and only when the package store later proves every
+        // package is additive; existing-package rebases keep requiring _P
+        // mount-order semantics. ("torch weapons", Nexus 3999 ships a fully
+        // additive TorchWeaponsAux triple.)
+        let missing_override_suffix = !name.to_ascii_lowercase().ends_with("_p");
+        if missing_override_suffix && scope != ReplacementScope::CompositePackage {
+            bail!("replacement container must use an override _P suffix: {raw_stem}");
         }
         if !names.insert(name.to_ascii_lowercase()) {
             bail!("duplicate replacement container name: {name}");
@@ -1004,6 +1026,27 @@ where
                 _ => {}
             }
         }
+        if missing_override_suffix {
+            let current = current_store_cache
+                .get_or_insert_with(|| load_current_store().ok())
+                .as_deref()
+                .with_context(|| {
+                    format!(
+                        "suffix-free container {name} requires the current package store to prove it is fully additive"
+                    )
+                })?;
+            let colliding = package_store.iter().find(|package| {
+                current
+                    .iter()
+                    .any(|entry| entry.package_id == package.package_id)
+            });
+            if let Some(package) = colliding {
+                bail!(
+                    "replacement container must use an override _P suffix: {raw_stem} (package {} exists in the current game)",
+                    package.path
+                );
+            }
+        }
         let packages = package_store
             .iter()
             .map(|entry| PackageEntry {
@@ -1025,7 +1068,13 @@ where
     Ok(containers)
 }
 
-fn unique_container_parent(root: &Path) -> Result<PathBuf> {
+/// Physical folders holding the staged input's container triples. Composite
+/// witnesses ship one folder (the original contract) or several — "Berserk
+/// Armor" (Nexus 4979) and "Cosmic's Black Cape" (Nexus 4840) split their
+/// triples across LogicMods and ~mods. Each folder is inspected with the
+/// same per-folder completeness rules; container stems must stay unique
+/// across all folders.
+fn container_parent_folders(root: &Path) -> Result<Vec<PathBuf>> {
     let mut parents = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -1043,13 +1092,10 @@ fn unique_container_parent(root: &Path) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
-    if parents.len() != 1 {
-        bail!(
-            "composite input requires every container triple in one physical folder; found {} folders",
-            parents.len()
-        );
+    if parents.is_empty() {
+        bail!("composite input contains no container triples");
     }
-    Ok(parents.remove(0))
+    Ok(parents)
 }
 
 fn inspect_staged_for_scope(
@@ -1714,12 +1760,46 @@ pub fn inspect_composite_package_staged_with_dependencies(
     retoc: &RetocTool,
     extra_target_dependencies: Option<&HashMap<u64, PackageEntry>>,
 ) -> Result<ReplacementInspection> {
+    inspect_composite_package_staged_with_dependencies_multi(
+        std::slice::from_ref(&root.to_path_buf()),
+        game_root,
+        retoc,
+        extra_target_dependencies,
+    )
+}
+
+/// Multi-folder variant of the composite inspection: every folder is
+/// discovered with the same per-folder rules and the containers are
+/// validated as one composite set with globally unique stems.
+pub fn inspect_composite_package_staged_with_dependencies_multi(
+    roots: &[PathBuf],
+    game_root: &Path,
+    retoc: &RetocTool,
+    extra_target_dependencies: Option<&HashMap<u64, PackageEntry>>,
+) -> Result<ReplacementInspection> {
     let target_utoc =
         game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
-    let containers =
-        discover_containers_with_current(root, retoc, ReplacementScope::CompositePackage, || {
-            Ok(retoc.package_store_entries(&target_utoc)?.1)
-        })?;
+    if roots.is_empty() {
+        bail!("composite inspection requires at least one container folder");
+    }
+    let mut containers = Vec::new();
+    for root in roots {
+        containers.extend(discover_containers_with_current(
+            root,
+            retoc,
+            ReplacementScope::CompositePackage,
+            || Ok(retoc.package_store_entries(&target_utoc)?.1),
+        )?);
+    }
+    let mut container_names = HashSet::new();
+    for container in &containers {
+        if !container_names.insert(container.name.to_ascii_lowercase()) {
+            bail!(
+                "duplicate composite container name across folders: {}",
+                container.name
+            );
+        }
+    }
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -4000,9 +4080,14 @@ pub fn probe_identity_alias_recovery(
         .tempdir()?;
     let staged = work.path().join("source");
     stage_input(mod_input, &staged)?;
-    let container_root = unique_container_parent(&staged)?;
+    let container_roots = container_parent_folders(&staged)?;
     let retoc = RetocTool::materialize()?;
-    let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
+    let inspection = inspect_composite_package_staged_with_dependencies_multi(
+        &container_roots,
+        game_root,
+        &retoc,
+        None,
+    )?;
     let source_view = create_additive_probe_view(game_root)?;
     for container in &inspection.containers {
         for source in [&container.utoc, &container.ucas, &container.pak] {
@@ -4072,9 +4157,14 @@ pub fn probe_composite_package_input(
     let staged = work.path().join("source");
     let legacy = work.path().join("legacy");
     stage_input(mod_input, &staged)?;
-    let container_root = unique_container_parent(&staged)?;
+    let container_roots = container_parent_folders(&staged)?;
     let retoc = RetocTool::materialize()?;
-    let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
+    let inspection = inspect_composite_package_staged_with_dependencies_multi(
+        &container_roots,
+        game_root,
+        &retoc,
+        None,
+    )?;
     for package in &inspection.packages {
         let effective = composite_effective_package_path(package, &inspection)?;
         canonical_additive_static_mesh_path(&effective).with_context(|| {

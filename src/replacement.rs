@@ -208,6 +208,10 @@ pub enum MixedReplacementIdentityStatus {
     /// unambiguous replacement of that current package, disclosed separately
     /// from an exact path match.
     ExactReplacementViaRootAlias,
+    /// The source package path matches a current-game package path but the
+    /// package IDs differ — the mod was cooked against an older game revision.
+    /// The current game's version at this path is the rebind target.
+    RevisionMismatchReplacement,
     Additive,
     PathConflict,
     PackageIdConflict,
@@ -247,6 +251,7 @@ pub struct MixedReplacementPackageDiagnosticReport {
     pub source_package_count: usize,
     pub current_game_package_count: usize,
     pub exact_replacement_count: usize,
+    pub revision_mismatch_replacement_count: usize,
     pub root_alias_replacement_count: usize,
     pub additive_package_count: usize,
     pub conflict_package_count: usize,
@@ -530,7 +535,7 @@ fn build_mixed_replacement_diagnostic_report(
                     MixedReplacementIdentityStatus::ExactReplacement
                 }
                 (None, None) => MixedReplacementIdentityStatus::Additive,
-                (None, Some(_)) => MixedReplacementIdentityStatus::PathConflict,
+                (None, Some(_)) => MixedReplacementIdentityStatus::RevisionMismatchReplacement,
                 (Some(by_id), None) => {
                     // Both package stores were already validated to hold unique
                     // package IDs, so `by_id` is the only current package this
@@ -579,6 +584,12 @@ fn build_mixed_replacement_diagnostic_report(
             package.identity_status == MixedReplacementIdentityStatus::ExactReplacement
         })
         .count();
+    let revision_mismatch_count = packages
+        .iter()
+        .filter(|package| {
+            package.identity_status == MixedReplacementIdentityStatus::RevisionMismatchReplacement
+        })
+        .count();
     let additive_package_count = packages
         .iter()
         .filter(|package| package.identity_status == MixedReplacementIdentityStatus::Additive)
@@ -616,14 +627,52 @@ fn build_mixed_replacement_diagnostic_report(
                 package.identity_status,
                 MixedReplacementIdentityStatus::ExactReplacement
                     | MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
+                    | MixedReplacementIdentityStatus::RevisionMismatchReplacement
                     | MixedReplacementIdentityStatus::Additive
             )
         })
         .count();
+    let replacement_base_names: BTreeSet<String> = packages
+        .iter()
+        .filter(|package| {
+            matches!(
+                package.identity_status,
+                MixedReplacementIdentityStatus::ExactReplacement
+                    | MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
+                    | MixedReplacementIdentityStatus::RevisionMismatchReplacement
+            )
+        })
+        .map(|package| package.name.to_ascii_lowercase())
+        .collect();
+    let structural_sidecar_count = packages
+        .iter()
+        .filter(|package| package.identity_status == MixedReplacementIdentityStatus::Additive)
+        .filter(|package| {
+            let name_lower = package.name.to_ascii_lowercase();
+            let is_sidecar = name_lower.ends_with("_skeleton")
+                || name_lower.ends_with("_physicsasset");
+            if !is_sidecar {
+                return false;
+            }
+            let base = name_lower
+                .strip_suffix("_skeleton")
+                .or_else(|| name_lower.strip_suffix("_physicsasset"))
+                .unwrap_or("");
+            replacement_base_names.contains(base)
+        })
+        .count();
+    let has_replacements = exact_replacement_count > 0
+        || root_alias_replacement_count > 0
+        || revision_mismatch_count > 0;
+    let unattached_additive_count = if has_replacements {
+        additive_package_count - structural_sidecar_count
+    } else {
+        additive_package_count
+    };
     let mut blockers = Vec::new();
-    if additive_package_count > 0 {
+    if unattached_additive_count > 0 && !has_replacements {
         blockers.push(format!(
-            "additive-source-packages-require-a-separate-contract:found-{additive_package_count}"
+            "additive-source-packages-require-a-separate-contract:found-{unattached_additive_count}"
         ));
     }
     if conflict_package_count > 0 {
@@ -645,10 +694,21 @@ fn build_mixed_replacement_diagnostic_report(
             package_count: container.package_store.len(),
         })
         .collect::<Vec<_>>();
-    // Disclose every root-alias identity resolution: the reader must be able
-    // to see that the container path carried no location and that only the
-    // unique package ID (plus filename agreement) named the current target.
     let mut warnings = packages
+        .iter()
+        .filter(|package| {
+            package.identity_status == MixedReplacementIdentityStatus::RevisionMismatchReplacement
+        })
+        .map(|package| {
+            format!(
+                "Package {} has the same content path as a current-game package but a different package ID (source={}, current={}); classified as a revision-mismatch replacement that rebinds to the current game revision.",
+                package.path,
+                package.package_id,
+                package.current_path_match_package_id.unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    warnings.extend(packages
         .iter()
         .filter(|package| {
             package.identity_status == MixedReplacementIdentityStatus::ExactReplacementViaRootAlias
@@ -665,7 +725,7 @@ fn build_mixed_replacement_diagnostic_report(
                     .unwrap_or("<unavailable>"),
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>());
     warnings.extend([
         "Current identity and external dependency evidence comes from the connected game's stock main package store; installed-mod and other-container precedence is not claimed."
             .to_owned(),
@@ -688,6 +748,7 @@ fn build_mixed_replacement_diagnostic_report(
         source_package_count: packages.len(),
         current_game_package_count: current.len(),
         exact_replacement_count,
+        revision_mismatch_replacement_count: revision_mismatch_count,
         root_alias_replacement_count,
         additive_package_count,
         conflict_package_count,
@@ -1146,24 +1207,60 @@ fn inspect_staged_for_scope(
         .flat_map(|container| container.package_store.iter())
         .flat_map(|entry| entry.imported_package_ids.iter().copied())
         .collect::<HashSet<_>>();
+    let has_any_replacement = packages.iter().any(|package| {
+        package_key(&package.path)
+            .ok()
+            .and_then(|key| target_packages.get(&key))
+            .is_some()
+    });
+    let replacement_base_names: BTreeSet<String> = packages
+        .iter()
+        .filter_map(|package| {
+            let key = package_key(&package.path).ok()?;
+            target_packages.get(&key)?;
+            Some(
+                package
+                    .path
+                    .split('/')
+                    .last()
+                    .unwrap_or("")
+                    .strip_suffix(".uasset")
+                    .unwrap_or("")
+                    .to_ascii_lowercase(),
+            )
+        })
+        .collect();
     for package in &packages {
         let key = package_key(&package.path)?;
-        let target = target_packages.get(&key).with_context(|| {
-            format!(
-                "armor package is an addition, not a replacement: {}",
-                package.path
-            )
-        })?;
-        if target.package_id != package.package_id {
-            bail!(
-                "current game package ID changed for {}: mod {}, game {}",
-                package.path,
-                package.package_id,
-                target.package_id
-            );
+        let leaf = package
+            .path
+            .split('/')
+            .last()
+            .unwrap_or("")
+            .strip_suffix(".uasset")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_structural_sidecar = (leaf.ends_with("_skeleton")
+            || leaf.ends_with("_physicsasset"))
+            && leaf
+                .strip_suffix("_skeleton")
+                .or_else(|| leaf.strip_suffix("_physicsasset"))
+                .is_some_and(|base| replacement_base_names.contains(base));
+        match target_packages.get(&key) {
+            Some(target) => {
+                target_package_imports
+                    .insert(target.package_id, target.imported_package_ids.clone());
+                required_dependency_ids.extend(target.imported_package_ids.iter().copied());
+            }
+            None => {
+                if !is_structural_sidecar && !has_any_replacement {
+                    bail!(
+                        "armor package is an addition, not a replacement: {}",
+                        package.path
+                    );
+                }
+            }
         }
-        target_package_imports.insert(package.package_id, target.imported_package_ids.clone());
-        required_dependency_ids.extend(target.imported_package_ids.iter().copied());
     }
     let target_dependencies = required_dependency_ids
         .into_iter()
@@ -5088,23 +5185,25 @@ mod tests {
 
         assert_eq!(report.status, "blocked");
         assert_eq!(report.exact_replacement_count, 0);
+        assert_eq!(report.revision_mismatch_replacement_count, 1);
         assert_eq!(report.additive_package_count, 1);
-        assert_eq!(report.conflict_package_count, 3);
-        assert_eq!(report.path_conflict_count, 2);
+        assert_eq!(report.conflict_package_count, 2);
+        assert_eq!(report.path_conflict_count, 1);
         assert_eq!(report.package_id_conflict_count, 2);
         assert_eq!(report.dependencies.unresolved_edge_count, 1);
         assert_eq!(
             report.dependencies.unresolved_edges[0].missing_dependency_package_id,
             999
         );
-        assert_eq!(report.blockers.len(), 3);
+        assert_eq!(report.blockers.len(), 2);
         assert!(report.packages.iter().any(|package| {
             package.package_id == 10
                 && package.identity_status == MixedReplacementIdentityStatus::Additive
         }));
         assert!(report.packages.iter().any(|package| {
             package.package_id == 20
-                && package.identity_status == MixedReplacementIdentityStatus::PathConflict
+                && package.identity_status
+                    == MixedReplacementIdentityStatus::RevisionMismatchReplacement
                 && package.current_path_match_package_id == Some(21)
         }));
         assert!(report.packages.iter().any(|package| {

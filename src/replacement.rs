@@ -856,6 +856,21 @@ fn discover_containers(
     })
 }
 
+/// Publication stem for a container triple: an authored stem carrying a
+/// redundant inner ".pak" extension keeps its override `_P` suffix by
+/// dropping that extension ("Flame Assassin Set", Nexus 4322 ships
+/// `FAssassin_Art_P.pak.utoc/.ucas/.pak`). Any other stem is returned
+/// unchanged.
+pub fn normalized_container_publish_stem(stem: &str) -> String {
+    let lower = stem.to_ascii_lowercase();
+    if let Some(cleaned) = lower.strip_suffix(".pak")
+        && cleaned.ends_with("_p")
+    {
+        return stem[..stem.len() - ".pak".len()].to_owned();
+    }
+    stem.to_owned()
+}
+
 fn discover_containers_with_current<F>(
     root: &Path,
     retoc: &RetocTool,
@@ -915,13 +930,20 @@ where
     // bare mount-root package actually needs identity resolution.
     let mut current_store_cache: Option<Option<Vec<PackageStoreEntry>>> = None;
     for utoc in utocs {
-        let name = utoc
+        let raw_stem = utoc
             .file_stem()
             .and_then(|value| value.to_str())
             .context("replacement UTOC filename is not UTF-8")?
             .to_owned();
-        if !name.to_ascii_lowercase().ends_with("_p") {
-            bail!("replacement container must use an override _P suffix: {name}");
+        let name = normalized_container_publish_stem(&raw_stem);
+        // A container without the override suffix is only tolerated in the
+        // composite scope and only when the package store later proves every
+        // package is additive; existing-package rebases keep requiring _P
+        // mount-order semantics. ("torch weapons", Nexus 3999 ships a fully
+        // additive TorchWeaponsAux triple.)
+        let missing_override_suffix = !name.to_ascii_lowercase().ends_with("_p");
+        if missing_override_suffix && scope != ReplacementScope::CompositePackage {
+            bail!("replacement container must use an override _P suffix: {raw_stem}");
         }
         if !names.insert(name.to_ascii_lowercase()) {
             bail!("duplicate replacement container name: {name}");
@@ -1004,6 +1026,27 @@ where
                 _ => {}
             }
         }
+        if missing_override_suffix {
+            let current = current_store_cache
+                .get_or_insert_with(|| load_current_store().ok())
+                .as_deref()
+                .with_context(|| {
+                    format!(
+                        "suffix-free container {name} requires the current package store to prove it is fully additive"
+                    )
+                })?;
+            let colliding = package_store.iter().find(|package| {
+                current
+                    .iter()
+                    .any(|entry| entry.package_id == package.package_id)
+            });
+            if let Some(package) = colliding {
+                bail!(
+                    "replacement container must use an override _P suffix: {raw_stem} (package {} exists in the current game)",
+                    package.path
+                );
+            }
+        }
         let packages = package_store
             .iter()
             .map(|entry| PackageEntry {
@@ -1025,7 +1068,13 @@ where
     Ok(containers)
 }
 
-fn unique_container_parent(root: &Path) -> Result<PathBuf> {
+/// Physical folders holding the staged input's container triples. Composite
+/// witnesses ship one folder (the original contract) or several — "Berserk
+/// Armor" (Nexus 4979) and "Cosmic's Black Cape" (Nexus 4840) split their
+/// triples across LogicMods and ~mods. Each folder is inspected with the
+/// same per-folder completeness rules; container stems must stay unique
+/// across all folders.
+fn container_parent_folders(root: &Path) -> Result<Vec<PathBuf>> {
     let mut parents = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -1043,13 +1092,10 @@ fn unique_container_parent(root: &Path) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
-    if parents.len() != 1 {
-        bail!(
-            "composite input requires every container triple in one physical folder; found {} folders",
-            parents.len()
-        );
+    if parents.is_empty() {
+        bail!("composite input contains no container triples");
     }
-    Ok(parents.remove(0))
+    Ok(parents)
 }
 
 fn inspect_staged_for_scope(
@@ -1700,12 +1746,60 @@ pub fn inspect_composite_package_staged(
     game_root: &Path,
     retoc: &RetocTool,
 ) -> Result<ReplacementInspection> {
+    inspect_composite_package_staged_with_dependencies(root, game_root, retoc, None)
+}
+
+/// Same inspection as [`inspect_composite_package_staged`], with additional
+/// externally proven dependency packages (for example layered-provider
+/// resolutions) that satisfy imports the stock store cannot. Extra entries
+/// never make a source package "existing" and never shadow a stock or
+/// selected-mod identity; they only extend the available dependency set.
+pub fn inspect_composite_package_staged_with_dependencies(
+    root: &Path,
+    game_root: &Path,
+    retoc: &RetocTool,
+    extra_target_dependencies: Option<&HashMap<u64, PackageEntry>>,
+) -> Result<ReplacementInspection> {
+    inspect_composite_package_staged_with_dependencies_multi(
+        std::slice::from_ref(&root.to_path_buf()),
+        game_root,
+        retoc,
+        extra_target_dependencies,
+    )
+}
+
+/// Multi-folder variant of the composite inspection: every folder is
+/// discovered with the same per-folder rules and the containers are
+/// validated as one composite set with globally unique stems.
+pub fn inspect_composite_package_staged_with_dependencies_multi(
+    roots: &[PathBuf],
+    game_root: &Path,
+    retoc: &RetocTool,
+    extra_target_dependencies: Option<&HashMap<u64, PackageEntry>>,
+) -> Result<ReplacementInspection> {
     let target_utoc =
         game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
-    let containers =
-        discover_containers_with_current(root, retoc, ReplacementScope::CompositePackage, || {
-            Ok(retoc.package_store_entries(&target_utoc)?.1)
-        })?;
+    if roots.is_empty() {
+        bail!("composite inspection requires at least one container folder");
+    }
+    let mut containers = Vec::new();
+    for root in roots {
+        containers.extend(discover_containers_with_current(
+            root,
+            retoc,
+            ReplacementScope::CompositePackage,
+            || Ok(retoc.package_store_entries(&target_utoc)?.1),
+        )?);
+    }
+    let mut container_names = HashSet::new();
+    for container in &containers {
+        if !container_names.insert(container.name.to_ascii_lowercase()) {
+            bail!(
+                "duplicate composite container name across folders: {}",
+                container.name
+            );
+        }
+    }
     let mut packages = containers
         .iter()
         .flat_map(|container| container.packages.iter().cloned())
@@ -1801,7 +1895,10 @@ pub fn inspect_composite_package_staged(
             .imported_package_ids
             .iter()
             .filter(|dependency| {
-                !source_ids.contains(dependency) && !target_by_id.contains_key(dependency)
+                !source_ids.contains(dependency)
+                    && !target_by_id.contains_key(dependency)
+                    && !extra_target_dependencies
+                        .is_some_and(|extra| extra.contains_key(*dependency))
             })
             .count();
         if missing > 2 {
@@ -1811,7 +1908,7 @@ pub fn inspect_composite_package_staged(
             );
         }
     }
-    let target_dependencies = target_entries
+    let mut target_dependencies: HashMap<u64, PackageEntry> = target_entries
         .into_iter()
         .map(|entry| {
             (
@@ -1823,6 +1920,19 @@ pub fn inspect_composite_package_staged(
             )
         })
         .collect();
+    if let Some(extra) = extra_target_dependencies {
+        for (package_id, entry) in extra {
+            if source_ids.contains(package_id) {
+                bail!(
+                    "externally proven dependency {} collides with a selected-mod package ID",
+                    package_id
+                );
+            }
+            target_dependencies
+                .entry(*package_id)
+                .or_insert_with(|| entry.clone());
+        }
+    }
     Ok(ReplacementInspection {
         containers,
         packages,
@@ -2064,6 +2174,12 @@ pub(crate) fn recovered_dependency_route(target_leaf: &str) -> Option<RecoveredD
     None
 }
 
+fn bundled_mesh_leaf(path: &str) -> bool {
+    let leaf = package_leaf_without_extension(path);
+    leaf.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_") || prefix.eq_ignore_ascii_case("SK_"))
+}
+
 fn composite_alias_candidate(
     consumer: &PackageStoreEntry,
     target_package_name: &str,
@@ -2071,44 +2187,78 @@ fn composite_alias_candidate(
     source_store: &HashMap<u64, PackageStoreEntry>,
     source_packages: &HashMap<u64, PackageEntry>,
 ) -> Result<PackageEntry> {
+    // Bundled mesh evidence for the consumer. Witnesses shaped this set:
+    // a weapon Blueprint importing one StaticMesh (the original proven
+    // contract), a Blueprint importing blade AND scabbard meshes ("Brass
+    // Katana", Nexus 4230; "Avo's Tear", Nexus 4228), an armor Blueprint
+    // importing skeletal SK_ meshes ("Invincible", Nexus 4233), and a mesh
+    // package that is itself the consumer of its own retired material
+    // ("Oblivion Blade of Nulgath", Nexus 4640). Multi-mesh consumers
+    // contribute the union of their imports; every arm still requires
+    // exactly one structurally related candidate, so broader evidence can
+    // only fail closed, never choose.
     let direct_meshes = consumer
         .imported_package_ids
         .iter()
         .filter_map(|package_id| source_store.get(package_id))
-        .filter(|entry| {
-            package_leaf_without_extension(&entry.path)
-                .get(..3)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
-        })
+        .filter(|entry| bundled_mesh_leaf(&entry.path))
         .collect::<Vec<_>>();
-    if direct_meshes.len() != 1 {
+    let consumer_is_mesh = bundled_mesh_leaf(&consumer.path);
+    if direct_meshes.is_empty() && !consumer_is_mesh {
         bail!(
-            "identity recovery requires exactly one bundled primary StaticMesh dependency; found {}",
-            direct_meshes.len()
+            "identity recovery requires bundled mesh evidence (an imported SM_/SK_ package or a mesh consumer); found none"
         );
     }
-    let main_dependencies = direct_meshes[0]
-        .imported_package_ids
+    let mut main_dependencies = direct_meshes
         .iter()
-        .copied()
+        .flat_map(|entry| entry.imported_package_ids.iter().copied())
         .collect::<HashSet<_>>();
+    if direct_meshes.is_empty() {
+        main_dependencies.extend(consumer.imported_package_ids.iter().copied());
+    }
     let target_leaf = package_leaf_without_extension(target_package_name);
     let target_parent = target_package_name
         .rsplit_once('/')
         .map(|(parent, _)| parent)
         .context("recovered package name has no parent")?;
+    let parent_matches = |package: &PackageEntry| {
+        mounted_game_package_name(&package.path)
+            .ok()
+            .and_then(|name| name.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
+            .is_some_and(|parent| parent.eq_ignore_ascii_case(target_parent))
+    };
     let candidates = if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
-        main_dependencies
+        let mut pool = main_dependencies
             .iter()
             .filter_map(|package_id| source_packages.get(package_id))
-            .filter(|package| {
-                mounted_game_package_name(&package.path)
-                    .ok()
-                    .and_then(|name| name.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
-                    .is_some_and(|parent| parent.eq_ignore_ascii_case(target_parent))
-            })
+            .filter(|package| parent_matches(package))
             .cloned()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if pool.is_empty() && consumer_is_mesh {
+            // The consumer mesh references nothing else that is bundled, so
+            // use sibling-mesh evidence: a bundled MaterialInstanceConstant
+            // in the exact recovered parent directory that a bundled sibling
+            // mesh package references ("Oblivion Blade of Nulgath", Nexus
+            // 4640: SM_OBON_scabbard's retired MIC aliases the blade's MIC).
+            pool = source_store
+                .values()
+                .filter(|entry| {
+                    entry.package_id != consumer.package_id && bundled_mesh_leaf(&entry.path)
+                })
+                .flat_map(|entry| entry.imported_package_ids.iter())
+                .filter_map(|package_id| source_packages.get(package_id))
+                .filter(|package| {
+                    package_leaf_without_extension(&package.path)
+                        .get(..4)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MIC_"))
+                })
+                .filter(|package| parent_matches(package))
+                .cloned()
+                .collect::<Vec<_>>();
+        }
+        pool.sort_by_key(|package| package.package_id);
+        pool.dedup_by_key(|package| package.package_id);
+        pool
     } else if expected_class.eq_ignore_ascii_case("StaticMesh") {
         source_packages
             .values()
@@ -2147,15 +2297,16 @@ fn composite_primary_static_mesh_candidate(
     source_store: &HashMap<u64, PackageStoreEntry>,
     source_packages: &HashMap<u64, PackageEntry>,
 ) -> Result<PackageEntry> {
+    // The temporary suppression donor is the consumer's single bundled
+    // primary mesh. Armor Blueprints import a skeletal SK_ mesh instead of a
+    // StaticMesh ("Cosmic's Black Cape", Nexus 4840), so both mesh classes
+    // count as primary evidence; the exactly-one rule keeps the choice
+    // fail-closed.
     let mut candidates = consumer
         .imported_package_ids
         .iter()
         .filter_map(|package_id| source_store.get(package_id))
-        .filter(|entry| {
-            package_leaf_without_extension(&entry.path)
-                .get(..3)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
-        })
+        .filter(|entry| bundled_mesh_leaf(&entry.path))
         .filter_map(|entry| source_packages.get(&entry.package_id))
         .cloned()
         .collect::<Vec<_>>();
@@ -2163,7 +2314,7 @@ fn composite_primary_static_mesh_candidate(
     candidates.dedup_by_key(|package| package.package_id);
     if candidates.len() != 1 {
         bail!(
-            "optional secondary StaticMesh recovery requires exactly one bundled primary StaticMesh; found {}",
+            "optional secondary StaticMesh recovery requires exactly one bundled primary mesh; found {}",
             candidates.len()
         );
     }
@@ -2547,8 +2698,10 @@ pub fn recover_composite_package_identities(
             path: mounted_game_legacy_path(&target_name)?,
         };
         if suppress_optional_component {
-            if role.role != "scabbard-static-mesh" {
-                bail!("optional StaticMesh fallback did not prove a secondary scabbard role");
+            if role.role != "scabbard-static-mesh" && role.role != "ground-static-mesh" {
+                bail!(
+                    "optional StaticMesh fallback did not prove a secondary scabbard or ground-mesh role"
+                );
             }
             suppressions.push(CompositeOptionalDependencySuppressionPlan {
                 consumer_package_id: consumer_id,
@@ -3930,9 +4083,14 @@ pub fn probe_identity_alias_recovery(
         .tempdir()?;
     let staged = work.path().join("source");
     stage_input(mod_input, &staged)?;
-    let container_root = unique_container_parent(&staged)?;
+    let container_roots = container_parent_folders(&staged)?;
     let retoc = RetocTool::materialize()?;
-    let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
+    let inspection = inspect_composite_package_staged_with_dependencies_multi(
+        &container_roots,
+        game_root,
+        &retoc,
+        None,
+    )?;
     let source_view = create_additive_probe_view(game_root)?;
     for container in &inspection.containers {
         for source in [&container.utoc, &container.ucas, &container.pak] {
@@ -4002,9 +4160,14 @@ pub fn probe_composite_package_input(
     let staged = work.path().join("source");
     let legacy = work.path().join("legacy");
     stage_input(mod_input, &staged)?;
-    let container_root = unique_container_parent(&staged)?;
+    let container_roots = container_parent_folders(&staged)?;
     let retoc = RetocTool::materialize()?;
-    let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
+    let inspection = inspect_composite_package_staged_with_dependencies_multi(
+        &container_roots,
+        game_root,
+        &retoc,
+        None,
+    )?;
     for package in &inspection.packages {
         let effective = composite_effective_package_path(package, &inspection)?;
         canonical_additive_static_mesh_path(&effective).with_context(|| {
@@ -4633,6 +4796,129 @@ mod tests {
             recovered_dependency_route("SK_Iron_Boots_B_PhysicsAsset"),
             Some(RecoveredDependencyRoute::CurrentDonorRebind("PhysicsAsset"))
         );
+    }
+
+    fn alias_fixture(
+        entries: &[(u64, &str, &[u64])],
+    ) -> (HashMap<u64, PackageStoreEntry>, HashMap<u64, PackageEntry>) {
+        let source_store = entries
+            .iter()
+            .map(|(id, path, imports)| (*id, store(*id, path, imports)))
+            .collect::<HashMap<_, _>>();
+        let source_packages = entries
+            .iter()
+            .map(|(id, path, _)| {
+                (
+                    *id,
+                    PackageEntry {
+                        package_id: *id,
+                        path: (*path).to_owned(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        (source_store, source_packages)
+    }
+
+    #[test]
+    fn alias_candidate_accepts_multi_mesh_consumers_with_one_related_material() {
+        // Witness ("Brass Katana", Nexus 4230; "Avo's Tear", Nexus 4228): the
+        // weapon Blueprint imports blade AND scabbard StaticMeshes, so the
+        // old exactly-one-primary-mesh gate rejected it even though exactly
+        // one bundled material in the recovered parent exists.
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Forms/BP_Katana.uasset", &[2, 3, 99]),
+            (2, "../../../OblivionRemastered/Content/Art/bkatana/SM_Katana.uasset", &[4]),
+            (3, "../../../OblivionRemastered/Content/Art/bkatana/SM_Katana_scabbard.uasset", &[4]),
+            (4, "../../../OblivionRemastered/Content/Art/bkatana/MIC_Katana_blade.uasset", &[]),
+        ]);
+        let candidate = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/bkatana/MIC_Katana",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 4);
+    }
+
+    #[test]
+    fn alias_candidate_accepts_skeletal_mesh_evidence_for_armor_consumers() {
+        // Witness ("Invincible", Nexus 4233): the armor Blueprint imports a
+        // skeletal SK_ mesh, not a StaticMesh; its retired materials recover
+        // through the same parent-directory candidate contract.
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Forms/BP_Armor.uasset", &[2, 99]),
+            (2, "../../../OblivionRemastered/Content/Art/mark/SK_Armor.uasset", &[3]),
+            (3, "../../../OblivionRemastered/Content/Art/mark/MIC_Armor.uasset", &[]),
+        ]);
+        let candidate = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/mark/MIC_Armor_m",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 3);
+    }
+
+    #[test]
+    fn alias_candidate_uses_sibling_mesh_evidence_for_mesh_consumers() {
+        // Witness ("Oblivion Blade of Nulgath", Nexus 4640): the scabbard
+        // mesh itself imports its retired MIC and references nothing else,
+        // so the blade sibling's bundled MIC in the same recovered parent is
+        // the only structurally related candidate.
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Art/obon/SM_OBON_scabbard.uasset", &[99]),
+            (2, "../../../OblivionRemastered/Content/Art/obon/SM_OBON.uasset", &[3]),
+            (3, "../../../OblivionRemastered/Content/Art/obon/MIC_OBON.uasset", &[]),
+        ]);
+        let candidate = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/obon/MIC_OBON_scabbard",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 3);
+
+        // Two sibling materials in the recovered parent stay ambiguous and
+        // fail closed.
+        let (ambiguous_store, ambiguous_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Art/obon/SM_OBON_scabbard.uasset", &[99]),
+            (2, "../../../OblivionRemastered/Content/Art/obon/SM_OBON.uasset", &[3, 4]),
+            (3, "../../../OblivionRemastered/Content/Art/obon/MIC_OBON.uasset", &[]),
+            (4, "../../../OblivionRemastered/Content/Art/obon/MIC_OBON_alt.uasset", &[]),
+        ]);
+        let error = composite_alias_candidate(
+            &ambiguous_store[&1],
+            "/Game/Art/obon/MIC_OBON_scabbard",
+            "MaterialInstanceConstant",
+            &ambiguous_store,
+            &ambiguous_packages,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("found 2"));
+    }
+
+    #[test]
+    fn alias_candidate_requires_bundled_mesh_evidence() {
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Forms/BP_Widget.uasset", &[99]),
+            (3, "../../../OblivionRemastered/Content/Art/x/MIC_Widget.uasset", &[]),
+        ]);
+        let error = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/x/MIC_Widget_b",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bundled mesh evidence"));
     }
 
     #[test]

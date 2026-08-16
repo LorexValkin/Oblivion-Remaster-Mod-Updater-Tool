@@ -2660,9 +2660,29 @@ pub fn prove_blueprint_alias_role(
             .map(|(_, object)| *object)
             .collect::<Vec<_>>()
     };
+    let consumer_stem = consumer_asset
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let (role, required_export_name) =
-        if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
+        if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant")
+            && consumer_stem.starts_with("sm_")
+        {
+            // The consumer is itself a StaticMesh package ("Oblivion Blade of
+            // Nulgath", Nexus 4640: SM_OBON_scabbard imports its retired
+            // MIC). The only accepted role is the mesh's own material slot:
+            // the single serialized reference must sit inside the export
+            // named after the consumer mesh itself.
+            ("static-mesh-material-slot", consumer_stem.as_str())
+        } else if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
             ("blood-splatter-material", "bloodsplatter")
+        } else if expected_class.eq_ignore_ascii_case("StaticMesh")
+            && target_object_name.to_ascii_lowercase().ends_with("_gnd")
+        {
+            // Retired world-drop ("ground") mesh of an armor Blueprint
+            // ("Cosmic's Black Cape", Nexus 4840: SM_CBLCape4_gnd).
+            ("ground-static-mesh", "gnd")
         } else if expected_class.eq_ignore_ascii_case("StaticMesh") {
             ("scabbard-static-mesh", "scabbard")
         } else {
@@ -2699,7 +2719,17 @@ pub fn prove_blueprint_alias_role(
                 }
             }
         }
-        if all_reference_count == 1 && object_matches.len() == 1 {
+        // A Blueprint references its recovered import exactly once. A cooked
+        // StaticMesh legitimately references its material several times
+        // (material slot plus per-LOD section tables), so the mesh-slot role
+        // instead requires every serialized reference to sit inside the
+        // consumer mesh's own export and treats them as one logical role.
+        let accepted = if role == "static-mesh-material-slot" {
+            all_reference_count >= 1 && object_matches.len() == all_reference_count
+        } else {
+            all_reference_count == 1 && object_matches.len() == 1
+        };
+        if accepted {
             let (export_index, export_name, offset) = object_matches.remove(0);
             matches.push((object_index, export_index, export_name, offset));
         }

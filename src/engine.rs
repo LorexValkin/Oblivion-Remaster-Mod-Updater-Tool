@@ -11,6 +11,10 @@ use crate::fixes::{
     EXACT_DEPENDENCY_EXTRACTION_API, ExactExtractionReport, diagnose_package_dependencies,
     extract_packages_with_dependency_view,
 };
+use crate::dependency_layers::{
+    LAYERED_IOSTORE_DEPENDENCY_API, LayeredProbeWithSources, PackageProviderLayer,
+    probe_layered_iostore_dependencies_with_sources,
+};
 use crate::game::{save_settings, validate_game_install};
 use crate::install_plan::{
     InstallPlan, build_logical_update_context, logical_install_adapter_id,
@@ -39,6 +43,7 @@ use crate::replacement::{
     extract_source_packages_exact,
     extract_source_static_mesh_packages, find_extracted_additive_static_mesh,
     inspect_additive_static_mesh_staged, inspect_composite_package_staged,
+    inspect_composite_package_staged_with_dependencies_multi,
     inspect_heterogeneous_replacement_staged, inspect_mixed_armor_staged, inspect_staged,
     inspect_texture_staged, recover_composite_package_identities, stage_input,
     validate_texture_replacement_pair, verify_donor_rebinds_consumed,
@@ -163,6 +168,7 @@ struct TextureContainerResult {
 #[derive(Clone, Debug)]
 struct ContainerInput {
     name: String,
+    source_directory: PathBuf,
     utoc: PathBuf,
     ucas: PathBuf,
     pak: PathBuf,
@@ -193,11 +199,13 @@ fn files_with_extension(directory: &Path, extension: &str) -> Result<Vec<PathBuf
 }
 
 fn has_direct_container_directory(root: &Path) -> bool {
+    // Containers may sit in a direct child folder of Content\Paks or one
+    // level deeper (witness: ~mods/TorchWeapons, Mods/SuperSledgePak).
     let paks = root.join(r"Content\Paks");
     paks.is_dir()
         && WalkDir::new(paks)
             .min_depth(2)
-            .max_depth(2)
+            .max_depth(3)
             .into_iter()
             .filter_map(Result::ok)
             .any(|entry| {
@@ -210,7 +218,16 @@ fn has_direct_container_directory(root: &Path) -> bool {
             })
 }
 
-fn find_single_container_directory(mod_root: &Path) -> Result<PathBuf> {
+/// Physical container folders of an additive mod: every distinct parent
+/// directory of a UTOC below Content\Paks. Witness shapes: one direct child
+/// folder (the original contract), one folder nested a single level deeper
+/// ("torch weapons", Nexus 3999: ~mods/TorchWeapons; "Super Sledge
+/// Standalone", Nexus 977: Mods/SuperSledgePak), and containers split across
+/// direct child folders ("Berserk Armor", Nexus 4979 and "Cosmic's Black
+/// Cape", Nexus 4840: LogicMods plus ~mods). The publisher preserves each
+/// folder exactly; anything deeper than two levels below Content\Paks stays
+/// fail-closed.
+fn find_container_directories(mod_root: &Path) -> Result<Vec<PathBuf>> {
     let paks = mod_root.join(r"Content\Paks");
     let mut utocs = WalkDir::new(&paks)
         .min_depth(1)
@@ -239,17 +256,17 @@ fn find_single_container_directory(mod_root: &Path) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
-    if parents.len() != 1 {
-        bail!(
-            "native additive scope requires every container triple in one physical folder; found {} folders",
-            parents.len()
-        );
+    for parent in &parents {
+        let relative = parent.strip_prefix(&paks)?;
+        let depth = relative.components().count();
+        if depth == 0 || depth > 2 {
+            bail!(
+                "native additive container folders must sit one or two levels below Content\\Paks: {}",
+                relative.display()
+            );
+        }
     }
-    let relative = parents[0].strip_prefix(&paks)?;
-    if relative.components().count() != 1 {
-        bail!("native additive container folder must be a direct child of Content\\Paks");
-    }
-    Ok(parents.remove(0))
+    Ok(parents)
 }
 
 fn find_mod_root(extracted: &Path) -> Result<PathBuf> {
@@ -2061,6 +2078,169 @@ impl EspSyncLane {
     }
 }
 
+/// The layered-provider support proven for one additive update: the probe
+/// evidence, the extra proven dependency entries for the composite
+/// inspection, and the per-edge provider disclosures for the update report.
+struct LayeredDependencySupport {
+    probe: LayeredProbeWithSources,
+    extra_target_dependencies: HashMap<u64, PackageEntry>,
+    disclosures: Vec<String>,
+    used_provider_ids: Vec<String>,
+}
+
+/// Attempts to satisfy the additive lane's stock-unresolved imports with the
+/// layered IoStore resolver (`zen-layered-iostore-dependency-resolver-v1`).
+///
+/// Returns `Ok(None)` when the layered resolver cannot completely resolve the
+/// reachable import graph; the guarded identity-recovery contract then stays
+/// the only remaining avenue and fails truthfully on its own evidence. When
+/// resolution is complete, every provider whose packages satisfy an import is
+/// materialized into the bounded dependency view, and every satisfied edge is
+/// disclosed with its chosen provider. A provider whose packages collide with
+/// the selected mod's own package IDs or paths fails closed instead of being
+/// mounted into the view.
+fn resolve_layered_dependency_support(
+    mod_input: &Path,
+    dependency_inputs: &[PathBuf],
+    game_root: &Path,
+    dependency_view: &Path,
+    source_package_store: &[PackageStoreEntry],
+    retoc: &RetocTool,
+) -> Result<Option<LayeredDependencySupport>> {
+    let Ok(probe) =
+        probe_layered_iostore_dependencies_with_sources(mod_input, dependency_inputs, game_root)
+    else {
+        return Ok(None);
+    };
+    if !probe.report.resolution_complete {
+        return Ok(None);
+    }
+    let supporting_layer = |layer: PackageProviderLayer| {
+        matches!(
+            layer,
+            PackageProviderLayer::ConnectedDependency
+                | PackageProviderLayer::InstalledActiveMod
+                | PackageProviderLayer::GameContainer
+        )
+    };
+    let mut needed_providers = BTreeMap::new();
+    let mut required_targets = Vec::new();
+    for edge in &probe.report.dependency_edges {
+        let Some(target) = edge.target.as_ref().filter(|_| edge.resolved) else {
+            continue;
+        };
+        if !supporting_layer(target.layer) {
+            continue;
+        }
+        needed_providers.insert(target.provider_id.clone(), target.layer);
+        required_targets.push((edge, target));
+    }
+    if required_targets.is_empty() {
+        return Ok(None);
+    }
+    let source_ids = source_package_store
+        .iter()
+        .map(|entry| entry.package_id)
+        .collect::<HashSet<_>>();
+    let source_paths = source_package_store
+        .iter()
+        .map(|entry| entry.path.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut provider_entries = HashMap::<u64, (String, PackageEntry)>::new();
+    let mut used_provider_ids = Vec::new();
+    for provider in &probe.providers {
+        if !needed_providers.contains_key(&provider.provider_id) {
+            continue;
+        }
+        used_provider_ids.push(provider.provider_id.clone());
+        for container in &provider.containers {
+            for source in [
+                Some(&container.utoc),
+                Some(&container.ucas),
+                container.pak.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let name = source
+                    .file_name()
+                    .context("layered provider container has no filename")?;
+                let target = dependency_view.join(name);
+                if target.exists() {
+                    bail!(
+                        "layered provider container filename collides with the dependency view: {}",
+                        container.relative_utoc
+                    );
+                }
+                copy_file(source, &target)?;
+            }
+            let (_, store) = retoc.package_store_entries_allow_empty(&container.utoc)?;
+            for entry in store {
+                if source_ids.contains(&entry.package_id)
+                    || source_paths.contains(&entry.path.to_ascii_lowercase())
+                {
+                    bail!(
+                        "layered provider {} shadows a selected-mod package ({}); the additive lane fails closed on selected-vs-provider identity collisions",
+                        provider.provider_id,
+                        entry.path
+                    );
+                }
+                provider_entries
+                    .entry(entry.package_id)
+                    .or_insert_with(|| {
+                        (
+                            provider.provider_id.clone(),
+                            PackageEntry {
+                                package_id: entry.package_id,
+                                path: entry.path.clone(),
+                            },
+                        )
+                    });
+            }
+        }
+    }
+    let mut extra_target_dependencies = HashMap::new();
+    let mut disclosures = Vec::new();
+    for (edge, target) in required_targets {
+        let (chosen_provider, entry) =
+            provider_entries.get(&target.package_id).with_context(|| {
+                format!(
+                    "layered provider {} no longer exposes package {}",
+                    target.provider_id, target.package_id
+                )
+            })?;
+        if !chosen_provider.eq_ignore_ascii_case(&target.provider_id) {
+            bail!(
+                "layered provider precedence disagreement for package {}: report chose {}, materialized view chose {chosen_provider}",
+                target.package_id,
+                target.provider_id
+            );
+        }
+        extra_target_dependencies
+            .entry(target.package_id)
+            .or_insert_with(|| entry.clone());
+        if edge.source.layer == PackageProviderLayer::SelectedMod {
+            disclosures.push(format!(
+                "{} required by {} is satisfied by provider {} [{}] in {}",
+                target.package_path,
+                edge.source.package_path,
+                target.provider_id,
+                target.layer.label(),
+                target.container,
+            ));
+        }
+    }
+    disclosures.sort();
+    disclosures.dedup();
+    used_provider_ids.sort();
+    Ok(Some(LayeredDependencySupport {
+        probe,
+        extra_target_dependencies,
+        disclosures,
+        used_provider_ids,
+    }))
+}
+
 fn run_additive_update(
     request: UpdateRequest,
     callback: &mut ProgressCallback<'_>,
@@ -2169,7 +2349,7 @@ fn run_esp_sync_lane_update(
         "the native additive adapter requires one canonical complete logical mod root; physical wrappers must enter through the guarded logical-install publication adapter",
     )?;
     let mod_data = mod_root.join(r"Content\Dev\ObvData\Data");
-    let mod_paks = find_single_container_directory(&mod_root)?;
+    let mod_container_directories = find_container_directories(&mod_root)?;
     // Inventory the complete staged input so a sibling ESP/ESM/ESL cannot be
     // silently dropped, then evaluate the mutation policy relative to the exact
     // mod root whose Content directories the engine will consume.
@@ -2236,7 +2416,10 @@ fn run_esp_sync_lane_update(
             sync_files.len()
         );
     }
-    let utoc_files = files_with_extension(&mod_paks, "utoc")?;
+    let mut utoc_files = Vec::new();
+    for directory in &mod_container_directories {
+        utoc_files.extend(files_with_extension(directory, "utoc")?);
+    }
     if utoc_files.is_empty() {
         bail!("mod contains no UTOC containers");
     }
@@ -2419,21 +2602,33 @@ fn run_esp_sync_lane_update(
     stage(callback, 3, "Checking that Unreal packages are additive");
     let mut container_inputs = Vec::new();
     let mut original_packages = Vec::new();
+    let mut container_names = HashSet::new();
     for utoc in utoc_files {
-        let name = utoc
+        let raw_stem = utoc
             .file_stem()
             .and_then(|value| value.to_str())
             .context("UTOC has no filename")?
             .to_owned();
-        let ucas = mod_paks.join(format!("{name}.ucas"));
-        let pak = mod_paks.join(format!("{name}.pak"));
+        // Publication name: an authored triple whose shared stem carries a
+        // redundant inner ".pak" extension is published under the cleaned
+        // stem so the container keeps its override suffix semantics.
+        let name = crate::replacement::normalized_container_publish_stem(&raw_stem);
+        if !container_names.insert(name.to_ascii_lowercase()) {
+            bail!("duplicate additive container name across folders: {name}");
+        }
+        let directory = utoc
+            .parent()
+            .context("UTOC has no parent directory")?
+            .to_path_buf();
+        let ucas = directory.join(format!("{raw_stem}.ucas"));
+        let pak = directory.join(format!("{raw_stem}.pak"));
         if !ucas.is_file() {
-            bail!("container is missing UCAS: {name}");
+            bail!("container is missing UCAS: {raw_stem}");
         }
         if !pak.is_file() {
-            bail!("container is missing PAK: {name}");
+            bail!("container is missing PAK: {raw_stem}");
         }
-        retoc.verify(&utoc, &format!("retoc verify source {name}"))?;
+        retoc.verify(&utoc, &format!("retoc verify source {raw_stem}"))?;
         let (_, package_store) = retoc.package_store_entries(&utoc)?;
         let packages = package_store
             .iter()
@@ -2442,6 +2637,7 @@ fn run_esp_sync_lane_update(
         original_packages.extend(packages.iter().cloned());
         container_inputs.push(ContainerInput {
             name,
+            source_directory: directory,
             utoc,
             ucas,
             pak,
@@ -2517,7 +2713,33 @@ fn run_esp_sync_lane_update(
             copy_file(source, &target)?;
         }
     }
-    let composite_inspection = inspect_composite_package_staged(&mod_paks, &game.root, &retoc)?;
+    let layered_dependency_support = if lane == EspSyncLane::AdditiveSyncmap
+        && !dependency_trace.fully_resolved
+    {
+        stage(
+            callback,
+            3,
+            "Resolving stock-unresolved imports across connected, installed, and game/DLC providers",
+        );
+        resolve_layered_dependency_support(
+            &mod_input,
+            &request.dependency_inputs,
+            &game.root,
+            dependency_view.path(),
+            &source_package_store,
+            &retoc,
+        )?
+    } else {
+        None
+    };
+    let composite_inspection = inspect_composite_package_staged_with_dependencies_multi(
+        &mod_container_directories,
+        &game.root,
+        &retoc,
+        layered_dependency_support
+            .as_ref()
+            .map(|support| &support.extra_target_dependencies),
+    )?;
     let identity_recovery = recover_composite_package_identities(
         &composite_inspection,
         &retoc,
@@ -2561,11 +2783,13 @@ fn run_esp_sync_lane_update(
             .context("mod root has no directory name")?,
     );
     copy_tree(&mod_root, &candidate_root)?;
-    let candidate_paks = candidate_root.join(
-        mod_paks
-            .strip_prefix(&mod_root)
-            .context("container folder is outside the selected mod root")?,
-    );
+    let candidate_container_directory = |source_directory: &Path| -> Result<PathBuf> {
+        Ok(candidate_root.join(
+            source_directory
+                .strip_prefix(&mod_root)
+                .context("container folder is outside the selected mod root")?,
+        ))
+    };
     let esp_relative = esp_files[0]
         .strip_prefix(&mod_root)
         .context("ESP is outside the selected mod root")?;
@@ -2766,8 +2990,22 @@ fn run_esp_sync_lane_update(
             dependency_edge_count,
             preserved: true,
         };
+        let candidate_directory = candidate_container_directory(&container.source_directory)?;
+        // The candidate tree was copied verbatim, so a container published
+        // under a normalized stem must not leave its authored spelling
+        // behind as a stale duplicate.
+        for original in [&container.utoc, &container.ucas, &container.pak] {
+            let copied = candidate_directory.join(
+                original
+                    .file_name()
+                    .context("source container has no filename")?,
+            );
+            if copied.is_file() {
+                fs::remove_file(&copied)?;
+            }
+        }
         for path in [&rebuilt_utoc, &rebuilt_ucas, &rebuilt_pak] {
-            copy_file(path, &candidate_paks.join(path.file_name().unwrap()))?;
+            copy_file(path, &candidate_directory.join(path.file_name().unwrap()))?;
         }
         container_results.push(ContainerResult {
             name: container.name.clone(),
@@ -2779,9 +3017,15 @@ fn run_esp_sync_lane_update(
                 pak_sha256: sha256_file(&container.pak)?,
             },
             rebuilt: RebuiltHashes {
-                utoc_sha256: sha256_file(&candidate_paks.join(format!("{}.utoc", container.name)))?,
-                ucas_sha256: sha256_file(&candidate_paks.join(format!("{}.ucas", container.name)))?,
-                pak_sha256: sha256_file(&candidate_paks.join(format!("{}.pak", container.name)))?,
+                utoc_sha256: sha256_file(
+                    &candidate_directory.join(format!("{}.utoc", container.name)),
+                )?,
+                ucas_sha256: sha256_file(
+                    &candidate_directory.join(format!("{}.ucas", container.name)),
+                )?,
+                pak_sha256: sha256_file(
+                    &candidate_directory.join(format!("{}.pak", container.name)),
+                )?,
                 retoc_verified: true,
                 inventory_preserved: true,
             },
@@ -2799,15 +3043,35 @@ fn run_esp_sync_lane_update(
             .provider
             .as_ref()
             .context("identity alias provider is missing for persistent aliases")?;
+        // Deterministic provider placement: the candidate folder of the first
+        // container (sorted input order) whose package store holds a
+        // recovered consumer, so the alias provider mounts beside the
+        // packages that import it.
+        let consumer_ids = recovery
+            .aliases
+            .iter()
+            .map(|alias| alias.consumer_package_id)
+            .collect::<HashSet<_>>();
+        let provider_home = container_inputs
+            .iter()
+            .find(|container| {
+                container
+                    .package_store
+                    .iter()
+                    .any(|package| consumer_ids.contains(&package.package_id))
+            })
+            .or_else(|| container_inputs.first())
+            .context("identity alias provider has no host container folder")?;
+        let provider_directory = candidate_container_directory(&provider_home.source_directory)?;
         for source in [
             &provider.provider_utoc,
             &provider.provider_ucas,
             &provider.provider_pak,
         ] {
-            copy_file(source, &candidate_paks.join(source.file_name().unwrap()))?;
+            copy_file(source, &provider_directory.join(source.file_name().unwrap()))?;
         }
         retoc.verify(
-            &candidate_paks.join(provider.provider_utoc.file_name().unwrap()),
+            &provider_directory.join(provider.provider_utoc.file_name().unwrap()),
             "additive identity alias provider",
         )?;
     }
@@ -2957,6 +3221,9 @@ fn run_esp_sync_lane_update(
         "single-resolved-dependency-public-export-rebase-v2",
         "package-store-decoder-placeholder-repair-v2",
     ];
+    if layered_dependency_support.is_some() {
+        fix_apis.push(LAYERED_IOSTORE_DEPENDENCY_API);
+    }
     if plugin_replacements.is_empty() {
         fix_apis.push(PLUGIN_PRESERVATION_API);
     } else if lane == EspSyncLane::MagicLoaderWorldspace {
@@ -3070,6 +3337,13 @@ fn run_esp_sync_lane_update(
             "collisionPolicy": "For structurally recognized StaticMesh BodySetup exports, the incompatible derived cooked-physics tail is normalized to the shipping game's accepted empty-cache boundary while the serialized property region (including AggGeom simple-collision source data) and BodySetupGuid are preserved. Each change remains disclosed as collisionRemoved: true and requires an in-game collision test.",
             "packagePaths": original_packages,
             "dependencyTrace": dependency_trace,
+            "layeredDependencyResolution": layered_dependency_support.as_ref().map(|support| json!({
+                "api": LAYERED_IOSTORE_DEPENDENCY_API,
+                "logicalSha256": support.probe.report.logical_sha256,
+                "usedProviderIds": support.used_provider_ids,
+                "satisfiedImportDisclosures": support.disclosures,
+                "note": "Imports listed here are satisfied by connected, installed, or game/DLC providers under explicit precedence; the candidate depends on those providers staying installed or connected.",
+            })),
             "containers": container_results,
             "containerNaming": {
                 "pSuffixCaseInsensitive": true,

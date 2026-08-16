@@ -3007,6 +3007,21 @@ pub fn verify_plugin_set_with_rewritten_esp(
     candidate_root: &Path,
     rewritten_relative_path: &str,
 ) -> Result<()> {
+    verify_plugin_set_with_rewritten_esps(
+        source_root,
+        candidate_root,
+        std::slice::from_ref(&rewritten_relative_path.to_owned()),
+    )
+}
+
+/// Same structural preservation proof as the single-ESP variant, allowing a
+/// declared set of semantically rewritten plugin paths; every other plugin
+/// artifact must remain byte-identical.
+pub fn verify_plugin_set_with_rewritten_esps(
+    source_root: &Path,
+    candidate_root: &Path,
+    rewritten_relative_paths: &[String],
+) -> Result<()> {
     let source = inspect_plugin_set(source_root)?;
     let candidate = inspect_plugin_set(candidate_root)?;
     let source = source
@@ -3022,12 +3037,13 @@ pub fn verify_plugin_set_with_rewritten_esp(
     if source.keys().collect::<Vec<_>>() != candidate.keys().collect::<Vec<_>>() {
         bail!("candidate plugin set differs in paths");
     }
-    let rewritten = rewritten_relative_path
-        .to_ascii_lowercase()
-        .replace('\\', "/");
+    let rewritten = rewritten_relative_paths
+        .iter()
+        .map(|path| path.to_ascii_lowercase().replace('\\', "/"))
+        .collect::<HashSet<_>>();
     for (path, source) in source {
         let candidate = candidate[&path];
-        if path == rewritten {
+        if rewritten.contains(&path) {
             if source.kind != "esp"
                 || candidate.kind != "esp"
                 || candidate.parse_status != "parsed"

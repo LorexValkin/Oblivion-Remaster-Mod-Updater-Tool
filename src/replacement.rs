@@ -2094,6 +2094,12 @@ pub(crate) fn recovered_dependency_route(target_leaf: &str) -> Option<RecoveredD
     None
 }
 
+fn bundled_mesh_leaf(path: &str) -> bool {
+    let leaf = package_leaf_without_extension(path);
+    leaf.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_") || prefix.eq_ignore_ascii_case("SK_"))
+}
+
 fn composite_alias_candidate(
     consumer: &PackageStoreEntry,
     target_package_name: &str,
@@ -2101,44 +2107,78 @@ fn composite_alias_candidate(
     source_store: &HashMap<u64, PackageStoreEntry>,
     source_packages: &HashMap<u64, PackageEntry>,
 ) -> Result<PackageEntry> {
+    // Bundled mesh evidence for the consumer. Witnesses shaped this set:
+    // a weapon Blueprint importing one StaticMesh (the original proven
+    // contract), a Blueprint importing blade AND scabbard meshes ("Brass
+    // Katana", Nexus 4230; "Avo's Tear", Nexus 4228), an armor Blueprint
+    // importing skeletal SK_ meshes ("Invincible", Nexus 4233), and a mesh
+    // package that is itself the consumer of its own retired material
+    // ("Oblivion Blade of Nulgath", Nexus 4640). Multi-mesh consumers
+    // contribute the union of their imports; every arm still requires
+    // exactly one structurally related candidate, so broader evidence can
+    // only fail closed, never choose.
     let direct_meshes = consumer
         .imported_package_ids
         .iter()
         .filter_map(|package_id| source_store.get(package_id))
-        .filter(|entry| {
-            package_leaf_without_extension(&entry.path)
-                .get(..3)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
-        })
+        .filter(|entry| bundled_mesh_leaf(&entry.path))
         .collect::<Vec<_>>();
-    if direct_meshes.len() != 1 {
+    let consumer_is_mesh = bundled_mesh_leaf(&consumer.path);
+    if direct_meshes.is_empty() && !consumer_is_mesh {
         bail!(
-            "identity recovery requires exactly one bundled primary StaticMesh dependency; found {}",
-            direct_meshes.len()
+            "identity recovery requires bundled mesh evidence (an imported SM_/SK_ package or a mesh consumer); found none"
         );
     }
-    let main_dependencies = direct_meshes[0]
-        .imported_package_ids
+    let mut main_dependencies = direct_meshes
         .iter()
-        .copied()
+        .flat_map(|entry| entry.imported_package_ids.iter().copied())
         .collect::<HashSet<_>>();
+    if direct_meshes.is_empty() {
+        main_dependencies.extend(consumer.imported_package_ids.iter().copied());
+    }
     let target_leaf = package_leaf_without_extension(target_package_name);
     let target_parent = target_package_name
         .rsplit_once('/')
         .map(|(parent, _)| parent)
         .context("recovered package name has no parent")?;
+    let parent_matches = |package: &PackageEntry| {
+        mounted_game_package_name(&package.path)
+            .ok()
+            .and_then(|name| name.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
+            .is_some_and(|parent| parent.eq_ignore_ascii_case(target_parent))
+    };
     let candidates = if expected_class.eq_ignore_ascii_case("MaterialInstanceConstant") {
-        main_dependencies
+        let mut pool = main_dependencies
             .iter()
             .filter_map(|package_id| source_packages.get(package_id))
-            .filter(|package| {
-                mounted_game_package_name(&package.path)
-                    .ok()
-                    .and_then(|name| name.rsplit_once('/').map(|(parent, _)| parent.to_owned()))
-                    .is_some_and(|parent| parent.eq_ignore_ascii_case(target_parent))
-            })
+            .filter(|package| parent_matches(package))
             .cloned()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if pool.is_empty() && consumer_is_mesh {
+            // The consumer mesh references nothing else that is bundled, so
+            // use sibling-mesh evidence: a bundled MaterialInstanceConstant
+            // in the exact recovered parent directory that a bundled sibling
+            // mesh package references ("Oblivion Blade of Nulgath", Nexus
+            // 4640: SM_OBON_scabbard's retired MIC aliases the blade's MIC).
+            pool = source_store
+                .values()
+                .filter(|entry| {
+                    entry.package_id != consumer.package_id && bundled_mesh_leaf(&entry.path)
+                })
+                .flat_map(|entry| entry.imported_package_ids.iter())
+                .filter_map(|package_id| source_packages.get(package_id))
+                .filter(|package| {
+                    package_leaf_without_extension(&package.path)
+                        .get(..4)
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("MIC_"))
+                })
+                .filter(|package| parent_matches(package))
+                .cloned()
+                .collect::<Vec<_>>();
+        }
+        pool.sort_by_key(|package| package.package_id);
+        pool.dedup_by_key(|package| package.package_id);
+        pool
     } else if expected_class.eq_ignore_ascii_case("StaticMesh") {
         source_packages
             .values()
@@ -4663,6 +4703,129 @@ mod tests {
             recovered_dependency_route("SK_Iron_Boots_B_PhysicsAsset"),
             Some(RecoveredDependencyRoute::CurrentDonorRebind("PhysicsAsset"))
         );
+    }
+
+    fn alias_fixture(
+        entries: &[(u64, &str, &[u64])],
+    ) -> (HashMap<u64, PackageStoreEntry>, HashMap<u64, PackageEntry>) {
+        let source_store = entries
+            .iter()
+            .map(|(id, path, imports)| (*id, store(*id, path, imports)))
+            .collect::<HashMap<_, _>>();
+        let source_packages = entries
+            .iter()
+            .map(|(id, path, _)| {
+                (
+                    *id,
+                    PackageEntry {
+                        package_id: *id,
+                        path: (*path).to_owned(),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        (source_store, source_packages)
+    }
+
+    #[test]
+    fn alias_candidate_accepts_multi_mesh_consumers_with_one_related_material() {
+        // Witness ("Brass Katana", Nexus 4230; "Avo's Tear", Nexus 4228): the
+        // weapon Blueprint imports blade AND scabbard StaticMeshes, so the
+        // old exactly-one-primary-mesh gate rejected it even though exactly
+        // one bundled material in the recovered parent exists.
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Forms/BP_Katana.uasset", &[2, 3, 99]),
+            (2, "../../../OblivionRemastered/Content/Art/bkatana/SM_Katana.uasset", &[4]),
+            (3, "../../../OblivionRemastered/Content/Art/bkatana/SM_Katana_scabbard.uasset", &[4]),
+            (4, "../../../OblivionRemastered/Content/Art/bkatana/MIC_Katana_blade.uasset", &[]),
+        ]);
+        let candidate = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/bkatana/MIC_Katana",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 4);
+    }
+
+    #[test]
+    fn alias_candidate_accepts_skeletal_mesh_evidence_for_armor_consumers() {
+        // Witness ("Invincible", Nexus 4233): the armor Blueprint imports a
+        // skeletal SK_ mesh, not a StaticMesh; its retired materials recover
+        // through the same parent-directory candidate contract.
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Forms/BP_Armor.uasset", &[2, 99]),
+            (2, "../../../OblivionRemastered/Content/Art/mark/SK_Armor.uasset", &[3]),
+            (3, "../../../OblivionRemastered/Content/Art/mark/MIC_Armor.uasset", &[]),
+        ]);
+        let candidate = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/mark/MIC_Armor_m",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 3);
+    }
+
+    #[test]
+    fn alias_candidate_uses_sibling_mesh_evidence_for_mesh_consumers() {
+        // Witness ("Oblivion Blade of Nulgath", Nexus 4640): the scabbard
+        // mesh itself imports its retired MIC and references nothing else,
+        // so the blade sibling's bundled MIC in the same recovered parent is
+        // the only structurally related candidate.
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Art/obon/SM_OBON_scabbard.uasset", &[99]),
+            (2, "../../../OblivionRemastered/Content/Art/obon/SM_OBON.uasset", &[3]),
+            (3, "../../../OblivionRemastered/Content/Art/obon/MIC_OBON.uasset", &[]),
+        ]);
+        let candidate = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/obon/MIC_OBON_scabbard",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 3);
+
+        // Two sibling materials in the recovered parent stay ambiguous and
+        // fail closed.
+        let (ambiguous_store, ambiguous_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Art/obon/SM_OBON_scabbard.uasset", &[99]),
+            (2, "../../../OblivionRemastered/Content/Art/obon/SM_OBON.uasset", &[3, 4]),
+            (3, "../../../OblivionRemastered/Content/Art/obon/MIC_OBON.uasset", &[]),
+            (4, "../../../OblivionRemastered/Content/Art/obon/MIC_OBON_alt.uasset", &[]),
+        ]);
+        let error = composite_alias_candidate(
+            &ambiguous_store[&1],
+            "/Game/Art/obon/MIC_OBON_scabbard",
+            "MaterialInstanceConstant",
+            &ambiguous_store,
+            &ambiguous_packages,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("found 2"));
+    }
+
+    #[test]
+    fn alias_candidate_requires_bundled_mesh_evidence() {
+        let (source_store, source_packages) = alias_fixture(&[
+            (1, "../../../OblivionRemastered/Content/Forms/BP_Widget.uasset", &[99]),
+            (3, "../../../OblivionRemastered/Content/Art/x/MIC_Widget.uasset", &[]),
+        ]);
+        let error = composite_alias_candidate(
+            &source_store[&1],
+            "/Game/Art/x/MIC_Widget_b",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("bundled mesh evidence"));
     }
 
     #[test]

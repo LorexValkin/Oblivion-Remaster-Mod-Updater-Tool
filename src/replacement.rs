@@ -4416,7 +4416,13 @@ pub fn probe_composite_package_input(
                         &available_dependencies,
                         &approved_stale_dependencies,
                         &package_work.join("repair"),
-                    )?;
+                    )
+                    .with_context(|| {
+                        format!(
+                            "rebasing existing Texture2D {} onto its current-game template",
+                            package.path
+                        )
+                    })?;
                     donor_rebind_repairs.insert(package.package_id, repair);
                 } else if missing_store_dependencies != 0 {
                     bail!("resolved Texture2D retains unresolved package-store dependencies");
@@ -4447,7 +4453,13 @@ pub fn probe_composite_package_input(
                             &available_dependencies,
                             &approved_stale_dependencies,
                             &package_work.join("repair"),
-                        )?;
+                        )
+                        .with_context(|| {
+                            format!(
+                                "rebasing existing material instance {} onto its current-game template",
+                                package.path
+                            )
+                        })?;
                         donor_rebind_repairs.insert(package.package_id, repair);
                     } else {
                         let targets = store
@@ -4561,7 +4573,13 @@ pub fn probe_composite_package_input(
                     &available_dependencies,
                     &approved_stale_dependencies,
                     &package_work.join("repair"),
-                )?;
+                )
+                .with_context(|| {
+                    format!(
+                        "rebasing existing package {} onto its current-game template",
+                        package.path
+                    )
+                })?;
                 donor_rebind_repairs.insert(package.package_id, repair);
             }
             CompositePackageAssetKind::ResolvedEngineDataPackage => {

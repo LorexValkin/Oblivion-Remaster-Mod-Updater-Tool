@@ -4476,12 +4476,20 @@ pub fn probe_composite_package_input(
                             .filter(|dependency| !source_ids.contains(dependency))
                             .filter_map(|dependency| inspection.target_dependencies.get(dependency))
                             .collect::<Vec<_>>();
-                        if targets.len() != 1 {
+                        if targets.is_empty() {
+                            // No external current dependency resolves; the
+                            // additive MIC's unresolved import targets a
+                            // package outside both the mod and the game
+                            // (runtime-null). Skip repair; the engine
+                            // resolves the missing reference to null.
+                            *kinds.entry("material-instance").or_default() -= 1;
+                            *kinds.entry("material-instance-passthrough").or_default() += 1;
+                        } else if targets.len() != 1 {
                             bail!(
                                 "additive material with one unresolved public export must have exactly one external current dependency; found {}",
                                 targets.len()
                             );
-                        }
+                        } else {
                         let target = targets[0];
                         let donor_root = package_work.join("dependency");
                         extract_composite_packages_exact(
@@ -4500,6 +4508,7 @@ pub fn probe_composite_package_input(
                             &available_dependencies,
                             &package_work.join("repair"),
                         )?;
+                    }
                     }
                 } else if missing_store_dependencies != 0 {
                     bail!(

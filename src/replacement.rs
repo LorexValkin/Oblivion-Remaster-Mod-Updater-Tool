@@ -2297,15 +2297,16 @@ fn composite_primary_static_mesh_candidate(
     source_store: &HashMap<u64, PackageStoreEntry>,
     source_packages: &HashMap<u64, PackageEntry>,
 ) -> Result<PackageEntry> {
+    // The temporary suppression donor is the consumer's single bundled
+    // primary mesh. Armor Blueprints import a skeletal SK_ mesh instead of a
+    // StaticMesh ("Cosmic's Black Cape", Nexus 4840), so both mesh classes
+    // count as primary evidence; the exactly-one rule keeps the choice
+    // fail-closed.
     let mut candidates = consumer
         .imported_package_ids
         .iter()
         .filter_map(|package_id| source_store.get(package_id))
-        .filter(|entry| {
-            package_leaf_without_extension(&entry.path)
-                .get(..3)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
-        })
+        .filter(|entry| bundled_mesh_leaf(&entry.path))
         .filter_map(|entry| source_packages.get(&entry.package_id))
         .cloned()
         .collect::<Vec<_>>();
@@ -2313,7 +2314,7 @@ fn composite_primary_static_mesh_candidate(
     candidates.dedup_by_key(|package| package.package_id);
     if candidates.len() != 1 {
         bail!(
-            "optional secondary StaticMesh recovery requires exactly one bundled primary StaticMesh; found {}",
+            "optional secondary StaticMesh recovery requires exactly one bundled primary mesh; found {}",
             candidates.len()
         );
     }
@@ -2697,8 +2698,10 @@ pub fn recover_composite_package_identities(
             path: mounted_game_legacy_path(&target_name)?,
         };
         if suppress_optional_component {
-            if role.role != "scabbard-static-mesh" {
-                bail!("optional StaticMesh fallback did not prove a secondary scabbard role");
+            if role.role != "scabbard-static-mesh" && role.role != "ground-static-mesh" {
+                bail!(
+                    "optional StaticMesh fallback did not prove a secondary scabbard or ground-mesh role"
+                );
             }
             suppressions.push(CompositeOptionalDependencySuppressionPlan {
                 consumer_package_id: consumer_id,

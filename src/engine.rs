@@ -839,7 +839,7 @@ fn resolve_sync_map_entries(
 /// Structural fail-closed parse of a MagicLoader JSON sidecar. MagicLoader itself accepts
 /// trailing commas, so they are normalized (outside string literals only) before the strict
 /// parse; the sidecar bytes shipped to the candidate are never modified.
-fn validate_magic_loader_sidecar(payload: &[u8]) -> Result<()> {
+pub(crate) fn validate_magic_loader_sidecar(payload: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(payload).context("sidecar is not UTF-8")?;
     let mut normalized = String::with_capacity(text.len());
     let mut in_string = false;
@@ -1053,8 +1053,392 @@ fn run_direct_update(
         "native-additive-static-mesh-v1" | ADDITIVE_STATIC_MESH_ADAPTER => {
             run_additive_static_mesh_update(request, callback)
         }
+        crate::plugin_only::PLUGIN_ONLY_ADAPTER => run_plugin_only_update(request, callback),
         adapter => bail!("preflight selected an unknown or empty update adapter: {adapter}"),
     }
+}
+
+/// Publishes a plugin-only mod as a canonical-layout runtime-test candidate.
+/// The complete lane probe must re-prove every gate against the current game;
+/// the ESP is byte-preserved unless the undelete-and-disable policy proved a
+/// deletion-stub rewrite, and every sidecar byte is preserved.
+fn run_plugin_only_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    use crate::plugin_only::{
+        PLUGIN_ONLY_ADAPTER, PLUGIN_ONLY_INSTALLABLE_EXTENSIONS, PLUGIN_ONLY_LANE_API,
+        evaluate_plugin_only_lane, stage_plugin_only_logical_view,
+    };
+
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let input_type = if mod_input.is_file() {
+        "archive"
+    } else {
+        "directory"
+    };
+    let input_hash = if mod_input.is_file() {
+        sha256_file(&mod_input)?
+    } else {
+        sha256_directory(&mod_input)?
+    };
+    let game = validate_game_install(&request.game_root, "native UI");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    if !request.output_parent.is_dir() {
+        bail!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        );
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let output_directory = request.output_parent.join(format!(
+        "{}-current-candidate-{stamp}",
+        safe_leaf(&mod_input)
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    if output_directory.exists() || output_archive.exists() {
+        bail!("timestamped output already exists; wait one second and try again");
+    }
+    if request.persist_settings {
+        save_settings(&game.root, &request.output_parent)?;
+    }
+    let game_data = game
+        .root
+        .join(r"OblivionRemastered\Content\Dev\ObvData\Data");
+    let game_esm = game_data.join("Oblivion.esm");
+
+    stage(callback, 1, "Inspecting the plugin-only mod and target game");
+    let work = tempfile::Builder::new()
+        .prefix("obr-plugin-only-update-")
+        .tempdir()?;
+    let extract_root = work.path().join("archive");
+    fs::create_dir_all(&extract_root)?;
+    if mod_input.is_dir() {
+        crate::archive::copy_tree(&mod_input, &extract_root)?;
+    } else {
+        crate::archive::extract_archive(&mod_input, &extract_root)?;
+    }
+    // Classify every file in the complete tree: installable payloads enter the
+    // canonical mapping, documentation is preserved without installation, and
+    // any other functional file fails the lane closed.
+    let mut documentation = Vec::new();
+    for entry in walkdir::WalkDir::new(&extract_root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!("plugin-only input contains a filesystem link");
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&extract_root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if PLUGIN_ONLY_INSTALLABLE_EXTENSIONS
+            .iter()
+            .any(|value| extension.eq_ignore_ascii_case(value))
+        {
+            continue;
+        }
+        let file_name = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let documentation_like = matches!(
+            extension.as_str(),
+            "txt" | "md" | "rtf" | "pdf" | "png" | "jpg" | "jpeg" | "gif" | "webp"
+        ) || matches!(
+            file_name.as_str(),
+            "readme" | "license" | "licence" | "notice" | "changelog"
+        );
+        if !documentation_like {
+            bail!("plugin-only lane refuses an unrecognized functional file: {relative}");
+        }
+        documentation.push(relative);
+    }
+    documentation.sort();
+
+    stage(
+        callback,
+        2,
+        "Proving Data-plane layout, masters, and current-master semantics",
+    );
+    let lane = evaluate_plugin_only_lane(&mod_input, Some(&game_data));
+    if lane.status != "proven" {
+        bail!(
+            "the plugin-only lane is blocked: {}",
+            lane.blockers.join(", ")
+        );
+    }
+    let layout = lane
+        .layout
+        .clone()
+        .context("the proven plugin-only lane lost its layout")?;
+    let esp_logical = lane
+        .esp_logical_path
+        .clone()
+        .context("the proven plugin-only lane lost its ESP path")?;
+    let (_staged, logical_root, publish_layout) = stage_plugin_only_logical_view(&mod_input)?;
+    if publish_layout != layout {
+        bail!("the publication layout no longer matches the proven lane layout");
+    }
+    let source_esp_path = logical_root.join(&esp_logical);
+    let source_esp_bytes = fs::read(&source_esp_path)?;
+    let source_esp_hash = sha256_file(&source_esp_path)?;
+    let plugin = crate::tes4::read_plugin_bytes(&source_esp_bytes, &esp_logical)?;
+    let has_overrides = plugin
+        .records
+        .iter()
+        .any(|record| ((record.form_id >> 24) as usize) < plugin.masters.len());
+    let mut plugin_replacements: HashMap<u32, Record> = HashMap::new();
+    let mut flag_update_form_ids: HashSet<u32> = HashSet::new();
+    let mut worldspace_evaluation: Option<WorldspaceLaneEvaluation> = None;
+    if has_overrides {
+        let evaluation = evaluate_worldspace_lane_semantics(
+            &plugin,
+            &source_esp_bytes,
+            &esp_logical,
+            &game_data,
+        )?;
+        if evaluation.semantic_gate.status != "proven" {
+            bail!(
+                "the current-master semantic gate is blocked: {}",
+                evaluation.semantic_gate.blockers.join(", ")
+            );
+        }
+        match evaluation.deleted_override_policy.status.as_str() {
+            "not-applicable" | "provable" => {}
+            _ => bail!(
+                "the undelete-and-disable deletion policy is blocked: {}",
+                evaluation.deleted_override_policy.blockers.join(", ")
+            ),
+        }
+        let policy = &evaluation.deleted_override_policy;
+        if policy.status == "provable"
+            && (policy.transformable_count != policy.deletion_stub_count
+                || evaluation.deletion_replacements.len() != policy.deletion_stub_count)
+        {
+            bail!(
+                "undelete-and-disable count invariant failed: {} stub(s), {} transformable, {} replacement(s)",
+                policy.deletion_stub_count,
+                policy.transformable_count,
+                evaluation.deletion_replacements.len()
+            );
+        }
+        flag_update_form_ids = evaluation.deletion_replacements.keys().copied().collect();
+        plugin_replacements = evaluation.deletion_replacements.clone();
+        worldspace_evaluation = Some(evaluation);
+    } else {
+        resolve_installed_master_records(&plugin, &game_data, &[])?;
+    }
+    // A SyncMap sidecar makes the TesSyncMapInjector runtime (under UE4SS) a
+    // hard requirement for the candidate to function.
+    if lane.sync_map_entry_count > 0 {
+        let dependency_candidates =
+            scan_dependencies(&request.dependency_inputs, Some(&mod_input));
+        let installed_dependencies = installed_state(&game.root);
+        let ue4ss_available = installed_dependencies.ue4ss.installed
+            || dependency_candidates
+                .iter()
+                .any(|candidate| candidate.kinds.contains(&DependencyKind::UE4SS));
+        let injector_available = installed_dependencies.tes_sync_map_injector.installed
+            || dependency_candidates.iter().any(|candidate| {
+                candidate
+                    .kinds
+                    .contains(&DependencyKind::TesSyncMapInjector)
+            });
+        if !ue4ss_available || !injector_available {
+            bail!(
+                "SyncMap mod requires UE4SS and TesSyncMapInjector. Place their archives beside the mod or attach them in the app."
+            );
+        }
+    }
+
+    stage(callback, 3, "Publishing the canonical runtime-test candidate");
+    fs::create_dir_all(&output_directory)?;
+    let candidate_root = output_directory.join("OblivionRemastered");
+    crate::archive::copy_tree(&logical_root, &candidate_root)?;
+    let candidate_esp = candidate_root.join(&esp_logical);
+    if !plugin_replacements.is_empty() {
+        let rewritten = rewrite_plugin_records_with_flag_updates(
+            &source_esp_bytes,
+            &plugin_replacements,
+            &flag_update_form_ids,
+            &esp_logical,
+        )?;
+        // Byte-roundtrip proof: splicing the original deletion stubs back must
+        // reproduce the source plugin exactly.
+        let originals = plugin
+            .records
+            .iter()
+            .filter(|record| plugin_replacements.contains_key(&record.form_id))
+            .map(|record| (record.form_id, record.clone()))
+            .collect::<HashMap<_, _>>();
+        let restored = rewrite_plugin_records_with_flag_updates(
+            &rewritten,
+            &originals,
+            &flag_update_form_ids,
+            &esp_logical,
+        )?;
+        if restored != source_esp_bytes {
+            bail!(
+                "undelete-and-disable byte-roundtrip proof failed; the rewrite touched bytes outside the transformed records"
+            );
+        }
+        fs::write(&candidate_esp, rewritten)?;
+    }
+    let passthrough_root = output_directory.join("unmapped-passthrough");
+    for relative in &documentation {
+        let source = extract_root.join(relative);
+        let target = passthrough_root.join(relative);
+        fs::create_dir_all(target.parent().context("passthrough file has no parent")?)?;
+        copy_file(&source, &target)?;
+    }
+
+    stage(callback, 4, "Verifying the published candidate");
+    if plugin_replacements.is_empty() {
+        verify_plugin_set_preserved(&logical_root, &candidate_root)?;
+    } else {
+        verify_plugin_set_with_rewritten_esp(&logical_root, &candidate_root, &esp_logical)?;
+        let candidate_bytes = fs::read(&candidate_esp)?;
+        let candidate_plugin = crate::tes4::read_plugin_bytes(&candidate_bytes, &esp_logical)?;
+        let final_evaluation = evaluate_worldspace_lane_semantics(
+            &candidate_plugin,
+            &candidate_bytes,
+            &esp_logical,
+            &game_data,
+        )?;
+        if final_evaluation.semantic_gate.status != "proven" {
+            bail!(
+                "the rewritten candidate fails the current-master semantic gate: {}",
+                final_evaluation.semantic_gate.blockers.join(", ")
+            );
+        }
+        if final_evaluation.deleted_override_policy.deletion_stub_count != 0 {
+            bail!(
+                "the rewritten candidate still carries {} deleted master override(s)",
+                final_evaluation.deleted_override_policy.deletion_stub_count
+            );
+        }
+    }
+    let candidate_esp_hash = sha256_file(&candidate_esp)?;
+
+    let mut fix_apis = vec![PLUGIN_MANIFEST_API, PLUGIN_ONLY_LANE_API];
+    if plugin_replacements.is_empty() {
+        fix_apis.push(PLUGIN_PRESERVATION_API);
+    } else {
+        fix_apis.push(UNDELETE_DISABLE_POLICY_API);
+    }
+    if has_overrides {
+        fix_apis.push(WORLDSPACE_SEMANTIC_GATE_API);
+    }
+    fix_apis.sort_unstable();
+    fix_apis.dedup();
+    let report_path = output_directory.join("plugin-only-update-report.json");
+    let mut report = json!({
+        "schema": "obr-plugin-only-update-report",
+        "version": 1,
+        "adapter": PLUGIN_ONLY_ADAPTER,
+        "implementation": "native-rust",
+        "fixApis": fix_apis,
+        "generatedAt": chrono::Utc::now().to_rfc3339(),
+        "reportSnapshot": "candidate-publication",
+        "status": "candidate_ready_for_runtime_test",
+        "structurallyVerified": true,
+        "runtimeVerified": false,
+        "source": {
+            "inputType": input_type,
+            "inputPath": mod_input,
+            "inputSha256": input_hash,
+            "esp": esp_logical,
+            "espSha256": source_esp_hash,
+        },
+        "target": {
+            "gameRoot": game.root,
+            "esm": game_esm,
+            "esmBytes": fs::metadata(&game_esm)?.len(),
+            "esmSha256": sha256_file(&game_esm)?,
+        },
+        "identity": {
+            "esmEdited": false,
+            "espBytePreserved": plugin_replacements.is_empty(),
+            "espUndeleteDisableRewrite": !plugin_replacements.is_empty(),
+            "espUndeleteDisableCount": plugin_replacements.len(),
+            "espSourceSha256": source_esp_hash,
+            "espCandidateSha256": candidate_esp_hash,
+            "mastersPreserved": true,
+            "masters": plugin.masters,
+            "declaredRecordCount": plugin.declared_record_count,
+            "nextObjectId": format!("0x{:08X}", plugin.next_object_id),
+        },
+        "installPlan": {
+            "scheme": layout.scheme,
+            "wrapper": layout.wrapper,
+            "mappings": layout.mappings,
+            "unmappedDocumentation": documentation,
+            "documentationPolicy": "Documentation files are preserved under unmapped-passthrough and are never installed into the game tree.",
+        },
+        "laneEvaluation": lane,
+        "output": {
+            "directory": output_directory,
+            "archive": output_archive,
+            "archiveContainsReportSnapshot": "candidate-publication",
+        },
+        "verification": {
+            "espReparsed": true,
+            "completePluginSetPreserved": true,
+            "sidecarBytesPreserved": true,
+            "productionRuntimeGateRequired": true,
+            "note": "SyncMap package targets and the MagicLoader runtime are disclosed runtime requirements; this candidate is not called repaired until an in-game production run proves the content and behavior.",
+        },
+    });
+    if let Some(evaluation) = worldspace_evaluation.as_ref() {
+        report["identity"]["worldspaceSemanticGate"] =
+            serde_json::to_value(&evaluation.semantic_gate)?;
+        report["identity"]["deletedOverridePolicy"] =
+            serde_json::to_value(&evaluation.deleted_override_policy)?;
+    }
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+
+    stage(callback, 5, "Creating portable candidate archive");
+    let mut zip_paths = vec![candidate_root.clone(), report_path.clone()];
+    if passthrough_root.is_dir() {
+        zip_paths.push(passthrough_root.clone());
+    }
+    create_zip_from_paths(&output_archive, &output_directory, &zip_paths)?;
+    if !output_archive.is_file() {
+        bail!(
+            "output archive was not created: {}",
+            output_archive.display()
+        );
+    }
+    stage(
+        callback,
+        6,
+        "Plugin-only candidate published; run the in-game production test",
+    );
+    Ok(UpdateOutcome {
+        adapter: PLUGIN_ONLY_ADAPTER.to_owned(),
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: 0,
+    })
 }
 
 fn nested_adapter_owns_logical_destinations(

@@ -18,6 +18,10 @@ use crate::mixed::{
     MIXED_IOSTORE_DEPENDENCY_PROBE_API, MixedIoStoreDependencyReport,
     probe_mixed_iostore_dependencies,
 };
+use crate::pak::{
+    LEGACY_PAK_PASSTHROUGH_ADAPTER, PakPassthroughProbeSummary, WWISE_AUDIO_MEDIA_PLANE,
+    probe_legacy_pak_passthrough_input,
+};
 use crate::plugin::{
     ADDITIVE_CONTRACT_API, AdditiveContractReport, PLUGIN_MANIFEST_API, PluginSetReport,
     WORLDSPACE_MASTER_PROBE_API, WorldspaceMasterProbeReport, inspect_additive_contract_input,
@@ -224,6 +228,8 @@ pub struct PreflightReport {
     pub install_plan: Option<InstallPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logical_install_analysis: Option<LogicalInstallAnalysis>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_pak_passthrough_probe: Option<PakPassthroughProbeSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unreal_replacement_probe: Option<ReplacementProbeSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -593,6 +599,71 @@ fn is_replacement_shape(inventory: &ModInventory) -> bool {
         && inventory.functional_or_unknown_loose_file_count == 0
         && inventory.file_count
             == inventory.complete_container_triple_count * 3 + inventory.loose_file_count
+}
+
+fn inventory_extension_count(inventory: &ModInventory, extension: &str) -> usize {
+    inventory
+        .extension_counts
+        .get(extension)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A container-only payload made purely of legacy `.pak` files (no IoStore
+/// UTOC/UCAS siblings): the shape the legacy pak passthrough lane may prove.
+fn is_legacy_pak_only_shape(inventory: &ModInventory) -> bool {
+    inventory.classification == "unreal-container-only"
+        && inventory_extension_count(inventory, "pak") > 0
+        && inventory_extension_count(inventory, "utoc") == 0
+        && inventory_extension_count(inventory, "ucas") == 0
+        && inventory.complete_container_triple_count == 0
+        && inventory.link_count == 0
+        && !inventory.scan_truncated
+        && inventory.functional_or_unknown_loose_file_count == 0
+}
+
+/// A pure UE4SS Lua scripting payload: runtime code the updater must never
+/// auto-install, distinct from a standalone tool executable.
+fn is_ue4ss_script_payload_shape(inventory: &ModInventory) -> bool {
+    inventory.classification == "script-or-loader"
+        && inventory_extension_count(inventory, "lua") > 0
+        && inventory_extension_count(inventory, "exe") == 0
+}
+
+/// A standalone executable tool payload (EXE, optionally with DLLs) with no
+/// Lua scripting plane: not mod content that installs into the game.
+fn is_standalone_tool_shape(inventory: &ModInventory) -> bool {
+    inventory.classification == "script-or-loader"
+        && inventory_extension_count(inventory, "exe") > 0
+        && inventory_extension_count(inventory, "lua") == 0
+}
+
+const AUTHORING_SOURCE_EXTENSIONS: &[&str] = &[
+    "fbx", "obj", "blend", "psk", "pskx", "psa", "gltf", "glb", "dae", "3ds", "max", "ma", "mb",
+];
+const AUTHORING_SIDECAR_EXTENSIONS: &[&str] = &["json", "txt", "xml", "csv"];
+const DOCUMENTATION_EXTENSIONS: &[&str] =
+    &["txt", "md", "rtf", "pdf", "png", "jpg", "jpeg", "gif", "webp"];
+
+/// A source authoring resource: DCC/editor inputs (FBX, PSK, and similar)
+/// plus sidecars and documentation, with nothing that installs into the game.
+fn is_authoring_resource_shape(inventory: &ModInventory) -> bool {
+    if inventory.classification != "loose-files-or-unknown"
+        || inventory.link_count != 0
+        || inventory.scan_truncated
+    {
+        return false;
+    }
+    let source_count = AUTHORING_SOURCE_EXTENSIONS
+        .iter()
+        .map(|extension| inventory_extension_count(inventory, extension))
+        .sum::<usize>();
+    source_count > 0
+        && inventory.extension_counts.keys().all(|extension| {
+            AUTHORING_SOURCE_EXTENSIONS.contains(&extension.as_str())
+                || AUTHORING_SIDECAR_EXTENSIONS.contains(&extension.as_str())
+                || DOCUMENTATION_EXTENSIONS.contains(&extension.as_str())
+        })
 }
 
 fn inspect_logical_install_input(
@@ -1398,6 +1469,27 @@ fn analyze_internal(
         .or(additive_static_mesh_probe.as_ref())
         .or(composite_package_probe.as_ref())
         .cloned();
+    let pak_passthrough_shape = inventory.as_ref().is_some_and(is_legacy_pak_only_shape);
+    let (legacy_pak_passthrough_probe, legacy_pak_passthrough_probe_error) =
+        if pak_passthrough_shape && !selected_active_game_mods {
+            progress("Validating legacy pak integrity and current-game audio targets");
+            if let Some(game) = game.as_ref().filter(|value| value.valid) {
+                match probe_legacy_pak_passthrough_input(&request.mod_input, &game.root) {
+                    Ok(summary) => (Some(summary), None),
+                    Err(error) => (None, Some(redact_preflight_error(&error, request))),
+                }
+            } else {
+                (
+                    None,
+                    Some(
+                        "A complete current game is required to prove legacy pak audio targets."
+                            .to_owned(),
+                    ),
+                )
+            }
+        } else {
+            (None, None)
+        };
     progress("Checking embedded engines and connected runtime tools");
     let candidates = if exists {
         scan_dependencies(&request.connected_tools, Some(&request.mod_input))
@@ -2196,6 +2288,30 @@ fn analyze_internal(
             ),
         ));
     }
+    if pak_passthrough_shape {
+        let success = legacy_pak_passthrough_probe
+            .as_ref()
+            .map(|summary| {
+                format!(
+                    "The input is a legacy .pak-only payload on the {} content plane: {} pak(s), {} hash-verified entr(ies), all present in the current game's shipped pak index.",
+                    WWISE_AUDIO_MEDIA_PLANE, summary.pak_count, summary.entry_count
+                )
+            })
+            .unwrap_or_default();
+        let failure = legacy_pak_passthrough_probe_error
+            .clone()
+            .unwrap_or_else(|| "The legacy pak passthrough contract was not evaluated.".to_owned());
+        checks.push(check(
+            "legacy-pak-passthrough-contract",
+            legacy_pak_passthrough_probe.is_some(),
+            true,
+            success,
+            failure,
+            Some(
+                "Encrypted, structurally inconsistent, or non-audio legacy paks and entries absent from the current game remain report-only until their planes are proven.",
+            ),
+        ));
+    }
     let adapter_blockers = checks
         .iter()
         .filter(|value| value.blocking)
@@ -2220,13 +2336,17 @@ fn analyze_internal(
         && adapter_blockers.is_empty();
     let composite_package_can_update =
         replacement_shape && composite_package_probe.is_some() && adapter_blockers.is_empty();
+    let pak_passthrough_can_update = pak_passthrough_shape
+        && legacy_pak_passthrough_probe.is_some()
+        && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
         || armor_can_update
         || mixed_armor_can_update
         || texture_can_update
         || additive_static_mesh_can_update
         || heterogeneous_replacement_can_update
-        || composite_package_can_update;
+        || composite_package_can_update
+        || pak_passthrough_can_update;
     let logical_publication_adapter = install_plan
         .as_ref()
         .filter(|plan| supports_logical_install_publication(plan))
@@ -2494,6 +2614,19 @@ fn analyze_internal(
         },
     });
     capabilities.push(Capability {
+        id: LEGACY_PAK_PASSTHROUGH_ADAPTER.to_owned(),
+        available: pak_passthrough_can_update,
+        evidence_level: "hash-verified-byte-preserving-passthrough".to_owned(),
+        description: "Legacy .pak-only payloads whose unencrypted index, per-entry stored-payload SHA-1 hashes, and zlib roundtrips all verify, whose every entry mounts on the proven Wwise audio media plane, and whose media IDs all exist in the current game's hash-verified shipped pak index are published byte-preserved with a ~mods install plan. The payload is version-passthrough, not structurally rebuilt; output remains a runtime-test candidate.".to_owned(),
+        blockers: if pak_passthrough_can_update {
+            Vec::new()
+        } else if pak_passthrough_shape {
+            adapter_blockers.clone()
+        } else {
+            vec!["mod-layout-is-not-a-legacy-pak-only-payload".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
         id: "pinned-offhand-staff-a-v1".to_owned(),
         available: false,
         evidence_level: "separate-audited-donor-cli".to_owned(),
@@ -2504,6 +2637,7 @@ fn analyze_internal(
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
         && composite_package_probe.is_none()
+        && legacy_pak_passthrough_probe.is_none()
         && !logical_adapter_matched
         && inventory.is_some()
     {
@@ -2531,6 +2665,8 @@ fn analyze_internal(
         Some(HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned())
     } else if composite_package_can_update {
         Some(COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned())
+    } else if pak_passthrough_can_update {
+        Some(LEGACY_PAK_PASSTHROUGH_ADAPTER.to_owned())
     } else if logical_install_can_update {
         logical_publication_adapter.clone()
     } else {
@@ -2554,12 +2690,12 @@ fn analyze_internal(
     let (disposition_code, disposition_reason) = if can_update {
         (
             "guarded-update-candidate",
-            "Every selected adapter gate passed. The output must still be tested in the shipping game.",
+            "Every selected adapter gate passed. The output must still be tested in the shipping game.".to_owned(),
         )
     } else if inventory.is_none() {
         (
             "input-error",
-            "The selected source could not be inventoried safely.",
+            "The selected source could not be inventoried safely.".to_owned(),
         )
     } else if layered_iostore_dependency_probe
         .as_ref()
@@ -2567,7 +2703,7 @@ fn analyze_internal(
     {
         (
             "dependency-closure-unresolved",
-            "At least one reachable IoStore import remains unresolved under explicit provider precedence.",
+            "At least one reachable IoStore import remains unresolved under explicit provider precedence.".to_owned(),
         )
     } else if plugin_compatibility
         .as_ref()
@@ -2575,24 +2711,72 @@ fn analyze_internal(
     {
         (
             "plugin-structural-or-semantic-review-required",
-            "Plugin structure or record semantics exceed the currently proven mutation policies.",
+            "Plugin structure or record semantics exceed the currently proven mutation policies.".to_owned(),
         )
     } else if install_plan.is_some() {
         (
             "install-layout-resolved-report-only",
-            "Physical-to-logical install mappings were resolved, but no end-to-end mutation adapter passed for that logical component.",
+            "Physical-to-logical install mappings were resolved, but no end-to-end mutation adapter passed for that logical component.".to_owned(),
+        )
+    } else if pak_passthrough_shape {
+        (
+            "legacy-pak-passthrough-validation-blocked",
+            format!(
+                "The input is a legacy .pak-only payload, but the fail-closed passthrough validation did not pass: {}",
+                legacy_pak_passthrough_probe_error
+                    .as_deref()
+                    .unwrap_or("a blocking preflight check failed before the passthrough contract")
+            ),
+        )
+    } else if inventory
+        .as_ref()
+        .is_some_and(is_ue4ss_script_payload_shape)
+    {
+        let inventory = inventory.as_ref().expect("inventory checked above");
+        (
+            "ue4ss-script-payload",
+            format!(
+                "The payload is UE4SS Lua runtime scripting ({} Lua file(s), {} loader DLL(s)). This updater never auto-installs or rewrites executable code, so there is no update lane; install the scripts under the UE4SS Mods folder and validate behavior in the shipping game.",
+                inventory_extension_count(inventory, "lua"),
+                inventory_extension_count(inventory, "dll"),
+            ),
+        )
+    } else if inventory.as_ref().is_some_and(is_standalone_tool_shape) {
+        let inventory = inventory.as_ref().expect("inventory checked above");
+        (
+            "standalone-tool-executable",
+            format!(
+                "The payload is a standalone tool ({} executable(s), {} DLL(s)); it is not game mod content that installs into the game folder, so there is nothing for this updater to update. Run the tool separately.",
+                inventory_extension_count(inventory, "exe"),
+                inventory_extension_count(inventory, "dll"),
+            ),
+        )
+    } else if inventory.as_ref().is_some_and(is_authoring_resource_shape) {
+        let inventory = inventory.as_ref().expect("inventory checked above");
+        let source_extensions = inventory
+            .extension_counts
+            .keys()
+            .filter(|extension| AUTHORING_SOURCE_EXTENSIONS.contains(&extension.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            "authoring-resource-source-assets",
+            format!(
+                "The payload is a source authoring resource ({source_extensions} plus sidecars/previews): DCC or editor inputs, not packaged game content. There is nothing to install into the game and therefore nothing to update.",
+            ),
         )
     } else {
         (
             "unsupported-structural-content",
-            "The input is reportable, but one or more selected files lack a proven update capability.",
+            "The input is reportable, but one or more selected files lack a proven update capability.".to_owned(),
         )
     };
     let disposition = UpdateDisposition {
         code: disposition_code.to_owned(),
         automatic_update: can_update,
         runtime_validation_required: can_update,
-        reason: disposition_reason.to_owned(),
+        reason: disposition_reason,
         blocker_ids: disposition_blockers,
     };
     let status = if can_update {
@@ -2639,6 +2823,7 @@ fn analyze_internal(
         layered_iostore_dependency_probe,
         install_plan,
         logical_install_analysis,
+        legacy_pak_passthrough_probe,
         unreal_replacement_probe: replacement_probe,
         heterogeneous_replacement_probe,
         selected_adapter,
@@ -2690,6 +2875,15 @@ pub fn stable_signature(report: &PreflightReport) -> String {
             &value.disposition.code,
             &value.disposition.blocker_ids,
         )),
+        "legacyPakPassthroughProbe": report
+            .legacy_pak_passthrough_probe
+            .as_ref()
+            .map(|value| (
+                value.pak_count,
+                value.entry_count,
+                value.matched_current_media_count,
+                value.paks.iter().map(|pak| &pak.pak_sha256).collect::<Vec<_>>(),
+            )),
         "pluginManifest": report
             .plugin_compatibility
             .as_ref()
@@ -3798,5 +3992,227 @@ mod tests {
         });
         assert!(write_report(&report, temp.path()).is_err());
         assert!(!temp.path().join("preflight.json").exists());
+    }
+
+    fn pak_passthrough_sound_entries() -> Vec<crate::pak::test_support::SyntheticEntry> {
+        vec![
+            crate::pak::test_support::SyntheticEntry {
+                name: "1020757059.wem".to_owned(),
+                payload: b"plain wwise payload".to_vec(),
+                zlib: false,
+            },
+            crate::pak::test_support::SyntheticEntry {
+                name: "240112521.wem".to_owned(),
+                payload: b"zlib wwise payload zlib wwise payload".to_vec(),
+                zlib: true,
+            },
+        ]
+    }
+
+    fn game_fixture_with_main_pak(root: &Path, listed_media: &[&str]) {
+        game_fixture(root);
+        let listing = crate::pak::test_support::write_modern_listing_pak(listed_media);
+        let pak_path = root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.pak");
+        fs::create_dir_all(pak_path.parent().unwrap()).unwrap();
+        fs::write(pak_path, listing).unwrap();
+    }
+
+    #[test]
+    fn pak_only_wwise_payload_becomes_a_guarded_passthrough_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(&mod_root).unwrap();
+        let pak = crate::pak::test_support::write_legacy_pak_v3(
+            "../../../OblivionRemastered/Content/WwiseAudio/Media/",
+            &pak_passthrough_sound_entries(),
+        );
+        fs::write(mod_root.join("Fixture_P.pak"), pak).unwrap();
+        let game_root = temp.path().join("game");
+        game_fixture_with_main_pak(
+            &game_root,
+            &[
+                "OblivionRemastered/Content/WwiseAudio/Media/1020757059.wem",
+                "OblivionRemastered/Content/WwiseAudio/Media/240112521.wem",
+            ],
+        );
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert_eq!(
+            report.inventory.as_ref().unwrap().classification,
+            "unreal-container-only"
+        );
+        assert!(report.game_valid);
+        assert!(report.can_update, "blockers: {:?}", report.disposition);
+        assert_eq!(report.disposition.code, "guarded-update-candidate");
+        assert!(report.disposition.runtime_validation_required);
+        assert_eq!(
+            report.selected_adapter.as_deref(),
+            Some(crate::pak::LEGACY_PAK_PASSTHROUGH_ADAPTER)
+        );
+        let probe = report.legacy_pak_passthrough_probe.as_ref().unwrap();
+        assert_eq!(probe.pak_count, 1);
+        assert_eq!(probe.entry_count, 2);
+        assert_eq!(probe.matched_current_media_count, 2);
+        assert!(
+            report
+                .capabilities
+                .iter()
+                .any(|capability| capability.id == crate::pak::LEGACY_PAK_PASSTHROUGH_ADAPTER
+                    && capability.available)
+        );
+    }
+
+    #[test]
+    fn pak_only_payload_missing_current_media_fails_closed_with_a_precise_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(&mod_root).unwrap();
+        let pak = crate::pak::test_support::write_legacy_pak_v3(
+            "../../../OblivionRemastered/Content/WwiseAudio/Media/",
+            &pak_passthrough_sound_entries(),
+        );
+        fs::write(mod_root.join("Fixture_P.pak"), pak).unwrap();
+        let game_root = temp.path().join("game");
+        game_fixture_with_main_pak(
+            &game_root,
+            &["OblivionRemastered/Content/WwiseAudio/Media/1020757059.wem"],
+        );
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert!(!report.can_update);
+        assert_eq!(
+            report.disposition.code,
+            "legacy-pak-passthrough-validation-blocked"
+        );
+        assert!(report.disposition.reason.contains("not present"));
+        assert!(report.selected_adapter.is_none());
+    }
+
+    #[test]
+    fn pak_only_cooked_asset_payload_fails_closed_with_a_precise_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(&mod_root).unwrap();
+        let pak = crate::pak::test_support::write_legacy_pak_v3(
+            "../../../OblivionRemastered/Content/Art/",
+            &[crate::pak::test_support::SyntheticEntry {
+                name: "SK_Armor.uasset".to_owned(),
+                payload: b"cooked".to_vec(),
+                zlib: false,
+            }],
+        );
+        fs::write(mod_root.join("Fixture_P.pak"), pak).unwrap();
+        let game_root = temp.path().join("game");
+        game_fixture_with_main_pak(
+            &game_root,
+            &["OblivionRemastered/Content/WwiseAudio/Media/1020757059.wem"],
+        );
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: Some(game_root),
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert!(!report.can_update);
+        assert_eq!(
+            report.disposition.code,
+            "legacy-pak-passthrough-validation-blocked"
+        );
+        assert!(report.disposition.reason.contains("cooked-asset"));
+    }
+
+    #[test]
+    fn ue4ss_lua_payload_gets_a_precise_terminal_disposition() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(mod_root.join(r"MyMod\Scripts")).unwrap();
+        fs::write(mod_root.join(r"MyMod\Scripts\main.lua"), b"-- script").unwrap();
+        fs::write(mod_root.join(r"MyMod\enabled.txt"), b"").unwrap();
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: None,
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert_eq!(
+            report.inventory.as_ref().unwrap().classification,
+            "script-or-loader"
+        );
+        assert!(!report.can_update);
+        assert_eq!(report.disposition.code, "ue4ss-script-payload");
+        assert!(!report.disposition.automatic_update);
+        assert!(report.disposition.reason.contains("UE4SS"));
+    }
+
+    #[test]
+    fn standalone_tool_executable_gets_a_precise_terminal_disposition() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(&mod_root).unwrap();
+        fs::write(mod_root.join("Tool.exe"), b"MZ tool").unwrap();
+        fs::write(mod_root.join("Helper.dll"), b"MZ helper").unwrap();
+        fs::write(mod_root.join("README.md"), b"docs").unwrap();
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: None,
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert_eq!(
+            report.inventory.as_ref().unwrap().classification,
+            "script-or-loader"
+        );
+        assert!(!report.can_update);
+        assert_eq!(report.disposition.code, "standalone-tool-executable");
+        assert!(report.disposition.reason.contains("tool"));
+    }
+
+    #[test]
+    fn authoring_source_assets_get_a_precise_terminal_disposition() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(&mod_root).unwrap();
+        fs::write(mod_root.join("Sword.fbx"), b"fbx").unwrap();
+        fs::write(mod_root.join("Sword.pskx"), b"pskx").unwrap();
+        fs::write(mod_root.join("Sword.json"), b"{}").unwrap();
+        fs::write(mod_root.join("Preview.png"), b"png").unwrap();
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: None,
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert_eq!(
+            report.inventory.as_ref().unwrap().classification,
+            "loose-files-or-unknown"
+        );
+        assert!(!report.can_update);
+        assert_eq!(report.disposition.code, "authoring-resource-source-assets");
+        assert!(report.disposition.reason.contains("authoring"));
+    }
+
+    #[test]
+    fn mixed_script_and_executable_payload_keeps_the_generic_terminal_code() {
+        let temp = tempfile::tempdir().unwrap();
+        let mod_root = temp.path().join("mod");
+        fs::create_dir_all(&mod_root).unwrap();
+        fs::write(mod_root.join("Tool.exe"), b"MZ tool").unwrap();
+        fs::write(mod_root.join("script.lua"), b"-- script").unwrap();
+        let report = analyze(&PreflightRequest {
+            mod_input: mod_root,
+            game_root: None,
+            output_parent: Some(temp.path().to_path_buf()),
+            connected_tools: Vec::new(),
+        });
+        assert!(!report.can_update);
+        assert_eq!(report.disposition.code, "unsupported-structural-content");
     }
 }

@@ -130,7 +130,14 @@ pub struct CompositeDonorRebindPlan {
 
 #[derive(Clone, Debug)]
 pub struct CompositeIdentityRecovery {
+    /// Persistent alias provider container. Ships with the candidate because
+    /// live rebuilt imports keep referencing its aliased identities.
     pub provider: Option<CompositeIdentityAliasProvider>,
+    /// Rebuild-only provider for temporary optional-component identities.
+    /// Mounted into extraction views so stale imports resolve during the
+    /// dependency-complete rebuild, and never shipped: every suppression
+    /// rewrites its consumer import to a bundled package before publication.
+    pub temporary_provider: Option<CompositeIdentityAliasProvider>,
     pub aliases: Vec<CompositeIdentityAliasPlan>,
     pub suppressions: Vec<CompositeOptionalDependencySuppressionPlan>,
     pub donor_rebinds: Vec<CompositeDonorRebindPlan>,
@@ -2271,6 +2278,83 @@ fn authoritative_alias_source_identity(
     })
 }
 
+/// Builds one identity provider container from a staged legacy root and
+/// mounts it into the extraction source view. The provider inventory must
+/// equal exactly the recovered target IDs it was staged for.
+fn build_composite_identity_provider(
+    retoc: &RetocTool,
+    inspection: &ReplacementInspection,
+    source_view: &Path,
+    provider_root: &Path,
+    legacy_root: &Path,
+    name_prefix: &str,
+    target_ids: &BTreeSet<u64>,
+) -> Result<Option<CompositeIdentityAliasProvider>> {
+    if target_ids.is_empty() {
+        return Ok(None);
+    }
+    let provider_hash = sha256_bytes(
+        target_ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("|")
+            .as_bytes(),
+    );
+    let provider_name = format!("{name_prefix}_{}_P", &provider_hash[..12]);
+    fs::create_dir_all(provider_root)?;
+    let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
+    let result = retoc.run([
+        OsString::from("to-zen"),
+        OsString::from("--version"),
+        OsString::from("UE5_3"),
+        legacy_root.as_os_str().to_owned(),
+        provider_utoc.as_os_str().to_owned(),
+    ])?;
+    RetocTool::assert_success(&result, "identity alias provider rebuild")?;
+    let provider_ucas = provider_utoc.with_extension("ucas");
+    let provider_pak = provider_utoc.with_extension("pak");
+    for path in [&provider_utoc, &provider_ucas, &provider_pak] {
+        if !path.is_file() {
+            bail!("identity alias provider is incomplete: {}", path.display());
+        }
+        copy_probe_file(
+            path,
+            &source_view.join(
+                path.file_name()
+                    .context("identity alias provider has no filename")?,
+            ),
+        )?;
+    }
+    retoc.verify(&provider_utoc, "identity alias provider")?;
+    let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
+    if provider_packages
+        .iter()
+        .map(|package| package.package_id)
+        .collect::<BTreeSet<_>>()
+        != *target_ids
+    {
+        bail!("identity alias provider inventory does not match recovered target IDs");
+    }
+    let first_container = inspection
+        .containers
+        .first()
+        .context("identity recovery has no source container")?;
+    let relative_utoc = first_container
+        .relative_utoc
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{provider_name}.utoc"));
+    Ok(Some(CompositeIdentityAliasProvider {
+        provider_name,
+        provider_utoc,
+        provider_ucas,
+        provider_pak,
+        legacy_root: legacy_root.to_path_buf(),
+        relative_utoc,
+    }))
+}
+
 pub fn recover_composite_package_identities(
     inspection: &ReplacementInspection,
     retoc: &RetocTool,
@@ -2309,6 +2393,11 @@ pub fn recover_composite_package_identities(
     fs::create_dir_all(work)?;
     let alias_legacy = work.join("legacy");
     fs::create_dir_all(&alias_legacy)?;
+    // Temporary optional-component identities never ship, so they are staged
+    // in their own legacy root and built into a separate rebuild-only
+    // provider container instead of the persistent alias provider.
+    let temporary_legacy = work.join("temporary-legacy");
+    fs::create_dir_all(&temporary_legacy)?;
     let mut recovered_targets =
         HashMap::<u64, (String, String, PackageEntry, PackageIdentityAlias, bool)>::new();
     let mut pending = Vec::<(u64, u64, String, String, PackageEntry, bool)>::new();
@@ -2460,7 +2549,11 @@ pub fn recover_composite_package_identities(
                 &target_name,
                 target_id,
                 expected_class,
-                &alias_legacy,
+                if suppress_optional_component {
+                    &temporary_legacy
+                } else {
+                    &alias_legacy
+                },
                 &work.join("aliases").join(target_id.to_string()),
             )?;
             recovered_targets.insert(
@@ -2484,75 +2577,34 @@ pub fn recover_composite_package_identities(
         ));
     }
 
-    let provider = if recovered_targets.is_empty() {
-        // Every missing edge was routed to a current-donor rebind, so no
-        // alias provider container is needed or built.
-        None
-    } else {
-        let mut target_ids = recovered_targets.keys().copied().collect::<Vec<_>>();
-        target_ids.sort_unstable();
-        let provider_hash = sha256_bytes(
-            target_ids
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join("|")
-                .as_bytes(),
-        );
-        let provider_name = format!("OBR_IdentityAliases_{}_P", &provider_hash[..12]);
-        let provider_root = work.join("provider");
-        fs::create_dir_all(&provider_root)?;
-        let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
-        let result = retoc.run([
-            OsString::from("to-zen"),
-            OsString::from("--version"),
-            OsString::from("UE5_3"),
-            alias_legacy.as_os_str().to_owned(),
-            provider_utoc.as_os_str().to_owned(),
-        ])?;
-        RetocTool::assert_success(&result, "identity alias provider rebuild")?;
-        let provider_ucas = provider_utoc.with_extension("ucas");
-        let provider_pak = provider_utoc.with_extension("pak");
-        for path in [&provider_utoc, &provider_ucas, &provider_pak] {
-            if !path.is_file() {
-                bail!("identity alias provider is incomplete: {}", path.display());
-            }
-            copy_probe_file(
-                path,
-                &source_view.join(
-                    path.file_name()
-                        .context("identity alias provider has no filename")?,
-                ),
-            )?;
-        }
-        retoc.verify(&provider_utoc, "identity alias provider")?;
-        let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
-        if provider_packages
-            .iter()
-            .map(|package| package.package_id)
-            .collect::<BTreeSet<_>>()
-            != target_ids.iter().copied().collect::<BTreeSet<_>>()
-        {
-            bail!("identity alias provider inventory does not match recovered target IDs");
-        }
-        let first_container = inspection
-            .containers
-            .first()
-            .context("identity recovery has no source container")?;
-        let relative_utoc = first_container
-            .relative_utoc
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(format!("{provider_name}.utoc"));
-        Some(CompositeIdentityAliasProvider {
-            provider_name,
-            provider_utoc,
-            provider_ucas,
-            provider_pak,
-            legacy_root: alias_legacy.clone(),
-            relative_utoc,
-        })
-    };
+    let persistent_ids = recovered_targets
+        .iter()
+        .filter(|(_, tuple)| !tuple.4)
+        .map(|(target_id, _)| *target_id)
+        .collect::<BTreeSet<_>>();
+    let temporary_ids = recovered_targets
+        .iter()
+        .filter(|(_, tuple)| tuple.4)
+        .map(|(target_id, _)| *target_id)
+        .collect::<BTreeSet<_>>();
+    let provider = build_composite_identity_provider(
+        retoc,
+        inspection,
+        source_view,
+        &work.join("provider"),
+        &alias_legacy,
+        "OBR_IdentityAliases",
+        &persistent_ids,
+    )?;
+    let temporary_provider = build_composite_identity_provider(
+        retoc,
+        inspection,
+        source_view,
+        &work.join("temporary-provider"),
+        &temporary_legacy,
+        "OBR_TemporaryProviders",
+        &temporary_ids,
+    )?;
 
     let mut aliases = Vec::new();
     let mut suppressions = Vec::new();
@@ -2632,11 +2684,6 @@ pub fn recover_composite_package_identities(
             .cmp(&right.target_package.package_id)
             .then(left.consumer_package_id.cmp(&right.consumer_package_id))
     });
-    if !aliases.is_empty() && !suppressions.is_empty() {
-        bail!(
-            "mixed persistent aliases and temporary optional-component providers require separate provider containers"
-        );
-    }
     donor_rebinds.sort_by(|left, right| {
         left.target_package_id
             .cmp(&right.target_package_id)
@@ -2644,6 +2691,7 @@ pub fn recover_composite_package_identities(
     });
     Ok(Some(CompositeIdentityRecovery {
         provider,
+        temporary_provider,
         aliases,
         suppressions,
         donor_rebinds,
@@ -3166,12 +3214,34 @@ pub(crate) fn extract_composite_packages_exact(
         }
     }
     let final_paths = extracted_uasset_paths(output)?;
-    let added = final_paths
-        .difference(&initial)
+    verify_exact_reconstruction(&initial, &final_paths, &expected, label)
+}
+
+/// The extraction above deliberately skips a requested package that a prior
+/// call into the same output directory already materialized, so reconstruction
+/// is proven by two properties: every requested package is present afterwards,
+/// and nothing outside the requested set was newly added.
+fn verify_exact_reconstruction(
+    initial: &BTreeSet<String>,
+    final_paths: &BTreeSet<String>,
+    expected: &BTreeSet<String>,
+    label: &str,
+) -> Result<()> {
+    let missing = expected
+        .difference(final_paths)
         .cloned()
-        .collect::<BTreeSet<_>>();
-    if added != expected {
-        bail!("{label} did not reconstruct the exact composite package set");
+        .collect::<Vec<_>>();
+    let unexpected = final_paths
+        .difference(initial)
+        .filter(|path| !expected.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        bail!(
+            "{label} did not reconstruct the exact composite package set; missing [{}], unexpected [{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        );
     }
     Ok(())
 }
@@ -4652,6 +4722,27 @@ mod tests {
                 ],
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_reconstruction_accepts_previously_materialized_requests_only() {
+        let set = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        // Fresh extraction of the requested package.
+        verify_exact_reconstruction(&set(&[]), &set(&["a"]), &set(&["a"]), "test").unwrap();
+        // A repeated request whose package a prior call already materialized.
+        verify_exact_reconstruction(&set(&["a"]), &set(&["a"]), &set(&["a"]), "test").unwrap();
+        // A requested package that never materialized fails closed.
+        assert!(verify_exact_reconstruction(&set(&[]), &set(&[]), &set(&["a"]), "test").is_err());
+        // Anything materialized beyond the requested set fails closed.
+        assert!(
+            verify_exact_reconstruction(&set(&[]), &set(&["a", "b"]), &set(&["a"]), "test")
+                .is_err()
         );
     }
 

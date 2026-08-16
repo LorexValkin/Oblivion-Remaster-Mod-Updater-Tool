@@ -17,6 +17,9 @@ use crate::install_plan::{
     nested_logical_install_adapter, reconstruct_logical_update_candidate,
     resolve_staged_install_view, supports_logical_install_publication, verify_install_trees_match,
 };
+use crate::pak::{
+    LEGACY_PAK_PASSTHROUGH_ADAPTER, probe_legacy_pak_passthrough_input, publish_passthrough_paks,
+};
 use crate::plugin::{
     ADDITIVE_CONTRACT_API, PLUGIN_MANIFEST_API, PLUGIN_PRESERVATION_API,
     PLUGIN_SEMANTIC_REWRITE_API, inspect_plugin_set, resolve_installed_master_records,
@@ -833,8 +836,180 @@ fn run_direct_update(
         "native-additive-static-mesh-v1" | ADDITIVE_STATIC_MESH_ADAPTER => {
             run_additive_static_mesh_update(request, callback)
         }
+        LEGACY_PAK_PASSTHROUGH_ADAPTER => run_legacy_pak_passthrough_update(request, callback),
         adapter => bail!("preflight selected an unknown or empty update adapter: {adapter}"),
     }
+}
+
+/// Publishes a proven legacy pak-only payload as a byte-preserved candidate
+/// with a canonical `~mods` install layout. The fail-closed probe is re-run at
+/// update time; nothing is structurally rebuilt.
+fn run_legacy_pak_passthrough_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let adapter = LEGACY_PAK_PASSTHROUGH_ADAPTER;
+    stage(callback, 1, "Hashing the source and validating the current game");
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let input_type = if mod_input.is_file() {
+        "archive"
+    } else {
+        "directory"
+    };
+    let input_hash = if mod_input.is_file() {
+        sha256_file(&mod_input)?
+    } else {
+        sha256_directory(&mod_input)?
+    };
+    let game = validate_game_install(&request.game_root, "native UI");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    if !request.output_parent.is_dir() {
+        bail!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        );
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let output_directory = request.output_parent.join(format!(
+        "{}-current-candidate-{stamp}",
+        safe_leaf(&mod_input)
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    if output_directory.exists() || output_archive.exists() {
+        bail!("timestamped output already exists; wait one second and try again");
+    }
+    if request.persist_settings {
+        save_settings(&game.root, &request.output_parent)?;
+    }
+
+    stage(
+        callback,
+        2,
+        "Re-proving the fail-closed legacy pak passthrough contract",
+    );
+    let summary = probe_legacy_pak_passthrough_input(&mod_input, &game.root)?;
+
+    stage(
+        callback,
+        3,
+        "Publishing byte-preserved paks into the ~mods install layout",
+    );
+    fs::create_dir_all(&output_directory)?;
+    let mappings = publish_passthrough_paks(&mod_input, &summary, &output_directory)?;
+
+    stage(
+        callback,
+        4,
+        "Re-verifying published pak hashes against the probe evidence",
+    );
+    if mappings.len() != summary.pak_count {
+        bail!(
+            "published {} pak(s) but the probe proved {}",
+            mappings.len(),
+            summary.pak_count
+        );
+    }
+    for pak in &summary.paks {
+        let published = output_directory.join(pak.install_relative_path.replace('/', "\\"));
+        if sha256_file(&published)? != pak.pak_sha256 {
+            bail!(
+                "published pak {} does not byte-match its verified source",
+                pak.file_name
+            );
+        }
+    }
+
+    stage(callback, 5, "Writing the passthrough update report");
+    let report_path = output_directory.join("legacy-pak-passthrough-update-report.json");
+    let install_plan = summary
+        .paks
+        .iter()
+        .map(|pak| {
+            json!({
+                "sourceRelativePath": pak.source_relative_path,
+                "candidateRelativePath": pak.install_relative_path,
+                "gameRelativeDestination": pak.install_relative_path,
+                "pakSha256": pak.pak_sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let report = json!({
+        "schema": "obr-legacy-pak-passthrough-update-report",
+        "version": 1,
+        "implementation": "native-rust",
+        "adapter": adapter,
+        "generatedAt": chrono::Utc::now().to_rfc3339(),
+        "status": "candidate_ready_for_runtime_test",
+        "structurallyVerified": true,
+        "runtimeVerified": false,
+        "source": {
+            "inputType": input_type,
+            "inputPath": mod_input,
+            "inputSha256": input_hash,
+        },
+        "target": {
+            "gameRoot": game.root,
+            "mainPak": summary.current_game.pak_file_name,
+            "mainPakIndexVersion": summary.current_game.pak_index_version,
+            "currentWwiseMediaFileCount": summary.current_game.wwise_media_file_count,
+        },
+        "identity": {
+            "pakCount": summary.pak_count,
+            "entryCount": summary.entry_count,
+            "contentPlanes": summary.content_planes,
+            "matchedCurrentMediaCount": summary.matched_current_media_count,
+        },
+        "passthrough": serde_json::to_value(&summary)?,
+        "installPlan": install_plan,
+        "output": {
+            "directory": output_directory,
+            "archive": output_archive,
+        },
+        "verification": {
+            "payloadBytePreserved": true,
+            "structurallyRebuilt": false,
+            "indexSha1Verified": true,
+            "entryStoredPayloadSha1Verified": true,
+            "zlibRoundtripVerified": true,
+            "mountAndEntryPathShapeVerified": true,
+            "currentGameMediaTargetsVerified": true,
+            "productionRuntimeGateRequired": true,
+            "note": "This candidate is a version-passthrough: the source pak bytes are preserved exactly and nothing is structurally rebuilt for the current game version. Container integrity, per-entry stored-payload hashes, zlib roundtrips, mount/path shape, the Wwise audio media plane, and presence of every media ID in the current game's shipped pak index are proven; in-game behavior is not. It is not called runtime verified until a shipping-game run proves the replaced audio plays correctly."
+        },
+        "disclosures": summary.disclosures,
+    });
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+
+    stage(callback, 6, "Creating portable passthrough candidate archive");
+    create_zip_from_paths(
+        &output_archive,
+        &output_directory,
+        std::slice::from_ref(&output_directory),
+    )?;
+    if !output_archive.is_file() {
+        bail!(
+            "output archive was not created: {}",
+            output_archive.display()
+        );
+    }
+    stage(
+        callback,
+        7,
+        "Byte-preserving passthrough complete; shipping-game test still required",
+    );
+    Ok(UpdateOutcome {
+        adapter: adapter.to_owned(),
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: summary.entry_count,
+    })
 }
 
 fn nested_adapter_owns_logical_destinations(

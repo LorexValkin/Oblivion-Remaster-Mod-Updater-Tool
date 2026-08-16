@@ -709,3 +709,74 @@ fn updates_current_heterogeneous_replacement_fixture() {
         true
     );
 }
+
+#[test]
+#[ignore = "requires an installed game and a local legacy pak-only fixture archive"]
+fn publishes_current_legacy_pak_passthrough_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: "native-legacy-pak-passthrough-v1".to_owned(),
+            mod_input: required("OBR_TEST_PAK_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| panic!("passthrough update failed:\n{error:#}\n{}", log.join("\n")));
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    assert_eq!(outcome.adapter, "native-legacy-pak-passthrough-v1");
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&outcome.report_path).unwrap()).unwrap();
+    assert_eq!(report["schema"], "obr-legacy-pak-passthrough-update-report");
+    assert_eq!(report["status"], "candidate_ready_for_runtime_test");
+    assert_eq!(report["structurallyVerified"], true);
+    assert_eq!(report["runtimeVerified"], false);
+    assert_eq!(report["verification"]["payloadBytePreserved"], true);
+    assert_eq!(report["verification"]["structurallyRebuilt"], false);
+    assert_eq!(report["verification"]["productionRuntimeGateRequired"], true);
+    assert_eq!(
+        report["identity"]["contentPlanes"],
+        serde_json::json!(["wwise-audio-media"])
+    );
+    let entry_count = report["identity"]["entryCount"].as_u64().unwrap();
+    assert!(entry_count > 0);
+    assert_eq!(
+        report["identity"]["matchedCurrentMediaCount"]
+            .as_u64()
+            .unwrap(),
+        entry_count
+    );
+    // Every published pak must byte-match the hash proven by the probe.
+    for pak in report["passthrough"]["paks"].as_array().unwrap() {
+        let candidate = outcome.output_directory.join(
+            pak["installRelativePath"]
+                .as_str()
+                .unwrap()
+                .replace('/', "\\"),
+        );
+        assert!(candidate.is_file(), "missing candidate pak {candidate:?}");
+        assert_eq!(
+            obr_mod_updater::archive::sha256_file(&candidate).unwrap(),
+            pak["pakSha256"].as_str().unwrap()
+        );
+        assert!(
+            pak["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["contentPlane"] == "wwise-audio-media"
+                    && entry["storedPayloadSha1Verified"] == true
+                    && entry["currentGameMediaPresent"] == true)
+        );
+    }
+}

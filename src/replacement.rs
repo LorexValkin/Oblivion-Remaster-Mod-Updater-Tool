@@ -1025,7 +1025,13 @@ where
     Ok(containers)
 }
 
-fn unique_container_parent(root: &Path) -> Result<PathBuf> {
+/// Resolves the composite container root: the deepest directory that contains
+/// every UTOC in the staged input. Container triples may live in different
+/// physical folders (multi-part armor sets ship one triple per folder); the
+/// shared ancestor keeps container discovery, provider placement, and
+/// relative-path reporting anchored to one root. An input with no UTOC at all
+/// fails closed.
+fn composite_container_root(root: &Path) -> Result<PathBuf> {
     let mut parents = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -1043,13 +1049,22 @@ fn unique_container_parent(root: &Path) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
-    if parents.len() != 1 {
-        bail!(
-            "composite input requires every container triple in one physical folder; found {} folders",
-            parents.len()
-        );
+    if parents.is_empty() {
+        bail!("composite input contains no container triples");
     }
-    Ok(parents.remove(0))
+    let mut ancestor = parents.remove(0);
+    for parent in &parents {
+        while !parent.starts_with(&ancestor) {
+            let Some(next) = ancestor.parent() else {
+                bail!("composite container folders share no common root");
+            };
+            ancestor = next.to_path_buf();
+        }
+    }
+    if !ancestor.starts_with(root) {
+        bail!("composite container folders escape the staged input root");
+    }
+    Ok(ancestor)
 }
 
 fn inspect_staged_for_scope(
@@ -1695,6 +1710,79 @@ pub fn inspect_heterogeneous_replacement_staged(
     })
 }
 
+/// Enforces composite package uniqueness across containers and returns the
+/// package IDs that are exact duplicates (same ID and same path in more than
+/// one container) for byte-identity proof. Any other overlap — one ID with
+/// two paths, or one path with two IDs — stays a hard failure.
+fn verify_composite_package_uniqueness(packages: &[PackageEntry]) -> Result<BTreeSet<u64>> {
+    let mut path_ids = HashMap::<String, u64>::new();
+    for package in packages {
+        let key = package.path.to_ascii_lowercase();
+        if let Some(existing) = path_ids.get(&key) {
+            if *existing != package.package_id {
+                bail!(
+                    "composite replacement path {} appears with two package IDs",
+                    package.path
+                );
+            }
+        } else {
+            path_ids.insert(key, package.package_id);
+        }
+    }
+    let mut duplicates = BTreeSet::new();
+    for pair in packages.windows(2) {
+        if pair[0].package_id != pair[1].package_id {
+            continue;
+        }
+        if !pair[0].path.eq_ignore_ascii_case(&pair[1].path) {
+            bail!(
+                "composite replacement package ID {} appears with two paths: {} and {}",
+                pair[0].package_id,
+                pair[0].path,
+                pair[1].path
+            );
+        }
+        duplicates.insert(pair[0].package_id);
+    }
+    Ok(duplicates)
+}
+
+/// Proves that every container carrying a duplicated composite package stores
+/// byte-identical content: identical package-store rows (path and imported
+/// package IDs) and identical raw chunk sets hashed chunk by chunk. Any
+/// divergence names the containers and fails closed.
+fn verify_identical_duplicate_carriers(
+    package_id: u64,
+    store_rows: &[(String, PackageStoreEntry)],
+    carriers: &[(String, BTreeMap<String, String>)],
+) -> Result<()> {
+    if carriers.len() < 2 || store_rows.len() != carriers.len() {
+        bail!("duplicated composite package {package_id} lost its carrier evidence");
+    }
+    let (first_container, first_row) = &store_rows[0];
+    for (container, row) in &store_rows[1..] {
+        if !row.path.eq_ignore_ascii_case(&first_row.path)
+            || row.imported_package_ids != first_row.imported_package_ids
+        {
+            bail!(
+                "containers {first_container} and {container} disagree on the package-store row of duplicated package {package_id}"
+            );
+        }
+    }
+    let (first_carrier, first_hashes) = &carriers[0];
+    if first_hashes.is_empty() {
+        bail!("duplicated composite package {package_id} has no raw chunks in {first_carrier}");
+    }
+    for (carrier, hashes) in &carriers[1..] {
+        if hashes != first_hashes {
+            bail!(
+                "containers {first_carrier} and {carrier} store different bytes for duplicated package {package_id}; identical-path duplicates must be byte-identical"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn inspect_composite_package_staged(
     root: &Path,
     game_root: &Path,
@@ -1720,12 +1808,49 @@ pub fn inspect_composite_package_staged(
                 .cmp(&right.path.to_ascii_lowercase()),
         )
     });
-    for pair in packages.windows(2) {
-        if pair[0].package_id == pair[1].package_id
-            || pair[0].path.eq_ignore_ascii_case(&pair[1].path)
-        {
-            bail!("composite replacement packages must have unique paths and package IDs");
+    let duplicate_ids = verify_composite_package_uniqueness(&packages)?;
+    if !duplicate_ids.is_empty() {
+        // Multi-folder container sets may repeat a shared package (one texture
+        // carried by several sibling containers). That is accepted only with a
+        // byte-identity proof: every carrier must store the same package-store
+        // row and the same raw chunk set, hashed chunk by chunk.
+        let duplicate_work = tempfile::Builder::new()
+            .prefix("obr-composite-duplicate-proof-")
+            .tempdir()?;
+        for package_id in &duplicate_ids {
+            let mut store_rows = Vec::new();
+            let mut carriers = Vec::new();
+            for container in &containers {
+                if !container
+                    .packages
+                    .iter()
+                    .any(|package| package.package_id == *package_id)
+                {
+                    continue;
+                }
+                let row = container
+                    .package_store
+                    .iter()
+                    .find(|entry| entry.package_id == *package_id)
+                    .context("duplicate composite package lost its package-store row")?;
+                store_rows.push((container.name.clone(), row.clone()));
+                let hashes = retoc.package_chunk_hashes(
+                    &container.utoc,
+                    *package_id,
+                    &duplicate_work
+                        .path()
+                        .join(&container.name)
+                        .join(package_id.to_string()),
+                )?;
+                carriers.push((container.name.clone(), hashes));
+            }
+            verify_identical_duplicate_carriers(*package_id, &store_rows, &carriers)?;
         }
+        let mut seen_duplicate_ids = HashSet::new();
+        packages.retain(|package| {
+            !duplicate_ids.contains(&package.package_id)
+                || seen_duplicate_ids.insert(package.package_id)
+        });
     }
 
     if !target_utoc.is_file() {
@@ -3091,6 +3216,19 @@ pub(crate) fn extract_composite_packages_exact(
                 }
             }
         }
+        // Retoc package filters match by name prefix, so a bare package-root
+        // request can co-extract longer-named bare siblings (a Cuirass filter
+        // also matches Cuirass_Old) into the staging root. Those files belong
+        // to other requests — each proven in its own iteration — and are never
+        // copied to the output; the requested alias itself was already moved
+        // to its canonical destination above. Clear the leftovers so path
+        // enumeration stays canonical.
+        for entry in fs::read_dir(single.path())? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                fs::remove_file(entry.path())?;
+            }
+        }
         let extracted_paths = extracted_uasset_paths(single.path())?;
         if !extracted_paths.contains(&expected_path) {
             bail!(
@@ -3930,7 +4068,7 @@ pub fn probe_identity_alias_recovery(
         .tempdir()?;
     let staged = work.path().join("source");
     stage_input(mod_input, &staged)?;
-    let container_root = unique_container_parent(&staged)?;
+    let container_root = composite_container_root(&staged)?;
     let retoc = RetocTool::materialize()?;
     let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
     let source_view = create_additive_probe_view(game_root)?;
@@ -4002,7 +4140,7 @@ pub fn probe_composite_package_input(
     let staged = work.path().join("source");
     let legacy = work.path().join("legacy");
     stage_input(mod_input, &staged)?;
-    let container_root = unique_container_parent(&staged)?;
+    let container_root = composite_container_root(&staged)?;
     let retoc = RetocTool::materialize()?;
     let inspection = inspect_composite_package_staged(&container_root, game_root, &retoc)?;
     for package in &inspection.packages {
@@ -4034,32 +4172,33 @@ pub fn probe_composite_package_input(
         source_view.path(),
         &work.path().join("identity-recovery"),
     )?;
-    for container in &inspection.containers {
-        let packages = container
-            .packages
-            .iter()
-            .map(|package| {
-                Ok((
-                    package.clone(),
-                    composite_effective_package_path(package, &inspection)?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let source_utocs = inspection
-            .containers
-            .iter()
-            .map(|container| container.utoc.clone())
-            .collect::<Vec<_>>();
-        extract_source_composite_packages_with_fallback(
-            &retoc,
-            source_view.path(),
-            current_view.path(),
-            &source_utocs,
-            &legacy,
-            &packages,
-            "composite source extraction",
-        )?;
-    }
+    // One extraction pass over the deduplicated package inventory: byte-proven
+    // duplicates shared by several containers extract once, and every request
+    // still resolves through the same exclusive-then-layered discipline.
+    let extraction_requests = inspection
+        .packages
+        .iter()
+        .map(|package| {
+            Ok((
+                package.clone(),
+                composite_effective_package_path(package, &inspection)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let source_utocs = inspection
+        .containers
+        .iter()
+        .map(|container| container.utoc.clone())
+        .collect::<Vec<_>>();
+    extract_source_composite_packages_with_fallback(
+        &retoc,
+        source_view.path(),
+        current_view.path(),
+        &source_utocs,
+        &legacy,
+        &extraction_requests,
+        "composite source extraction",
+    )?;
     let mut available_dependencies = inspection.target_dependencies.clone();
     for package in &inspection.packages {
         available_dependencies
@@ -4649,6 +4788,116 @@ mod tests {
         assert_eq!(
             recovered_dependency_route("SK_Chainmail_Cuirass_f_Physics"),
             None
+        );
+    }
+
+    #[test]
+    fn composite_container_root_spans_multiple_folders() {
+        let staged = tempfile::tempdir().unwrap();
+        let nested = staged.path().join("Set").join("Helmets").join("Imperial");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(staged.path().join("Set")).unwrap();
+        std::fs::write(staged.path().join("Set").join("Main_P.utoc"), b"x").unwrap();
+        std::fs::write(nested.join("Helm_P.utoc"), b"x").unwrap();
+        assert_eq!(
+            composite_container_root(staged.path()).unwrap(),
+            staged.path().join("Set")
+        );
+        // A single folder keeps resolving to itself.
+        std::fs::remove_file(nested.join("Helm_P.utoc")).unwrap();
+        assert_eq!(
+            composite_container_root(staged.path()).unwrap(),
+            staged.path().join("Set")
+        );
+        // No containers at all fails closed.
+        std::fs::remove_file(staged.path().join("Set").join("Main_P.utoc")).unwrap();
+        assert!(composite_container_root(staged.path()).is_err());
+    }
+
+    #[test]
+    fn composite_uniqueness_accepts_only_exact_duplicates() {
+        let package = |package_id: u64, path: &str| PackageEntry {
+            package_id,
+            path: path.to_owned(),
+        };
+        // Same ID and same path in two containers: returned for byte proof.
+        let duplicates = verify_composite_package_uniqueness(&[
+            package(1, "OblivionRemastered/Content/Art/A.uasset"),
+            package(1, "oblivionremastered/content/art/a.uasset"),
+            package(2, "OblivionRemastered/Content/Art/B.uasset"),
+        ])
+        .unwrap();
+        assert_eq!(duplicates.into_iter().collect::<Vec<_>>(), vec![1]);
+        // One ID with two paths is a hard failure.
+        assert!(
+            verify_composite_package_uniqueness(&[
+                package(1, "OblivionRemastered/Content/Art/A.uasset"),
+                package(1, "OblivionRemastered/Content/Art/B.uasset"),
+            ])
+            .is_err()
+        );
+        // One path with two IDs is a hard failure.
+        assert!(
+            verify_composite_package_uniqueness(&[
+                package(1, "OblivionRemastered/Content/Art/A.uasset"),
+                package(2, "OblivionRemastered/Content/Art/A.uasset"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn duplicate_carriers_require_identical_rows_and_chunk_hashes() {
+        let hashes = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(chunk, hash)| (chunk.to_string(), hash.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let row = |imports: &[u64]| ("A".to_owned(), store(1, "art/T_Shared.uasset", imports));
+        let row_b = |imports: &[u64]| ("B".to_owned(), store(1, "art/T_Shared.uasset", imports));
+        let identical = hashes(&[("aa00", "h1"), ("aa01", "h2")]);
+        verify_identical_duplicate_carriers(
+            1,
+            &[row(&[7]), row_b(&[7])],
+            &[
+                ("A".to_owned(), identical.clone()),
+                ("B".to_owned(), identical.clone()),
+            ],
+        )
+        .unwrap();
+        // Diverging chunk bytes fail closed.
+        assert!(
+            verify_identical_duplicate_carriers(
+                1,
+                &[row(&[7]), row_b(&[7])],
+                &[
+                    ("A".to_owned(), identical.clone()),
+                    ("B".to_owned(), hashes(&[("aa00", "h1"), ("aa01", "DIFFERENT")])),
+                ],
+            )
+            .is_err()
+        );
+        // Diverging package-store imports fail closed.
+        assert!(
+            verify_identical_duplicate_carriers(
+                1,
+                &[row(&[7]), row_b(&[8])],
+                &[
+                    ("A".to_owned(), identical.clone()),
+                    ("B".to_owned(), identical.clone()),
+                ],
+            )
+            .is_err()
+        );
+        // A single carrier is not a duplicate.
+        assert!(
+            verify_identical_duplicate_carriers(
+                1,
+                &[row(&[7])],
+                &[("A".to_owned(), identical.clone())]
+            )
+            .is_err()
         );
     }
 

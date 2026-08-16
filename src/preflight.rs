@@ -1276,6 +1276,19 @@ fn analyze_internal(
                         .contains(&(edge.source_package_id, edge.missing_dependency_package_id))
                 })
         });
+    let mixed_unresolved_disclosed = !mixed_unresolved_recovered
+        && mixed_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|probe| {
+                !probe.dependencies.fully_resolved
+                    && !probe.dependencies.unresolved_edges.is_empty()
+                    && probe.dependencies.unresolved_edges.iter().all(|edge| {
+                        recovered_alias_pairs
+                            .contains(&(edge.source_package_id, edge.missing_dependency_package_id))
+                            || !edge.authored_package_names.is_empty()
+                    })
+            });
+    let mixed_unresolved_accepted = mixed_unresolved_recovered || mixed_unresolved_disclosed;
     let magicloader_syncmap_gate = if magic_loader_layout {
         Some(
             inspect_magicloader_syncmap_gate(
@@ -1323,7 +1336,7 @@ fn analyze_internal(
                 if probe.collision_count > 0 {
                     magicloader_lane_blockers.push("source-current-package-collisions".to_owned());
                 }
-                if !probe.dependencies.fully_resolved && !mixed_unresolved_recovered {
+                if !probe.dependencies.fully_resolved && !mixed_unresolved_accepted {
                     magicloader_lane_blockers.push("mixed-zen-dependencies-unresolved".to_owned());
                 }
             }
@@ -2049,7 +2062,7 @@ fn analyze_internal(
                     .join("; ");
                 checks.push(CheckResult {
                 id: "mixed-iostore-dependency-closure".to_owned(),
-                status: if probe.dependencies.fully_resolved || mixed_unresolved_recovered {
+                status: if probe.dependencies.fully_resolved || mixed_unresolved_accepted {
                     "pass"
                 } else {
                     "warning"
@@ -2068,13 +2081,20 @@ fn analyze_internal(
                         probe.dependencies.dependency_edge_count,
                         probe.dependencies.unresolved_edge_count
                     )
+                } else if mixed_unresolved_disclosed {
+                    format!(
+                        "Resolved {}/{} package dependency edge(s) directly; the remaining {} unresolved import(s) have disclosed authored names and are accepted as non-blocking runtime references: {unresolved_summary}",
+                        probe.dependencies.resolved_edge_count,
+                        probe.dependencies.dependency_edge_count,
+                        probe.dependencies.unresolved_edge_count
+                    )
                 } else {
                     format!(
                         "Found {} unresolved package dependency edge(s): {unresolved_summary}",
                         probe.dependencies.unresolved_edge_count
                     )
                 },
-                remediation: (!probe.dependencies.fully_resolved && !mixed_unresolved_recovered).then(|| {
+                remediation: (!probe.dependencies.fully_resolved && !mixed_unresolved_accepted).then(|| {
                     "Use a current-version mod package that removes the stale assets, or wait for a class- and shader-aware repair adapter; unresolved package IDs are never dropped automatically."
                         .to_owned()
                 }),
@@ -2185,15 +2205,25 @@ fn analyze_internal(
         ));
         let dependency_closure = mixed_iostore_dependency_probe
             .as_ref()
-            .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+            .is_some_and(|probe| {
+                probe.collision_count == 0
+                    && (probe.dependencies.fully_resolved || mixed_unresolved_accepted)
+            })
             || composite_package_probe.is_some();
         let failure = mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| {
-                format!(
-                    "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the guarded composite identity-recovery contract.",
-                    probe.collision_count, probe.dependencies.unresolved_edge_count
-                )
+                if mixed_unresolved_accepted && probe.collision_count == 0 {
+                    format!(
+                        "The additive package set has {} disclosed unresolved dependency edge(s) accepted as non-blocking runtime references.",
+                        probe.dependencies.unresolved_edge_count
+                    )
+                } else {
+                    format!(
+                        "The additive package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the guarded composite identity-recovery contract.",
+                        probe.collision_count, probe.dependencies.unresolved_edge_count
+                    )
+                }
             })
             .unwrap_or_else(|| {
                 "The additive package dependency closure could not be inspected against the current game."
@@ -2257,15 +2287,25 @@ fn analyze_internal(
         ));
         let dependency_closure = mixed_iostore_dependency_probe
             .as_ref()
-            .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+            .is_some_and(|probe| {
+                probe.collision_count == 0
+                    && (probe.dependencies.fully_resolved || mixed_unresolved_accepted)
+            })
             || composite_package_probe.is_some();
         let failure = mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| {
-                format!(
-                    "The mixed-plane package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the guarded composite identity-recovery contract.",
-                    probe.collision_count, probe.dependencies.unresolved_edge_count
-                )
+                if mixed_unresolved_accepted && probe.collision_count == 0 {
+                    format!(
+                        "The mixed-plane package set has {} disclosed unresolved dependency edge(s) accepted as non-blocking runtime references.",
+                        probe.dependencies.unresolved_edge_count
+                    )
+                } else {
+                    format!(
+                        "The mixed-plane package set has {} source/current collision(s) and {} unresolved dependency edge(s), and those edges did not pass the guarded composite identity-recovery contract.",
+                        probe.collision_count, probe.dependencies.unresolved_edge_count
+                    )
+                }
             })
             .unwrap_or_else(|| {
                 mixed_iostore_dependency_probe_error
@@ -2534,7 +2574,10 @@ fn analyze_internal(
         .collect::<Vec<_>>();
     let additive_dependency_closure = mixed_iostore_dependency_probe
         .as_ref()
-        .is_some_and(|probe| probe.collision_count == 0 && probe.dependencies.fully_resolved)
+        .is_some_and(|probe| {
+            probe.collision_count == 0
+                && (probe.dependencies.fully_resolved || mixed_unresolved_accepted)
+        })
         || ((additive_shape || mixed_composite_shape) && composite_package_probe.is_some());
     let additive_can_update =
         additive_shape && additive_dependency_closure && adapter_blockers.is_empty();
@@ -2906,10 +2949,11 @@ fn analyze_internal(
         disposition_blockers.extend(plugin.blockers.iter().cloned());
     }
     if let Some(layered) = layered_iostore_dependency_probe.as_ref() {
-        if mixed_unresolved_recovered {
-            // Every unresolved layered edge is covered by the disclosed, role-proven
-            // identity-alias recovery reported in identityAliasRecoveryProbe; only the
-            // uncovered blockers remain dispositive.
+        let layered_deps_accepted = mixed_unresolved_accepted
+            || !mixed_iostore_dependency_probe
+                .as_ref()
+                .is_some_and(|probe| !probe.dependencies.fully_resolved);
+        if layered_deps_accepted {
             disposition_blockers.extend(
                 layered
                     .blockers
@@ -2944,7 +2988,10 @@ fn analyze_internal(
     } else if layered_iostore_dependency_probe
         .as_ref()
         .is_some_and(|report| !report.resolution_complete)
-        && !mixed_unresolved_recovered
+        && !mixed_unresolved_accepted
+        && mixed_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|probe| !probe.dependencies.fully_resolved)
     {
         (
             "dependency-closure-unresolved",

@@ -2834,7 +2834,12 @@ fn analyze_internal(
         blockers: mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| probe.blockers.clone())
-            .unwrap_or_else(|| vec!["mixed-iostore-dependency-probe-not-run".to_owned()]),
+            .unwrap_or_else(|| {
+                vec![mixed_iostore_dependency_probe_error.clone().map_or_else(
+                    || "mixed-iostore-dependency-probe-not-run".to_owned(),
+                    |error| format!("mixed-iostore-dependency-probe-failed: {error}"),
+                )]
+            }),
     });
     capabilities.push(Capability {
         id: MIXED_REPLACEMENT_PACKAGE_DIAGNOSTIC_API.to_owned(),
@@ -2986,7 +2991,12 @@ fn analyze_internal(
         blockers: if composite_package_probe.is_some() {
             adapter_blockers.clone()
         } else {
-            vec!["packages-did-not-pass-the-system-wide-composite-rebase-contract".to_owned()]
+            vec![composite_package_probe_error.clone().map_or_else(
+                || "packages-did-not-pass-the-system-wide-composite-rebase-contract".to_owned(),
+                |error| {
+                    format!("packages-did-not-pass-the-system-wide-composite-rebase-contract: {error}")
+                },
+            )]
         },
     });
     capabilities.push(Capability {

@@ -10,6 +10,7 @@ pub mod installer;
 pub mod mixed;
 pub mod modlist;
 pub mod offhand_export;
+pub mod pak;
 pub mod plugin;
 pub mod preflight;
 pub mod replacement;

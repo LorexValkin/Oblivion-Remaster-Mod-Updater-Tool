@@ -130,7 +130,14 @@ pub struct CompositeDonorRebindPlan {
 
 #[derive(Clone, Debug)]
 pub struct CompositeIdentityRecovery {
+    /// Persistent alias provider container. Ships with the candidate because
+    /// live rebuilt imports keep referencing its aliased identities.
     pub provider: Option<CompositeIdentityAliasProvider>,
+    /// Rebuild-only provider for temporary optional-component identities.
+    /// Mounted into extraction views so stale imports resolve during the
+    /// dependency-complete rebuild, and never shipped: every suppression
+    /// rewrites its consumer import to a bundled package before publication.
+    pub temporary_provider: Option<CompositeIdentityAliasProvider>,
     pub aliases: Vec<CompositeIdentityAliasPlan>,
     pub suppressions: Vec<CompositeOptionalDependencySuppressionPlan>,
     pub donor_rebinds: Vec<CompositeDonorRebindPlan>,
@@ -1086,6 +1093,7 @@ fn container_parent_folders(root: &Path) -> Result<Vec<PathBuf>> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
+<<<<<<< HEAD
     if parents.is_empty() {
         bail!("composite input contains no container triples");
     }
@@ -1107,6 +1115,44 @@ fn composite_container_root(root: &Path) -> Result<PathBuf> {
         bail!("composite container folders escape the staged input root");
     }
     Ok(ancestor)
+=======
+    if parents.len() == 1 {
+        return Ok(parents.remove(0));
+    }
+    // Canonical mixed layouts split container folders below one Content/Paks
+    // boundary (for example `~mods` plus a nested `LogicMods` mod folder).
+    // Container discovery walks recursively and keys identity by container
+    // stem, so the shared Content/Paks root is an equally exact scope.
+    let mut paks_roots = parents
+        .iter()
+        .filter_map(|parent| {
+            let mut current = Some(parent.as_path());
+            while let Some(path) = current {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Paks"))
+                    && path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Content"))
+                {
+                    return Some(path.to_path_buf());
+                }
+                current = path.parent();
+            }
+            None
+        })
+        .collect::<Vec<_>>();
+    paks_roots.sort();
+    paks_roots.dedup();
+    if paks_roots.len() == 1 && parents.len() > 1 {
+        return Ok(paks_roots.remove(0));
+    }
+    bail!(
+        "composite input requires every container triple in one physical folder or below one Content/Paks root; found {} folders",
+        parents.len()
+    )
+>>>>>>> worktree-agent-a8367ae53aeaed092
 }
 
 fn inspect_staged_for_scope(
@@ -1752,6 +1798,7 @@ pub fn inspect_heterogeneous_replacement_staged(
     })
 }
 
+<<<<<<< HEAD
 /// Enforces composite package uniqueness across containers and returns the
 /// package IDs that are exact duplicates (same ID and same path in more than
 /// one container) for byte-identity proof. Any other overlap — one ID with
@@ -1823,6 +1870,62 @@ fn verify_identical_duplicate_carriers(
         }
     }
     Ok(())
+=======
+/// Pools per-container composite packages into one identity view. Authors
+/// sometimes cook the same package into more than one shipped container;
+/// under equal mount order that duplication is benign and every copy is
+/// preserved by the per-container rebuild, so entries whose package ID,
+/// case-insensitive path, and import set all agree are deduplicated here.
+/// Any partial identity overlap remains fail-closed.
+pub(crate) fn pool_unique_composite_packages(
+    packages: Vec<PackageEntry>,
+    package_store: &[PackageStoreEntry],
+) -> Result<Vec<PackageEntry>> {
+    let mut imports_by_id = HashMap::<u64, BTreeSet<u64>>::new();
+    for row in package_store {
+        let imports = row
+            .imported_package_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some(existing) = imports_by_id.get(&row.package_id) {
+            if *existing != imports {
+                bail!("composite replacement packages must have unique paths and package IDs");
+            }
+        } else {
+            imports_by_id.insert(row.package_id, imports);
+        }
+    }
+    let mut pooled: Vec<PackageEntry> = Vec::new();
+    let mut kept_by_id = HashMap::<u64, String>::new();
+    for package in packages {
+        match kept_by_id.get(&package.package_id) {
+            Some(kept_path) => {
+                if !kept_path.eq_ignore_ascii_case(&package.path) {
+                    bail!(
+                        "composite replacement packages must have unique paths and package IDs"
+                    );
+                }
+            }
+            None => {
+                kept_by_id.insert(package.package_id, package.path.clone());
+                pooled.push(package);
+            }
+        }
+    }
+    let mut sorted = pooled.clone();
+    sorted.sort_by(|left, right| {
+        left.path
+            .to_ascii_lowercase()
+            .cmp(&right.path.to_ascii_lowercase())
+    });
+    for pair in sorted.windows(2) {
+        if pair[0].path.eq_ignore_ascii_case(&pair[1].path) {
+            bail!("composite replacement packages must have unique paths and package IDs");
+        }
+    }
+    Ok(pooled)
+>>>>>>> worktree-agent-a8367ae53aeaed092
 }
 
 pub fn inspect_composite_package_staged(
@@ -1863,6 +1966,7 @@ pub fn inspect_composite_package_staged_with_dependencies_multi(
 ) -> Result<ReplacementInspection> {
     let target_utoc =
         game_root.join(r"OblivionRemastered\Content\Paks\OblivionRemastered-Windows.utoc");
+<<<<<<< HEAD
     if roots.is_empty() {
         bail!("composite inspection requires at least one container folder");
     }
@@ -1885,12 +1989,27 @@ pub fn inspect_composite_package_staged_with_dependencies_multi(
         }
     }
     let mut packages = containers
+=======
+    let containers =
+        discover_containers_with_current(root, retoc, ReplacementScope::CompositePackage, || {
+            Ok(retoc.package_store_entries(&target_utoc)?.1)
+        })?;
+    let pooled_store = containers
+>>>>>>> worktree-agent-a8367ae53aeaed092
         .iter()
-        .flat_map(|container| container.packages.iter().cloned())
+        .flat_map(|container| container.package_store.iter().cloned())
         .collect::<Vec<_>>();
+    let packages = pool_unique_composite_packages(
+        containers
+            .iter()
+            .flat_map(|container| container.packages.iter().cloned())
+            .collect(),
+        &pooled_store,
+    )?;
     if packages.is_empty() || packages.len() > MAX_REPLACEMENT_PACKAGES {
         bail!("composite replacement input must contain 1..={MAX_REPLACEMENT_PACKAGES} packages");
     }
+<<<<<<< HEAD
     packages.sort_by(|left, right| {
         left.package_id.cmp(&right.package_id).then(
             left.path
@@ -1942,6 +2061,8 @@ pub fn inspect_composite_package_staged_with_dependencies_multi(
                 || seen_duplicate_ids.insert(package.package_id)
         });
     }
+=======
+>>>>>>> worktree-agent-a8367ae53aeaed092
 
     if !target_utoc.is_file() {
         bail!("current game stock package store is unavailable");
@@ -2331,6 +2452,7 @@ fn composite_alias_candidate(
         .filter_map(|package_id| source_store.get(package_id))
         .filter(|entry| bundled_mesh_leaf(&entry.path))
         .collect::<Vec<_>>();
+<<<<<<< HEAD
     let consumer_is_mesh = bundled_mesh_leaf(&consumer.path);
     if direct_meshes.is_empty() && !consumer_is_mesh {
         bail!(
@@ -2340,6 +2462,19 @@ fn composite_alias_candidate(
     let mut main_dependencies = direct_meshes
         .iter()
         .flat_map(|entry| entry.imported_package_ids.iter().copied())
+=======
+    if direct_meshes.is_empty() {
+        bail!(
+            "identity recovery requires at least one bundled primary StaticMesh dependency; found 0"
+        );
+    }
+    // A consumer may bundle several primary meshes (blade plus scabbard); any
+    // of them may carry the structural link to the recovered dependency, and
+    // the final exactly-one-candidate gate still fails closed on ambiguity.
+    let main_dependencies = direct_meshes
+        .iter()
+        .flat_map(|mesh| mesh.imported_package_ids.iter().copied())
+>>>>>>> worktree-agent-a8367ae53aeaed092
         .collect::<HashSet<_>>();
     if direct_meshes.is_empty() {
         main_dependencies.extend(consumer.imported_package_ids.iter().copied());
@@ -2501,6 +2636,83 @@ fn authoritative_alias_source_identity(
     })
 }
 
+/// Builds one identity provider container from a staged legacy root and
+/// mounts it into the extraction source view. The provider inventory must
+/// equal exactly the recovered target IDs it was staged for.
+fn build_composite_identity_provider(
+    retoc: &RetocTool,
+    inspection: &ReplacementInspection,
+    source_view: &Path,
+    provider_root: &Path,
+    legacy_root: &Path,
+    name_prefix: &str,
+    target_ids: &BTreeSet<u64>,
+) -> Result<Option<CompositeIdentityAliasProvider>> {
+    if target_ids.is_empty() {
+        return Ok(None);
+    }
+    let provider_hash = sha256_bytes(
+        target_ids
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("|")
+            .as_bytes(),
+    );
+    let provider_name = format!("{name_prefix}_{}_P", &provider_hash[..12]);
+    fs::create_dir_all(provider_root)?;
+    let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
+    let result = retoc.run([
+        OsString::from("to-zen"),
+        OsString::from("--version"),
+        OsString::from("UE5_3"),
+        legacy_root.as_os_str().to_owned(),
+        provider_utoc.as_os_str().to_owned(),
+    ])?;
+    RetocTool::assert_success(&result, "identity alias provider rebuild")?;
+    let provider_ucas = provider_utoc.with_extension("ucas");
+    let provider_pak = provider_utoc.with_extension("pak");
+    for path in [&provider_utoc, &provider_ucas, &provider_pak] {
+        if !path.is_file() {
+            bail!("identity alias provider is incomplete: {}", path.display());
+        }
+        copy_probe_file(
+            path,
+            &source_view.join(
+                path.file_name()
+                    .context("identity alias provider has no filename")?,
+            ),
+        )?;
+    }
+    retoc.verify(&provider_utoc, "identity alias provider")?;
+    let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
+    if provider_packages
+        .iter()
+        .map(|package| package.package_id)
+        .collect::<BTreeSet<_>>()
+        != *target_ids
+    {
+        bail!("identity alias provider inventory does not match recovered target IDs");
+    }
+    let first_container = inspection
+        .containers
+        .first()
+        .context("identity recovery has no source container")?;
+    let relative_utoc = first_container
+        .relative_utoc
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{provider_name}.utoc"));
+    Ok(Some(CompositeIdentityAliasProvider {
+        provider_name,
+        provider_utoc,
+        provider_ucas,
+        provider_pak,
+        legacy_root: legacy_root.to_path_buf(),
+        relative_utoc,
+    }))
+}
+
 pub fn recover_composite_package_identities(
     inspection: &ReplacementInspection,
     retoc: &RetocTool,
@@ -2539,6 +2751,11 @@ pub fn recover_composite_package_identities(
     fs::create_dir_all(work)?;
     let alias_legacy = work.join("legacy");
     fs::create_dir_all(&alias_legacy)?;
+    // Temporary optional-component identities never ship, so they are staged
+    // in their own legacy root and built into a separate rebuild-only
+    // provider container instead of the persistent alias provider.
+    let temporary_legacy = work.join("temporary-legacy");
+    fs::create_dir_all(&temporary_legacy)?;
     let mut recovered_targets =
         HashMap::<u64, (String, String, PackageEntry, PackageIdentityAlias, bool)>::new();
     let mut pending = Vec::<(u64, u64, String, String, PackageEntry, bool)>::new();
@@ -2726,7 +2943,11 @@ pub fn recover_composite_package_identities(
                 &target_name,
                 target_id,
                 expected_class,
-                &alias_legacy,
+                if suppress_optional_component {
+                    &temporary_legacy
+                } else {
+                    &alias_legacy
+                },
                 &work.join("aliases").join(target_id.to_string()),
             )?;
             recovered_targets.insert(
@@ -2750,75 +2971,34 @@ pub fn recover_composite_package_identities(
         ));
     }
 
-    let provider = if recovered_targets.is_empty() {
-        // Every missing edge was routed to a current-donor rebind, so no
-        // alias provider container is needed or built.
-        None
-    } else {
-        let mut target_ids = recovered_targets.keys().copied().collect::<Vec<_>>();
-        target_ids.sort_unstable();
-        let provider_hash = sha256_bytes(
-            target_ids
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join("|")
-                .as_bytes(),
-        );
-        let provider_name = format!("OBR_IdentityAliases_{}_P", &provider_hash[..12]);
-        let provider_root = work.join("provider");
-        fs::create_dir_all(&provider_root)?;
-        let provider_utoc = provider_root.join(format!("{provider_name}.utoc"));
-        let result = retoc.run([
-            OsString::from("to-zen"),
-            OsString::from("--version"),
-            OsString::from("UE5_3"),
-            alias_legacy.as_os_str().to_owned(),
-            provider_utoc.as_os_str().to_owned(),
-        ])?;
-        RetocTool::assert_success(&result, "identity alias provider rebuild")?;
-        let provider_ucas = provider_utoc.with_extension("ucas");
-        let provider_pak = provider_utoc.with_extension("pak");
-        for path in [&provider_utoc, &provider_ucas, &provider_pak] {
-            if !path.is_file() {
-                bail!("identity alias provider is incomplete: {}", path.display());
-            }
-            copy_probe_file(
-                path,
-                &source_view.join(
-                    path.file_name()
-                        .context("identity alias provider has no filename")?,
-                ),
-            )?;
-        }
-        retoc.verify(&provider_utoc, "identity alias provider")?;
-        let (_, provider_packages) = retoc.package_entries(&provider_utoc)?;
-        if provider_packages
-            .iter()
-            .map(|package| package.package_id)
-            .collect::<BTreeSet<_>>()
-            != target_ids.iter().copied().collect::<BTreeSet<_>>()
-        {
-            bail!("identity alias provider inventory does not match recovered target IDs");
-        }
-        let first_container = inspection
-            .containers
-            .first()
-            .context("identity recovery has no source container")?;
-        let relative_utoc = first_container
-            .relative_utoc
-            .parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(format!("{provider_name}.utoc"));
-        Some(CompositeIdentityAliasProvider {
-            provider_name,
-            provider_utoc,
-            provider_ucas,
-            provider_pak,
-            legacy_root: alias_legacy.clone(),
-            relative_utoc,
-        })
-    };
+    let persistent_ids = recovered_targets
+        .iter()
+        .filter(|(_, tuple)| !tuple.4)
+        .map(|(target_id, _)| *target_id)
+        .collect::<BTreeSet<_>>();
+    let temporary_ids = recovered_targets
+        .iter()
+        .filter(|(_, tuple)| tuple.4)
+        .map(|(target_id, _)| *target_id)
+        .collect::<BTreeSet<_>>();
+    let provider = build_composite_identity_provider(
+        retoc,
+        inspection,
+        source_view,
+        &work.join("provider"),
+        &alias_legacy,
+        "OBR_IdentityAliases",
+        &persistent_ids,
+    )?;
+    let temporary_provider = build_composite_identity_provider(
+        retoc,
+        inspection,
+        source_view,
+        &work.join("temporary-provider"),
+        &temporary_legacy,
+        "OBR_TemporaryProviders",
+        &temporary_ids,
+    )?;
 
     let mut aliases = Vec::new();
     let mut suppressions = Vec::new();
@@ -2900,11 +3080,6 @@ pub fn recover_composite_package_identities(
             .cmp(&right.target_package.package_id)
             .then(left.consumer_package_id.cmp(&right.consumer_package_id))
     });
-    if !aliases.is_empty() && !suppressions.is_empty() {
-        bail!(
-            "mixed persistent aliases and temporary optional-component providers require separate provider containers"
-        );
-    }
     donor_rebinds.sort_by(|left, right| {
         left.target_package_id
             .cmp(&right.target_package_id)
@@ -2912,6 +3087,7 @@ pub fn recover_composite_package_identities(
     });
     Ok(Some(CompositeIdentityRecovery {
         provider,
+        temporary_provider,
         aliases,
         suppressions,
         donor_rebinds,
@@ -3447,12 +3623,34 @@ pub(crate) fn extract_composite_packages_exact(
         }
     }
     let final_paths = extracted_uasset_paths(output)?;
-    let added = final_paths
-        .difference(&initial)
+    verify_exact_reconstruction(&initial, &final_paths, &expected, label)
+}
+
+/// The extraction above deliberately skips a requested package that a prior
+/// call into the same output directory already materialized, so reconstruction
+/// is proven by two properties: every requested package is present afterwards,
+/// and nothing outside the requested set was newly added.
+fn verify_exact_reconstruction(
+    initial: &BTreeSet<String>,
+    final_paths: &BTreeSet<String>,
+    expected: &BTreeSet<String>,
+    label: &str,
+) -> Result<()> {
+    let missing = expected
+        .difference(final_paths)
         .cloned()
-        .collect::<BTreeSet<_>>();
-    if added != expected {
-        bail!("{label} did not reconstruct the exact composite package set");
+        .collect::<Vec<_>>();
+    let unexpected = final_paths
+        .difference(initial)
+        .filter(|path| !expected.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        bail!(
+            "{label} did not reconstruct the exact composite package set; missing [{}], unexpected [{}]",
+            missing.join(", "),
+            unexpected.join(", ")
+        );
     }
     Ok(())
 }
@@ -4934,6 +5132,183 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mic_alias_candidate_resolves_across_multiple_bundled_primary_meshes() {
+        let store = |id: u64, path: &str, imports: &[u64]| PackageStoreEntry {
+            package_id: id,
+            path: path.to_owned(),
+            imported_package_ids: imports.to_vec(),
+        };
+        let entry = |id: u64, path: &str| PackageEntry {
+            package_id: id,
+            path: path.to_owned(),
+        };
+        // Consumer blueprint imports two bundled meshes (blade + scabbard) and
+        // one stale MIC; only the blade mesh links the bundled MIC candidate
+        // in the stale target's exact parent directory.
+        let consumer = store(
+            1,
+            "../../../Mod/Content/Forms/items/weapons/BP_Blade.uasset",
+            &[10, 11, 99],
+        );
+        let source_store: HashMap<u64, PackageStoreEntry> = [
+            (1, consumer.clone()),
+            (
+                10,
+                store(
+                    10,
+                    "../../../Mod/Content/Art/Equipment/weapons/blade/SM_Blade.uasset",
+                    &[20],
+                ),
+            ),
+            (
+                11,
+                store(
+                    11,
+                    "../../../Mod/Content/Art/Equipment/weapons/blade/SM_Blade_Saya.uasset",
+                    &[],
+                ),
+            ),
+            (
+                20,
+                store(
+                    20,
+                    "../../../Mod/Content/Art/Equipment/weapons/blade/MIC_BladeNew.uasset",
+                    &[],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let source_packages: HashMap<u64, PackageEntry> = source_store
+            .iter()
+            .map(|(id, row)| (*id, entry(*id, &row.path)))
+            .collect();
+        let candidate = composite_alias_candidate(
+            &consumer,
+            "/Game/Art/Equipment/weapons/blade/MIC_Blade",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 20);
+
+        // Zero bundled meshes still fails closed.
+        let bare_consumer = store(
+            2,
+            "../../../Mod/Content/Forms/items/weapons/BP_Bare.uasset",
+            &[99],
+        );
+        assert!(
+            composite_alias_candidate(
+                &bare_consumer,
+                "/Game/Art/Equipment/weapons/blade/MIC_Blade",
+                "MaterialInstanceConstant",
+                &source_store,
+                &source_packages,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn composite_pool_tolerates_exact_cross_container_duplicates_only() {
+        let entry = |id: u64, path: &str| PackageEntry {
+            package_id: id,
+            path: path.to_owned(),
+        };
+        let store = |id: u64, path: &str, imports: &[u64]| PackageStoreEntry {
+            package_id: id,
+            path: path.to_owned(),
+            imported_package_ids: imports.to_vec(),
+        };
+        // The same authored package cooked into two shipped containers with one
+        // identity, path, and import set is benign equal-mount-order duplication.
+        let pooled = pool_unique_composite_packages(
+            vec![
+                entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                entry(20, "../../../Mod/Content/Forms/WeapItem.uasset"),
+                entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+            ],
+            &[
+                store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[20]),
+                store(20, "../../../Mod/Content/Forms/WeapItem.uasset", &[]),
+                store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[20]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(pooled.len(), 2);
+
+        // One package ID with two different paths is a real conflict.
+        assert!(
+            pool_unique_composite_packages(
+                vec![
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                    entry(10, "../../../Mod/Content/Forms/Other.uasset"),
+                ],
+                &[
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[]),
+                    store(10, "../../../Mod/Content/Forms/Other.uasset", &[]),
+                ],
+            )
+            .is_err()
+        );
+
+        // One path with two different package IDs is a real conflict.
+        assert!(
+            pool_unique_composite_packages(
+                vec![
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                    entry(11, "../../../Mod/Content/Forms/BP_ITEM.uasset"),
+                ],
+                &[
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[]),
+                    store(11, "../../../Mod/Content/Forms/BP_ITEM.uasset", &[]),
+                ],
+            )
+            .is_err()
+        );
+
+        // Identical identity and path but diverging import sets is a real conflict.
+        assert!(
+            pool_unique_composite_packages(
+                vec![
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                    entry(20, "../../../Mod/Content/Forms/WeapItem.uasset"),
+                    entry(10, "../../../Mod/Content/Forms/BP_Item.uasset"),
+                ],
+                &[
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[20]),
+                    store(20, "../../../Mod/Content/Forms/WeapItem.uasset", &[]),
+                    store(10, "../../../Mod/Content/Forms/BP_Item.uasset", &[]),
+                ],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_reconstruction_accepts_previously_materialized_requests_only() {
+        let set = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        // Fresh extraction of the requested package.
+        verify_exact_reconstruction(&set(&[]), &set(&["a"]), &set(&["a"]), "test").unwrap();
+        // A repeated request whose package a prior call already materialized.
+        verify_exact_reconstruction(&set(&["a"]), &set(&["a"]), &set(&["a"]), "test").unwrap();
+        // A requested package that never materialized fails closed.
+        assert!(verify_exact_reconstruction(&set(&[]), &set(&[]), &set(&["a"]), "test").is_err());
+        // Anything materialized beyond the requested set fails closed.
+        assert!(
+            verify_exact_reconstruction(&set(&[]), &set(&["a", "b"]), &set(&["a"]), "test")
+                .is_err()
+        );
+    }
 
     #[test]
     fn maps_any_valid_project_content_root_to_game_mount() {

@@ -2137,16 +2137,17 @@ fn composite_alias_candidate(
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("SM_"))
         })
         .collect::<Vec<_>>();
-    if direct_meshes.len() != 1 {
+    if direct_meshes.is_empty() {
         bail!(
-            "identity recovery requires exactly one bundled primary StaticMesh dependency; found {}",
-            direct_meshes.len()
+            "identity recovery requires at least one bundled primary StaticMesh dependency; found 0"
         );
     }
-    let main_dependencies = direct_meshes[0]
-        .imported_package_ids
+    // A consumer may bundle several primary meshes (blade plus scabbard); any
+    // of them may carry the structural link to the recovered dependency, and
+    // the final exactly-one-candidate gate still fails closed on ambiguity.
+    let main_dependencies = direct_meshes
         .iter()
-        .copied()
+        .flat_map(|mesh| mesh.imported_package_ids.iter().copied())
         .collect::<HashSet<_>>();
     let target_leaf = package_leaf_without_extension(target_package_name);
     let target_parent = target_package_name
@@ -4648,6 +4649,86 @@ pub fn probe_texture_input(mod_input: &Path, game_root: &Path) -> Result<Replace
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mic_alias_candidate_resolves_across_multiple_bundled_primary_meshes() {
+        let store = |id: u64, path: &str, imports: &[u64]| PackageStoreEntry {
+            package_id: id,
+            path: path.to_owned(),
+            imported_package_ids: imports.to_vec(),
+        };
+        let entry = |id: u64, path: &str| PackageEntry {
+            package_id: id,
+            path: path.to_owned(),
+        };
+        // Consumer blueprint imports two bundled meshes (blade + scabbard) and
+        // one stale MIC; only the blade mesh links the bundled MIC candidate
+        // in the stale target's exact parent directory.
+        let consumer = store(
+            1,
+            "../../../Mod/Content/Forms/items/weapons/BP_Blade.uasset",
+            &[10, 11, 99],
+        );
+        let source_store: HashMap<u64, PackageStoreEntry> = [
+            (1, consumer.clone()),
+            (
+                10,
+                store(
+                    10,
+                    "../../../Mod/Content/Art/Equipment/weapons/blade/SM_Blade.uasset",
+                    &[20],
+                ),
+            ),
+            (
+                11,
+                store(
+                    11,
+                    "../../../Mod/Content/Art/Equipment/weapons/blade/SM_Blade_Saya.uasset",
+                    &[],
+                ),
+            ),
+            (
+                20,
+                store(
+                    20,
+                    "../../../Mod/Content/Art/Equipment/weapons/blade/MIC_BladeNew.uasset",
+                    &[],
+                ),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let source_packages: HashMap<u64, PackageEntry> = source_store
+            .iter()
+            .map(|(id, row)| (*id, entry(*id, &row.path)))
+            .collect();
+        let candidate = composite_alias_candidate(
+            &consumer,
+            "/Game/Art/Equipment/weapons/blade/MIC_Blade",
+            "MaterialInstanceConstant",
+            &source_store,
+            &source_packages,
+        )
+        .unwrap();
+        assert_eq!(candidate.package_id, 20);
+
+        // Zero bundled meshes still fails closed.
+        let bare_consumer = store(
+            2,
+            "../../../Mod/Content/Forms/items/weapons/BP_Bare.uasset",
+            &[99],
+        );
+        assert!(
+            composite_alias_candidate(
+                &bare_consumer,
+                "/Game/Art/Equipment/weapons/blade/MIC_Blade",
+                "MaterialInstanceConstant",
+                &source_store,
+                &source_packages,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn composite_pool_tolerates_exact_cross_container_duplicates_only() {

@@ -210,6 +210,44 @@ fn updates_current_magicloader_worldspace_fixture() {
 }
 
 #[test]
+#[ignore = "requires an installed game, a local mod fixture, and an adapter id"]
+fn updates_current_selected_adapter_fixture() {
+    let required = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("missing required test environment variable {name}"))
+    };
+    let adapter = std::env::var("OBR_TEST_ADAPTER").expect("missing OBR_TEST_ADAPTER");
+    let mut log = Vec::new();
+    let outcome = run_update(
+        UpdateRequest {
+            adapter: adapter.clone(),
+            mod_input: required("OBR_TEST_SELECTED_MOD"),
+            game_root: required("OBR_TEST_GAME"),
+            output_parent: required("OBR_TEST_OUTPUT"),
+            dependency_inputs: Vec::new(),
+            installed_collision_exclusions: Vec::new(),
+            persist_settings: false,
+        },
+        &mut |step, total, message| log.push(format!("[{step}/{total}] {message}")),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "selected adapter update failed for {adapter}:\n{error:#}\n{}",
+            log.join("\n")
+        )
+    });
+    assert!(outcome.output_archive.is_file());
+    assert!(outcome.report_path.is_file());
+    println!(
+        "selected-adapter fixture: adapter={} archive={} report={}",
+        outcome.adapter,
+        outcome.output_archive.display(),
+        outcome.report_path.display()
+    );
+}
+
+#[test]
 #[ignore = "requires an installed game and a local mixed-composite fixture"]
 fn updates_current_mixed_composite_fixture() {
     let required = |name: &str| {

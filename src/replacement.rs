@@ -1050,13 +1050,42 @@ fn unique_container_parent(root: &Path) -> Result<PathBuf> {
         .collect::<Vec<_>>();
     parents.sort();
     parents.dedup();
-    if parents.len() != 1 {
-        bail!(
-            "composite input requires every container triple in one physical folder; found {} folders",
-            parents.len()
-        );
+    if parents.len() == 1 {
+        return Ok(parents.remove(0));
     }
-    Ok(parents.remove(0))
+    // Canonical mixed layouts split container folders below one Content/Paks
+    // boundary (for example `~mods` plus a nested `LogicMods` mod folder).
+    // Container discovery walks recursively and keys identity by container
+    // stem, so the shared Content/Paks root is an equally exact scope.
+    let mut paks_roots = parents
+        .iter()
+        .filter_map(|parent| {
+            let mut current = Some(parent.as_path());
+            while let Some(path) = current {
+                if path
+                    .file_name()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Paks"))
+                    && path
+                        .parent()
+                        .and_then(|parent| parent.file_name())
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Content"))
+                {
+                    return Some(path.to_path_buf());
+                }
+                current = path.parent();
+            }
+            None
+        })
+        .collect::<Vec<_>>();
+    paks_roots.sort();
+    paks_roots.dedup();
+    if paks_roots.len() == 1 && parents.len() > 1 {
+        return Ok(paks_roots.remove(0));
+    }
+    bail!(
+        "composite input requires every container triple in one physical folder or below one Content/Paks root; found {} folders",
+        parents.len()
+    )
 }
 
 fn inspect_staged_for_scope(

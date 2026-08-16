@@ -293,6 +293,35 @@ fn find_mixed_container_utocs(mod_root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn find_mod_root(extracted: &Path) -> Result<PathBuf> {
+    find_mod_root_with_policy(extracted, false)
+}
+
+/// The mixed-composite lane accepts UTOC files at any recognized depth below
+/// Content/Paks, not just depth-2. The relaxed variant walks deeper to find
+/// the one canonical root that carries both Data and containers.
+fn find_mod_root_mixed(extracted: &Path) -> Result<PathBuf> {
+    find_mod_root_with_policy(extracted, true)
+}
+
+fn has_any_container_directory(root: &Path) -> bool {
+    let paks = root.join(r"Content\Paks");
+    paks.is_dir()
+        && WalkDir::new(paks)
+            .min_depth(2)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|value| value.eq_ignore_ascii_case("utoc"))
+            })
+}
+
+fn find_mod_root_with_policy(extracted: &Path, relaxed_container_depth: bool) -> Result<PathBuf> {
     let roots = WalkDir::new(extracted)
         .max_depth(8)
         .into_iter()
@@ -300,7 +329,12 @@ fn find_mod_root(extracted: &Path) -> Result<PathBuf> {
         .filter(|entry| entry.file_type().is_dir())
         .map(|entry| entry.path().to_path_buf())
         .filter(|path| {
-            path.join(r"Content\Dev\ObvData\Data").is_dir() && has_direct_container_directory(path)
+            path.join(r"Content\Dev\ObvData\Data").is_dir()
+                && if relaxed_container_depth {
+                    has_any_container_directory(path)
+                } else {
+                    has_direct_container_directory(path)
+                }
         })
         .collect::<Vec<_>>();
     if roots.len() != 1 {
@@ -1751,7 +1785,11 @@ fn run_esp_sync_lane_update(
 
     stage(callback, 1, "Inspecting mod input and target game");
     copy_input_tree(&mod_input, &extract_root)?;
-    let mod_root = find_mod_root(&extract_root).context(
+    let mod_root = match lane {
+        EspSyncLane::MixedComposite => find_mod_root_mixed(&extract_root),
+        _ => find_mod_root(&extract_root),
+    }
+    .context(
         "the native additive adapter requires one canonical complete logical mod root; physical wrappers must enter through the guarded logical-install publication adapter",
     )?;
     let mod_data = mod_root.join(r"Content\Dev\ObvData\Data");

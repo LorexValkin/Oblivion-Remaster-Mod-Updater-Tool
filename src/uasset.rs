@@ -194,6 +194,11 @@ pub enum CompositePackageAssetKind {
     StaticMesh,
     Texture2D,
     MaterialInstanceConstant,
+    AnimSequence,
+    AnimMontage,
+    BlendSpace,
+    SoundWave,
+    SoundCue,
     ResolvedAuthoredPackage,
     CurrentTemplatePackage,
 }
@@ -3024,6 +3029,12 @@ pub fn classify_composite_package_asset(
             "MaterialInstanceConstant",
             CompositePackageAssetKind::MaterialInstanceConstant,
         ),
+        ("AnimSequence", CompositePackageAssetKind::AnimSequence),
+        ("AnimMontage", CompositePackageAssetKind::AnimMontage),
+        ("BlendSpace", CompositePackageAssetKind::BlendSpace),
+        ("BlendSpace1D", CompositePackageAssetKind::BlendSpace),
+        ("SoundWave", CompositePackageAssetKind::SoundWave),
+        ("SoundCue", CompositePackageAssetKind::SoundCue),
     ]
     .into_iter()
     .filter(|(class, _)| {

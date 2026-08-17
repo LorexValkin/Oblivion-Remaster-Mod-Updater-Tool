@@ -4575,6 +4575,79 @@ pub fn probe_composite_package_input(
                     bail!("resolved Texture2D retains unresolved package-store dependencies");
                 }
             }
+            CompositePackageAssetKind::AnimSequence
+            | CompositePackageAssetKind::AnimMontage
+            | CompositePackageAssetKind::BlendSpace => {
+                let kind_label = match kind {
+                    CompositePackageAssetKind::AnimSequence => "anim-sequence",
+                    CompositePackageAssetKind::AnimMontage => "anim-montage",
+                    CompositePackageAssetKind::BlendSpace => "blend-space",
+                    _ => unreachable!(),
+                };
+                *kinds.entry(kind_label).or_default() += 1;
+                if unresolved != 0 {
+                    if !existing {
+                        bail!("additive {kind_label} has unresolved imports");
+                    }
+                    let current = inspection
+                        .target_dependencies
+                        .get(&package.package_id)
+                        .context(format!("existing {kind_label} has no current template"))?;
+                    let donor_root = package_work.join("current");
+                    extract_composite_packages_exact(
+                        &retoc,
+                        current_view.path(),
+                        &donor_root,
+                        &[(current.clone(), current.path.clone())],
+                        &format!("current {kind_label} extraction"),
+                    )?;
+                    let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
+                    repair_current_template_imports(
+                        &asset,
+                        &donor,
+                        store,
+                        &available_dependencies,
+                        &package_work.join("repair"),
+                    )?;
+                } else if missing_store_dependencies != 0 {
+                    bail!("resolved {kind_label} retains unresolved package-store dependencies");
+                }
+            }
+            CompositePackageAssetKind::SoundWave | CompositePackageAssetKind::SoundCue => {
+                let kind_label = match kind {
+                    CompositePackageAssetKind::SoundWave => "sound-wave",
+                    CompositePackageAssetKind::SoundCue => "sound-cue",
+                    _ => unreachable!(),
+                };
+                *kinds.entry(kind_label).or_default() += 1;
+                if unresolved != 0 {
+                    if !existing {
+                        bail!("additive {kind_label} has unresolved imports");
+                    }
+                    let current = inspection
+                        .target_dependencies
+                        .get(&package.package_id)
+                        .context(format!("existing {kind_label} has no current template"))?;
+                    let donor_root = package_work.join("current");
+                    extract_composite_packages_exact(
+                        &retoc,
+                        current_view.path(),
+                        &donor_root,
+                        &[(current.clone(), current.path.clone())],
+                        &format!("current {kind_label} extraction"),
+                    )?;
+                    let donor = find_extracted_additive_static_mesh(&donor_root, &current.path)?;
+                    repair_current_template_imports(
+                        &asset,
+                        &donor,
+                        store,
+                        &available_dependencies,
+                        &package_work.join("repair"),
+                    )?;
+                } else if missing_store_dependencies != 0 {
+                    bail!("resolved {kind_label} retains unresolved package-store dependencies");
+                }
+            }
             CompositePackageAssetKind::MaterialInstanceConstant => {
                 *kinds.entry("material-instance").or_default() += 1;
                 if unresolved != 0 {

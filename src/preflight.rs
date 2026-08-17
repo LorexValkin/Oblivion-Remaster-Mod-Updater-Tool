@@ -2,6 +2,7 @@ use crate::archive::{
     MAX_ARCHIVE_DECLARED_BYTES, MAX_ARCHIVE_ENTRIES, SELECTED_METADATA_EXTRACTION_API, rar_entries,
     sha256_bytes, sha256_file,
 };
+use crate::plugin_only::{PLUGIN_ONLY_ADAPTER, evaluate_plugin_only_lane};
 use crate::dependencies::{
     DependencyCandidate, DependencyKind, installed_state, scan_dependencies,
 };
@@ -1356,6 +1357,38 @@ fn analyze_internal(
     let magicloader_worldspace_gate_ready =
         magic_loader_layout && magicloader_lane_blockers.is_empty();
     let requires_runtime = requires_runtime || magicloader_worldspace_gate_ready;
+    let plugin_only_layout = inventory.as_ref().is_some_and(|value| {
+        value.classification == "plugin-only" && value.link_count == 0 && !value.scan_truncated
+    });
+    let plugin_only_lane = if plugin_only_layout {
+        progress("Evaluating the plugin-only Data-plane lane against the current game");
+        let mut lane = evaluate_plugin_only_lane(
+            &request.mod_input,
+            current_game_data.as_deref().filter(|_| game_valid),
+        );
+        if let Some(count) = inventory
+            .as_ref()
+            .map(|value| value.functional_or_unknown_loose_file_count)
+            .filter(|count| *count > 0)
+        {
+            lane.blockers.push(format!(
+                "functional-or-unknown-loose-files-outside-the-data-plane:count-{count}"
+            ));
+            lane.blockers.sort();
+            lane.blockers.dedup();
+            lane.status = "blocked".to_owned();
+        }
+        Some(lane)
+    } else {
+        None
+    };
+    let plugin_only_gate_ready = plugin_only_lane
+        .as_ref()
+        .is_some_and(|lane| lane.status == "proven");
+    let requires_runtime = requires_runtime
+        || plugin_only_lane
+            .as_ref()
+            .is_some_and(|lane| lane.status == "proven" && lane.sync_map_entry_count > 0);
     let (
         armor_probe,
         armor_probe_error,
@@ -2599,6 +2632,7 @@ fn analyze_internal(
         && adapter_blockers.is_empty();
     let composite_package_can_update =
         replacement_shape && composite_package_probe.is_some() && adapter_blockers.is_empty();
+    let plugin_only_can_update = plugin_only_gate_ready && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
         || mixed_composite_can_update
         || magicloader_can_update
@@ -2607,7 +2641,8 @@ fn analyze_internal(
         || texture_can_update
         || additive_static_mesh_can_update
         || heterogeneous_replacement_can_update
-        || composite_package_can_update;
+        || composite_package_can_update
+        || plugin_only_can_update;
     let logical_publication_adapter = install_plan
         .as_ref()
         .filter(|plan| supports_logical_install_publication(plan))
@@ -2897,6 +2932,22 @@ fn analyze_internal(
         },
     });
     capabilities.push(Capability {
+        id: PLUGIN_ONLY_ADAPTER.to_owned(),
+        available: plugin_only_can_update,
+        evidence_level: "current-master-semantic-gate-on-canonical-data-plane-layout".to_owned(),
+        description: "Fail-closed lane for plugin-only mods: one full ESP plus optional SyncMap INI, MagicLoader JSON sidecars, and documentation, resolved from a canonical wrapper, Place-in-Data, or bare rooting into Content/Dev/ObvData/Data. Declared masters must resolve installed, and every master override must pass the per-subrecord three-way current-master semantic gate with authored, revert-risk, and merge-needed fields disclosed; witness-shaped REFR deletion stubs are rewritten as undeleted, initially disabled, player-opposite enable-parented overrides, and every other byte is preserved.".to_owned(),
+        blockers: plugin_only_lane
+            .as_ref()
+            .map(|lane| {
+                if lane.blockers.is_empty() {
+                    adapter_blockers.clone()
+                } else {
+                    lane.blockers.clone()
+                }
+            })
+            .unwrap_or_else(|| vec!["mod-layout-does-not-match-plugin-only-lane".to_owned()]),
+    });
+    capabilities.push(Capability {
         id: "pinned-offhand-staff-a-v1".to_owned(),
         available: false,
         evidence_level: "separate-audited-donor-cli".to_owned(),
@@ -2905,6 +2956,7 @@ fn analyze_internal(
     });
     if !additive_shape
         && !magicloader_worldspace_gate_ready
+        && !plugin_only_gate_ready
         && !mixed_composite_layout
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
@@ -2940,12 +2992,17 @@ fn analyze_internal(
         Some(HETEROGENEOUS_REPLACEMENT_ADAPTER.to_owned())
     } else if composite_package_can_update {
         Some(COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned())
+    } else if plugin_only_can_update {
+        Some(PLUGIN_ONLY_ADAPTER.to_owned())
     } else if logical_install_can_update {
         logical_publication_adapter.clone()
     } else {
         None
     };
     let mut disposition_blockers = adapter_blockers.clone();
+    if let Some(lane) = plugin_only_lane.as_ref().filter(|lane| lane.status != "proven") {
+        disposition_blockers.extend(lane.blockers.iter().cloned());
+    }
     if let Some(plugin) = plugin_compatibility.as_ref() {
         disposition_blockers.extend(plugin.blockers.iter().cloned());
     }
@@ -3005,6 +3062,14 @@ fn analyze_internal(
         (
             "plugin-structural-or-semantic-review-required",
             "Plugin structure or record semantics exceed the currently proven mutation policies.",
+        )
+    } else if plugin_only_lane
+        .as_ref()
+        .is_some_and(|lane| lane.status != "proven")
+    {
+        (
+            "plugin-only-lane-blocked",
+            "The plugin-only Data-plane lane could not prove every gate; the disclosed blockers name each unproven step.",
         )
     } else if install_plan.is_some() {
         (

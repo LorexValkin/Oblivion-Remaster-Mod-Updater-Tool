@@ -2802,14 +2802,22 @@ fn additive_contract_from_staged(
                     let owned_ids = plugin
                         .records
                         .iter()
-                        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
+                        .filter(|record| (record.form_id >> 24) as u8 >= plugin_index)
                         .map(|record| record.form_id)
                         .collect::<HashSet<_>>();
                     for entry in &sync_entries {
                         let local_id =
                             u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
-                        let full_id = ((owned_index as u32) << 24) | local_id;
-                        if !owned_ids.contains(&full_id) {
+                        let owned_slots = plugin
+                            .records
+                            .iter()
+                            .map(|r| (r.form_id >> 24) as u8)
+                            .filter(|idx| *idx >= plugin_index)
+                            .collect::<HashSet<_>>();
+                        let matched = owned_slots
+                            .iter()
+                            .any(|slot| owned_ids.contains(&((*slot as u32) << 24 | local_id)));
+                        if !matched {
                             bail!(
                                 "SyncMap local FormID {} has no plugin-owned record",
                                 entry.local_form_id

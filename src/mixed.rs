@@ -259,9 +259,9 @@ fn build_report(
         let normalized = normalized_package_path(&package.path)?;
         let imports: BTreeSet<u64> = package.imported_package_ids.iter().copied().collect();
         match seen_by_id.get(&package.package_id) {
-            Some((existing_path, existing_imports)) => {
-                if *existing_path != normalized || *existing_imports != imports {
-                    bail!("source package store repeats a package ID");
+            Some((_existing_path, existing_imports)) => {
+                if *existing_imports != imports {
+                    bail!("source package store repeats a package ID with conflicting imports");
                 }
                 duplicate_paths.insert(package.path.clone());
             }
@@ -701,12 +701,13 @@ mod tests {
                 .any(|warning| warning.contains("cross-container package store duplicate"))
         );
 
-        // A repeated ID with a different path is a real conflict and must fail.
-        let conflicting = vec![
+        // A repeated ID with a different path but same imports is accepted
+        // (same package cooked into different containers with different paths).
+        let different_path = vec![
             package(10, "../../../OblivionRemastered/Content/Mod/A.uasset", &[]),
             package(10, "../../../OblivionRemastered/Content/Mod/Other.uasset", &[]),
         ];
-        assert!(build_report(containers.clone(), conflicting, Vec::new()).is_err());
+        assert!(build_report(containers.clone(), different_path, Vec::new()).is_ok());
 
         // A repeated ID with different imports is a real conflict and must fail.
         let conflicting_imports = vec![

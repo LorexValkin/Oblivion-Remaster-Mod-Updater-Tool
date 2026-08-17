@@ -2634,8 +2634,7 @@ fn analyze_internal(
     let additive_dependency_closure = mixed_iostore_dependency_probe
         .as_ref()
         .is_some_and(|probe| {
-            probe.collision_count == 0
-                && (probe.dependencies.fully_resolved || mixed_unresolved_accepted)
+            probe.dependencies.fully_resolved || mixed_unresolved_accepted
         })
         || ((additive_shape || mixed_composite_shape) && composite_package_probe.is_some());
     let additive_can_update =

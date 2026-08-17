@@ -422,11 +422,18 @@ impl InventoryBuilder {
             })
             .count();
         let incomplete = self.containers.len().saturating_sub(complete);
-        let candidate_roots = self
-            .data_roots
-            .intersection(&self.pak_roots)
-            .cloned()
-            .collect::<Vec<_>>();
+        let esp = *self.plugins.get("esp").unwrap_or(&0);
+        let plugin_total = self.plugins.values().sum::<usize>();
+        let has_plugins = plugin_total > 0;
+        let plugin_only_shape = has_plugins && self.containers.is_empty() && self.scripts == 0;
+        let candidate_roots = if plugin_only_shape && self.pak_roots.is_empty() {
+            self.data_roots.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.data_roots
+                .intersection(&self.pak_roots)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let roots = candidate_roots.len();
         let candidate_mod_root = (roots == 1).then(|| candidate_roots[0].clone());
         let magic_loader_total = self.magic_loader_configs_by_root.values().sum::<usize>();
@@ -437,9 +444,6 @@ impl InventoryBuilder {
             .unwrap_or(0);
         self.functional_or_unknown_loose +=
             magic_loader_total.saturating_sub(magic_loader_config_count);
-        let esp = *self.plugins.get("esp").unwrap_or(&0);
-        let plugin_total = self.plugins.values().sum::<usize>();
-        let has_plugins = plugin_total > 0;
         let syncmap_iostore_shape = roots == 1
             && esp == 1
             && plugin_total == 1

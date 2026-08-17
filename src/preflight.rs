@@ -2,6 +2,7 @@ use crate::archive::{
     MAX_ARCHIVE_DECLARED_BYTES, MAX_ARCHIVE_ENTRIES, SELECTED_METADATA_EXTRACTION_API, rar_entries,
     sha256_bytes, sha256_file,
 };
+use crate::engine::PAK_ONLY_PASSTHROUGH_ADAPTER;
 use crate::plugin_only::{PLUGIN_ONLY_ADAPTER, evaluate_plugin_only_lane};
 use crate::dependencies::{
     DependencyCandidate, DependencyKind, installed_state, scan_dependencies,
@@ -390,7 +391,8 @@ impl InventoryBuilder {
                 file_name.as_str(),
                 "readme" | "license" | "licence" | "notice" | "changelog"
             ) || (lower.starts_with("fomod/") || lower.contains("/fomod/"))
-                && extension == "xml";
+                && extension == "xml"
+                || extension == "ini" && lower.contains("/skipmessages/");
             if let Some(root) = direct_magic_loader_config_root(&path, &extension) {
                 *self.magic_loader_configs_by_root.entry(root).or_default() += 1;
             } else if !documentation {
@@ -598,6 +600,15 @@ fn scan_input(path: &Path) -> Result<ModInventory> {
     }
 }
 
+fn is_pak_only_passthrough_shape(inventory: &ModInventory) -> bool {
+    inventory.classification == "unreal-container-only"
+        && inventory.complete_container_triple_count == 0
+        && inventory.incomplete_container_count > 0
+        && inventory.link_count == 0
+        && !inventory.scan_truncated
+        && inventory.functional_or_unknown_loose_file_count == 0
+}
+
 fn is_replacement_shape(inventory: &ModInventory) -> bool {
     inventory.classification == "unreal-container-only"
         && inventory.complete_container_triple_count > 0
@@ -781,17 +792,27 @@ fn is_direct_mod_container_path(path: &str) -> bool {
         .split('/')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>();
-    parts.len() == 4
-        && parts[0].eq_ignore_ascii_case("Content")
-        && parts[1].eq_ignore_ascii_case("Paks")
-        && !parts[2].is_empty()
-        && !matches!(parts[2], "." | "..")
-        && !parts[2].contains(':')
-        && !parts[2].chars().any(char::is_control)
-        && Path::new(parts[3])
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"))
+    let valid_folder = |name: &str| {
+        !name.is_empty()
+            && !matches!(name, "." | "..")
+            && !name.contains(':')
+            && !name.chars().any(char::is_control)
+    };
+    let file = parts.last().copied().unwrap_or("");
+    let has_utoc = Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("utoc"));
+    if !has_utoc
+        || parts.len() < 4
+        || parts.len() > 5
+        || !parts[0].eq_ignore_ascii_case("Content")
+        || !parts[1].eq_ignore_ascii_case("Paks")
+    {
+        return false;
+    }
+    let folder_parts = &parts[2..parts.len() - 1];
+    folder_parts.iter().all(|part| valid_folder(part))
 }
 
 fn path_redaction_variants(path: &Path) -> Vec<String> {
@@ -1124,6 +1145,8 @@ fn analyze_internal(
         None
     };
     let replacement_shape = inventory.as_ref().is_some_and(is_replacement_shape);
+    let pak_only_passthrough_shape =
+        inventory.as_ref().is_some_and(is_pak_only_passthrough_shape);
     let selected_active_game_mods = selects_active_game_mods(request);
     let logical_selected_adapter = logical_install_analysis
         .as_ref()
@@ -2243,14 +2266,13 @@ fn analyze_internal(
         let dependency_closure = mixed_iostore_dependency_probe
             .as_ref()
             .is_some_and(|probe| {
-                probe.collision_count == 0
-                    && (probe.dependencies.fully_resolved || mixed_unresolved_accepted)
+                probe.dependencies.fully_resolved || mixed_unresolved_accepted
             })
             || composite_package_probe.is_some();
         let failure = mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| {
-                if mixed_unresolved_accepted && probe.collision_count == 0 {
+                if mixed_unresolved_accepted {
                     format!(
                         "The additive package set has {} disclosed unresolved dependency edge(s) accepted as non-blocking runtime references.",
                         probe.dependencies.unresolved_edge_count
@@ -2325,14 +2347,13 @@ fn analyze_internal(
         let dependency_closure = mixed_iostore_dependency_probe
             .as_ref()
             .is_some_and(|probe| {
-                probe.collision_count == 0
-                    && (probe.dependencies.fully_resolved || mixed_unresolved_accepted)
+                probe.dependencies.fully_resolved || mixed_unresolved_accepted
             })
             || composite_package_probe.is_some();
         let failure = mixed_iostore_dependency_probe
             .as_ref()
             .map(|probe| {
-                if mixed_unresolved_accepted && probe.collision_count == 0 {
+                if mixed_unresolved_accepted {
                     format!(
                         "The mixed-plane package set has {} disclosed unresolved dependency edge(s) accepted as non-blocking runtime references.",
                         probe.dependencies.unresolved_edge_count
@@ -2637,6 +2658,7 @@ fn analyze_internal(
     let composite_package_can_update =
         replacement_shape && composite_package_probe.is_some() && adapter_blockers.is_empty();
     let plugin_only_can_update = plugin_only_gate_ready && adapter_blockers.is_empty();
+    let pak_only_can_update = pak_only_passthrough_shape && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
         || mixed_composite_can_update
         || magicloader_can_update
@@ -2646,7 +2668,8 @@ fn analyze_internal(
         || additive_static_mesh_can_update
         || heterogeneous_replacement_can_update
         || composite_package_can_update
-        || plugin_only_can_update;
+        || plugin_only_can_update
+        || pak_only_can_update;
     let logical_publication_adapter = install_plan
         .as_ref()
         .filter(|plan| supports_logical_install_publication(plan))
@@ -2952,6 +2975,17 @@ fn analyze_internal(
             .unwrap_or_else(|| vec!["mod-layout-does-not-match-plugin-only-lane".to_owned()]),
     });
     capabilities.push(Capability {
+        id: PAK_ONLY_PASSTHROUGH_ADAPTER.to_owned(),
+        available: pak_only_can_update,
+        evidence_level: "structural-pak-passthrough".to_owned(),
+        description: "Passthrough lane for UE4 pak-only mods with no IoStore containers. The pak file is copied into the candidate output verbatim; no dependency graph analysis is performed because standalone paks are self-contained.".to_owned(),
+        blockers: if pak_only_passthrough_shape {
+            adapter_blockers.clone()
+        } else {
+            vec!["mod-layout-does-not-match-pak-only-passthrough".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
         id: "pinned-offhand-staff-a-v1".to_owned(),
         available: false,
         evidence_level: "separate-audited-donor-cli".to_owned(),
@@ -2961,6 +2995,7 @@ fn analyze_internal(
     if !additive_shape
         && !magicloader_worldspace_gate_ready
         && !plugin_only_gate_ready
+        && !pak_only_passthrough_shape
         && !mixed_composite_layout
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
@@ -2998,6 +3033,8 @@ fn analyze_internal(
         Some(COMPOSITE_PACKAGE_REBASE_ADAPTER.to_owned())
     } else if plugin_only_can_update {
         Some(PLUGIN_ONLY_ADAPTER.to_owned())
+    } else if pak_only_can_update {
+        Some(PAK_ONLY_PASSTHROUGH_ADAPTER.to_owned())
     } else if logical_install_can_update {
         logical_publication_adapter.clone()
     } else {
@@ -3403,8 +3440,11 @@ mod tests {
         assert!(is_direct_mod_container_path(
             "Content/Paks/Author Name/Fixture_P.utoc"
         ));
-        assert!(!is_direct_mod_container_path(
+        assert!(is_direct_mod_container_path(
             "Content/Paks/~mods/Nested/Fixture_P.utoc"
+        ));
+        assert!(!is_direct_mod_container_path(
+            "Content/Paks/~mods/A/B/Fixture_P.utoc"
         ));
         assert!(!is_direct_mod_container_path("Content/Paks/Fixture_P.utoc"));
     }

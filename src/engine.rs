@@ -1129,6 +1129,7 @@ fn run_direct_update(
         }
         COMPOSITE_PACKAGE_REBASE_ADAPTER => run_composite_package_update(request, callback),
         crate::plugin_only::PLUGIN_ONLY_ADAPTER => run_plugin_only_update(request, callback),
+        PAK_ONLY_PASSTHROUGH_ADAPTER => run_pak_only_passthrough_update(request, callback),
         "native-additive-static-mesh-v1" | ADDITIVE_STATIC_MESH_ADAPTER => {
             run_additive_static_mesh_update(request, callback)
         }
@@ -1501,6 +1502,183 @@ fn run_plugin_only_update(
     );
     Ok(UpdateOutcome {
         adapter: PLUGIN_ONLY_ADAPTER.to_owned(),
+        output_directory,
+        output_archive,
+        report_path,
+        package_count: 0,
+    })
+}
+
+fn run_pak_only_passthrough_update(
+    request: UpdateRequest,
+    callback: &mut ProgressCallback<'_>,
+) -> Result<UpdateOutcome> {
+    let mod_input = fs::canonicalize(&request.mod_input)
+        .with_context(|| format!("mod input not found: {}", request.mod_input.display()))?;
+    let input_type = if mod_input.is_file() {
+        "archive"
+    } else {
+        "directory"
+    };
+    let input_hash = if mod_input.is_file() {
+        sha256_file(&mod_input)?
+    } else {
+        sha256_directory(&mod_input)?
+    };
+    let game = validate_game_install(&request.game_root, "native UI");
+    if !game.valid {
+        bail!(
+            "game folder is incomplete. Missing: {}",
+            game.missing.join(", ")
+        );
+    }
+    if !request.output_parent.is_dir() {
+        bail!(
+            "output parent does not exist: {}",
+            request.output_parent.display()
+        );
+    }
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let output_directory = request.output_parent.join(format!(
+        "{}-current-candidate-{stamp}",
+        safe_leaf(&mod_input)
+    ));
+    let output_archive = portable_archive_path(&output_directory)?;
+    if output_directory.exists() || output_archive.exists() {
+        bail!("timestamped output already exists; wait one second and try again");
+    }
+    if request.persist_settings {
+        save_settings(&game.root, &request.output_parent)?;
+    }
+
+    stage(callback, 1, "Extracting pak-only mod");
+    let work = tempfile::Builder::new()
+        .prefix("obr-pak-only-update-")
+        .tempdir()?;
+    let extract_root = work.path().join("archive");
+    fs::create_dir_all(&extract_root)?;
+    if mod_input.is_dir() {
+        crate::archive::copy_tree(&mod_input, &extract_root)?;
+    } else {
+        crate::archive::extract_archive(&mod_input, &extract_root)?;
+    }
+
+    stage(callback, 2, "Classifying pak files and documentation");
+    let mut pak_files = Vec::new();
+    let mut documentation = Vec::new();
+    for entry in walkdir::WalkDir::new(&extract_root).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_symlink() {
+            bail!("pak-only input contains a filesystem link");
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry
+            .path()
+            .strip_prefix(&extract_root)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if extension == "pak" {
+            pak_files.push(relative);
+            continue;
+        }
+        let file_name = entry
+            .path()
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let documentation_like = matches!(
+            extension.as_str(),
+            "txt" | "md" | "rtf" | "pdf" | "png" | "jpg" | "jpeg" | "gif" | "webp"
+        ) || matches!(
+            file_name.as_str(),
+            "readme" | "license" | "licence" | "notice" | "changelog"
+        );
+        if !documentation_like {
+            bail!("pak-only lane refuses an unrecognized functional file: {relative}");
+        }
+        documentation.push(relative);
+    }
+    pak_files.sort();
+    documentation.sort();
+    if pak_files.is_empty() {
+        bail!("pak-only lane found no .pak files in the mod input");
+    }
+
+    stage(callback, 3, "Publishing pak-only candidate");
+    fs::create_dir_all(&output_directory)?;
+    let candidate_root = output_directory.join("OblivionRemastered");
+    crate::archive::copy_tree(&extract_root, &candidate_root)?;
+
+    let passthrough_root = output_directory.join("unmapped-passthrough");
+    for relative in &documentation {
+        let source = extract_root.join(relative);
+        let target = passthrough_root.join(relative);
+        fs::create_dir_all(target.parent().context("passthrough file has no parent")?)?;
+        copy_file(&source, &target)?;
+    }
+
+    stage(callback, 4, "Writing report and creating archive");
+    let report_path = output_directory.join("pak-only-passthrough-report.json");
+    let report = json!({
+        "schema": "obr-pak-only-passthrough-report",
+        "version": 1,
+        "adapter": PAK_ONLY_PASSTHROUGH_ADAPTER,
+        "implementation": "native-rust",
+        "fixApis": ["pak-only-passthrough-v1"],
+        "generatedAt": chrono::Utc::now().to_rfc3339(),
+        "reportSnapshot": "candidate-publication",
+        "status": "candidate_ready_for_runtime_test",
+        "structurallyVerified": true,
+        "runtimeVerified": false,
+        "source": {
+            "inputType": input_type,
+            "inputPath": mod_input,
+            "inputSha256": input_hash,
+        },
+        "target": {
+            "gameRoot": game.root,
+        },
+        "paks": pak_files,
+        "unmappedDocumentation": documentation,
+        "output": {
+            "directory": output_directory,
+            "archive": output_archive,
+        },
+        "verification": {
+            "pakFilesPreserved": true,
+            "productionRuntimeGateRequired": true,
+            "note": "Pak files are passed through byte-preserved. This candidate must be tested in the shipping game.",
+        },
+    });
+    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+
+    let mut zip_paths = vec![candidate_root.clone(), report_path.clone()];
+    if passthrough_root.is_dir() {
+        zip_paths.push(passthrough_root.clone());
+    }
+    create_zip_from_paths(&output_archive, &output_directory, &zip_paths)?;
+    if !output_archive.is_file() {
+        bail!(
+            "output archive was not created: {}",
+            output_archive.display()
+        );
+    }
+    stage(
+        callback,
+        5,
+        "Pak-only candidate published; run the in-game production test",
+    );
+    Ok(UpdateOutcome {
+        adapter: PAK_ONLY_PASSTHROUGH_ADAPTER.to_owned(),
         output_directory,
         output_archive,
         report_path,
@@ -1994,6 +2172,7 @@ pub const MAGICLOADER_WORLDSPACE_ADAPTER: &str = "native-magicloader-worldspace-
 /// INIs, byte-preserved passthrough planes, and additive IoStore containers in
 /// one or more recognized container folders.
 pub const MIXED_COMPOSITE_ADAPTER: &str = "native-mixed-composite-syncmap-v1";
+pub const PAK_ONLY_PASSTHROUGH_ADAPTER: &str = "native-pak-only-passthrough-v1";
 
 /// Bounded plugin-unit count for the mixed-plane lane.
 const MAX_MIXED_COMPOSITE_PLUGINS: usize = 8;

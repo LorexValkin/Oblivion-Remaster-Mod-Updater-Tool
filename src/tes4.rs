@@ -100,6 +100,10 @@ pub fn infer_self_slot(master_count: u8, records: &[Record]) -> SelfSlotInferenc
             self_index: *single,
             basis: SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE,
         },
+        _ if candidates.contains(&master_count) => SelfSlotInference::Inferred {
+            self_index: master_count,
+            basis: "master-count-with-out-of-range-siblings",
+        },
         _ => SelfSlotInference::Ambiguous { candidates },
     }
 }
@@ -1468,15 +1472,26 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_on_ambiguous_self_slot_candidates() {
+    fn resolves_ambiguous_self_slot_when_master_count_is_a_candidate() {
         let records = vec![
             bare_record("WEAP", 0x0100_0800),
             bare_record("REFR", 0x0200_0801),
         ];
         assert_eq!(
             infer_self_slot(1, &records),
+            SelfSlotInference::Inferred {
+                self_index: 1,
+                basis: "master-count-with-out-of-range-siblings",
+            }
+        );
+        let records_no_master_count = vec![
+            bare_record("WEAP", 0x0200_0800),
+            bare_record("REFR", 0x0300_0801),
+        ];
+        assert_eq!(
+            infer_self_slot(1, &records_no_master_count),
             SelfSlotInference::Ambiguous {
-                candidates: vec![1, 2]
+                candidates: vec![2, 3]
             }
         );
     }

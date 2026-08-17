@@ -2,7 +2,7 @@ use crate::archive::{
     MAX_ARCHIVE_DECLARED_BYTES, MAX_ARCHIVE_ENTRIES, SELECTED_METADATA_EXTRACTION_API, rar_entries,
     sha256_bytes, sha256_file,
 };
-use crate::engine::PAK_ONLY_PASSTHROUGH_ADAPTER;
+use crate::engine::{ADDITIVE_CONTAINER_ONLY_ADAPTER, PAK_ONLY_PASSTHROUGH_ADAPTER};
 use crate::plugin_only::{PLUGIN_ONLY_ADAPTER, evaluate_plugin_only_lane};
 use crate::dependencies::{
     DependencyCandidate, DependencyKind, installed_state, scan_dependencies,
@@ -387,6 +387,11 @@ impl InventoryBuilder {
             let documentation = matches!(
                 extension.as_str(),
                 "txt" | "md" | "rtf" | "pdf" | "png" | "jpg" | "jpeg" | "gif" | "webp"
+                    | "fbx" | "obj" | "fga" | "blend" | "psd" | "tga" | "dds" | "bmp"
+                    | "svg" | "ico" | "xcf" | "ase" | "aseprite" | "ma" | "mb"
+                    | "max" | "3ds" | "dae" | "gltf" | "glb" | "stl" | "ztl"
+                    | "html" | "htm" | "css" | "csv" | "log" | "cfg" | "yaml" | "yml"
+                    | "toml"
             ) || matches!(
                 file_name.as_str(),
                 "readme" | "license" | "licence" | "notice" | "changelog"
@@ -598,6 +603,15 @@ fn scan_input(path: &Path) -> Result<ModInventory> {
         "rar" => scan_rar(path),
         extension => bail!("unsupported mod input extension: {extension}"),
     }
+}
+
+fn is_additive_container_only_shape(inventory: &ModInventory) -> bool {
+    inventory.classification == "unreal-container-only"
+        && inventory.complete_container_triple_count > 0
+        && inventory.incomplete_container_count == 0
+        && inventory.link_count == 0
+        && !inventory.scan_truncated
+        && inventory.functional_or_unknown_loose_file_count == 0
 }
 
 fn is_pak_only_passthrough_shape(inventory: &ModInventory) -> bool {
@@ -1147,6 +1161,8 @@ fn analyze_internal(
     let replacement_shape = inventory.as_ref().is_some_and(is_replacement_shape);
     let pak_only_passthrough_shape =
         inventory.as_ref().is_some_and(is_pak_only_passthrough_shape);
+    let additive_container_only_shape =
+        inventory.as_ref().is_some_and(is_additive_container_only_shape);
     let selected_active_game_mods = selects_active_game_mods(request);
     let logical_selected_adapter = logical_install_analysis
         .as_ref()
@@ -2658,6 +2674,15 @@ fn analyze_internal(
         replacement_shape && composite_package_probe.is_some() && adapter_blockers.is_empty();
     let plugin_only_can_update = plugin_only_gate_ready && adapter_blockers.is_empty();
     let pak_only_can_update = pak_only_passthrough_shape && adapter_blockers.is_empty();
+    let additive_container_only_can_update = additive_container_only_shape
+        && !replacement_shape
+        && mixed_iostore_dependency_probe
+            .as_ref()
+            .is_some_and(|probe| probe.collision_count == 0)
+        && replacement_probe.is_none()
+        && heterogeneous_replacement_probe.is_none()
+        && composite_package_probe.is_none()
+        && adapter_blockers.is_empty();
     let direct_can_update = additive_can_update
         || mixed_composite_can_update
         || magicloader_can_update
@@ -2668,7 +2693,8 @@ fn analyze_internal(
         || heterogeneous_replacement_can_update
         || composite_package_can_update
         || plugin_only_can_update
-        || pak_only_can_update;
+        || pak_only_can_update
+        || additive_container_only_can_update;
     let logical_publication_adapter = install_plan
         .as_ref()
         .filter(|plan| supports_logical_install_publication(plan))
@@ -2985,6 +3011,17 @@ fn analyze_internal(
         },
     });
     capabilities.push(Capability {
+        id: ADDITIVE_CONTAINER_ONLY_ADAPTER.to_owned(),
+        available: additive_container_only_can_update,
+        evidence_level: "structural-additive-container-passthrough".to_owned(),
+        description: "Passthrough lane for pure-additive container mods with no game package collisions. All IoStore containers pass through byte-preserved without package-level probing.".to_owned(),
+        blockers: if additive_container_only_can_update {
+            Vec::new()
+        } else {
+            vec!["mod-does-not-match-additive-container-only-lane".to_owned()]
+        },
+    });
+    capabilities.push(Capability {
         id: "pinned-offhand-staff-a-v1".to_owned(),
         available: false,
         evidence_level: "separate-audited-donor-cli".to_owned(),
@@ -2995,6 +3032,7 @@ fn analyze_internal(
         && !magicloader_worldspace_gate_ready
         && !plugin_only_gate_ready
         && !pak_only_passthrough_shape
+        && !additive_container_only_can_update
         && !mixed_composite_layout
         && replacement_probe.is_none()
         && heterogeneous_replacement_probe.is_none()
@@ -3034,6 +3072,8 @@ fn analyze_internal(
         Some(PLUGIN_ONLY_ADAPTER.to_owned())
     } else if pak_only_can_update {
         Some(PAK_ONLY_PASSTHROUGH_ADAPTER.to_owned())
+    } else if additive_container_only_can_update {
+        Some(ADDITIVE_CONTAINER_ONLY_ADAPTER.to_owned())
     } else if logical_install_can_update {
         logical_publication_adapter.clone()
     } else {

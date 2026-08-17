@@ -408,6 +408,14 @@ fn analyze_parsed_plugin(
                     "Record FormIDs use preserved self slot {self_index} beyond the {plugin_index} declared master(s); unique-only inference keeps those records plugin-owned without rewriting their authored identities"
                 ));
             }
+            Some(SelfSlotInference::Inferred { self_index, basis })
+                if *basis == "master-count-with-out-of-range-siblings" =>
+            {
+                warnings.push(format!(
+                    "Self slot inferred as {self_index} (= master count); {} record(s) in higher slots are byte-preserved out-of-range siblings from a removed master dependency",
+                    out_of_range_record_count
+                ));
+            }
             Some(SelfSlotInference::Ambiguous { candidates }) => {
                 structural_blockers.push(format!(
                     "self-slot-inference-ambiguous:candidates-{}",
@@ -420,7 +428,10 @@ fn analyze_parsed_plugin(
             }
             _ => {}
         }
-        if out_of_range_record_count > 0 {
+        let self_slot_resolved = self_slot
+            .as_ref()
+            .is_some_and(|slot| slot.self_index().is_some());
+        if out_of_range_record_count > 0 && !self_slot_resolved {
             structural_blockers.push("record-form-ids-exceed-master-plugin-index-range".to_owned());
         }
         if reserved_local_form_id_count > 0 {
@@ -3386,7 +3397,7 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_and_names_ambiguous_self_slot_candidates() {
+    fn resolves_master_count_self_slot_with_out_of_range_siblings() {
         let temp = tempfile::tempdir().unwrap();
         write_plugin(
             temp.path(),
@@ -3400,16 +3411,8 @@ mod tests {
         let report = inspect_plugin_set(temp.path()).unwrap();
         let artifact = &report.artifacts[0];
         assert_eq!(artifact.out_of_range_record_count, 1);
-        assert!(
-            artifact
-                .structural_blockers
-                .contains(&"record-form-ids-exceed-master-plugin-index-range".to_owned())
-        );
-        assert!(
-            artifact
-                .structural_blockers
-                .contains(&"self-slot-inference-ambiguous:candidates-0x01,0x02".to_owned())
-        );
+        assert!(artifact.structural_blockers.is_empty());
+        assert!(artifact.warnings.iter().any(|w| w.contains("out-of-range siblings")));
     }
 
     #[test]

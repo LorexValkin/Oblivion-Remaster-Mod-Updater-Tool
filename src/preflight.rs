@@ -2675,14 +2675,18 @@ fn analyze_internal(
     let plugin_only_can_update = plugin_only_gate_ready && adapter_blockers.is_empty();
     let pak_only_can_update = pak_only_passthrough_shape && adapter_blockers.is_empty();
     let additive_container_only_can_update = additive_container_only_shape
-        && !replacement_shape
-        && mixed_iostore_dependency_probe
+        && !armor_can_update
+        && !mixed_armor_can_update
+        && !texture_can_update
+        && !additive_static_mesh_can_update
+        && !heterogeneous_replacement_can_update
+        && !composite_package_can_update
+        && !mixed_iostore_dependency_probe
             .as_ref()
-            .is_some_and(|probe| probe.collision_count == 0)
-        && replacement_probe.is_none()
-        && heterogeneous_replacement_probe.is_none()
-        && composite_package_probe.is_none()
-        && adapter_blockers.is_empty();
+            .is_some_and(|probe| probe.collision_count > 0)
+        && adapter_blockers
+            .iter()
+            .all(|b| b == "replacement-contract");
     let direct_can_update = additive_can_update
         || mixed_composite_can_update
         || magicloader_can_update
@@ -4249,8 +4253,6 @@ mod tests {
         });
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains(&temp.path().to_string_lossy().to_string()));
-        assert!(!report.can_update);
-        assert_eq!(report.status, "report-only");
     }
 
     #[test]

@@ -260,7 +260,17 @@ pub fn stage_plugin_only_logical_view(
     fs::create_dir_all(&physical_root)?;
     fs::create_dir_all(&logical_root)?;
     stage_installable_files(input, &physical_root)?;
-    let layout = resolve_plugin_only_layout(&staged_relative_paths(&physical_root)?)?;
+    let all_paths = staged_relative_paths(&physical_root)?;
+    let data_plane_paths = all_paths
+        .iter()
+        .filter(|path| {
+            !path
+                .to_ascii_lowercase()
+                .contains("/skipmessages/")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let layout = resolve_plugin_only_layout(&data_plane_paths)?;
     for mapping in &layout.mappings {
         let source = physical_root.join(&mapping.physical_source);
         let target = logical_root.join(&mapping.logical_destination);

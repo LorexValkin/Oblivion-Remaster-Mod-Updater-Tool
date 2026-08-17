@@ -1244,6 +1244,7 @@ fn parse_fomod(sources: &SourceIndex, xml: &[u8]) -> Result<InstallPlan> {
                 let name = event_name(&start);
                 let frame = match name.as_str() {
                     "requiredinstallfiles" => XmlFrame::Required,
+                    "typedescriptor" | "image" => XmlFrame::Other,
                     "moduledependencies"
                     | "conditionalfileinstalls"
                     | "dependencies"
@@ -1253,7 +1254,6 @@ fn parse_fomod(sources: &SourceIndex, xml: &[u8]) -> Result<InstallPlan> {
                     | "fommdependency"
                     | "visible"
                     | "conditionflags"
-                    | "typedescriptor"
                     | "dependencytype" => {
                         bail!(
                             "conditional or type-dependent FOMOD element is not supported by this bounded reader: {name}"
@@ -1334,7 +1334,6 @@ fn parse_fomod(sources: &SourceIndex, xml: &[u8]) -> Result<InstallPlan> {
                         | "fommdependency"
                         | "visible"
                         | "conditionflags"
-                        | "typedescriptor"
                         | "dependencytype"
                 ) {
                     bail!(
@@ -1989,7 +1988,7 @@ mod tests {
             </files><typeDescriptor><type name="Optional" /></typeDescriptor></plugin>
           </plugins></group>
         </optionalFileGroups></installStep></installSteps></config>"#;
-        assert!(resolve_install_plan(&source, Some(typed_option)).is_err());
+        assert!(resolve_install_plan(&source, Some(typed_option)).is_ok());
     }
 
     #[test]

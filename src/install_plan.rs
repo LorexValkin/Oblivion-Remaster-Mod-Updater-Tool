@@ -189,11 +189,13 @@ pub fn nested_logical_install_adapter(adapter: &str) -> Option<&str> {
 /// group currently has only one possible selection.
 pub fn supports_logical_install_publication(plan: &InstallPlan) -> bool {
     plan.api == INSTALL_PLAN_API
-        && plan.choice_groups.is_empty()
+        && plan.choice_groups.iter().all(|group| group.options.len() == 1)
         && !plan.mappings.is_empty()
         && matches!(
             plan.evidence,
-            LayoutEvidence::Canonical | LayoutEvidence::ManualStructural
+            LayoutEvidence::Canonical
+                | LayoutEvidence::ManualStructural
+                | LayoutEvidence::Fomod
         )
 }
 

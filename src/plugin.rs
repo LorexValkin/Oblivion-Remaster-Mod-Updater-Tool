@@ -1,8 +1,9 @@
 use crate::archive::{MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions, sha256_bytes};
 use crate::tes4::{
-    COMPRESSED_RECORD, DELETED_RECORD, LIGHT_PLUGIN, MASTER_FILE, Plugin, Record,
+    COMPRESSED_RECORD, DELETED_RECORD, GROUP_CELL_TEMPORARY_CHILDREN, LIGHT_PLUGIN, MASTER_FILE,
+    Plugin, Record, SelfSlotInference, UndeleteDisableEvidence, infer_self_slot,
     merge_inventory_addition, package_to_game_path, read_plugin_bytes, read_sync_map_bytes,
-    supports_additive_inventory_record,
+    record_group_contexts, supports_additive_inventory_record, undelete_and_disable_refr,
 };
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -162,8 +163,86 @@ pub struct WorldspaceMasterProbeReport {
     pub type_mismatch_override_count: usize,
     pub deleted_master_override_count: usize,
     pub masters: Vec<InstalledMasterProbe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_gate: Option<WorldspaceSemanticGateReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_override_policy: Option<DeletedOverridePolicyReport>,
     pub blockers: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+pub const WORLDSPACE_SEMANTIC_GATE_API: &str = "tes4-current-master-semantic-gate-v1";
+pub const UNDELETE_DISABLE_POLICY_API: &str = "tes4-undelete-and-disable-v1";
+/// Base-object record classes whose vanilla cell-temporary placements are proven inert to
+/// undelete-and-disable: static dressing, furniture, containers, and leveled spawn points.
+pub const INERT_DELETION_BASE_KINDS: &[&str] = &["STAT", "FURN", "CONT", "LVLC", "LVLI"];
+
+/// Per-subrecord three-way classification of one master override against its declared
+/// origin master and the effective current winner.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverrideSemanticDisclosure {
+    pub form_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub origin_master: String,
+    pub winner_provider: String,
+    pub authored_fields: Vec<String>,
+    pub revert_risk_fields: Vec<String>,
+    pub merge_needed_fields: Vec<String>,
+    pub flag_classification: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldspaceSemanticGateReport {
+    pub api: String,
+    pub status: String,
+    pub evaluated_override_count: usize,
+    pub identical_override_count: usize,
+    pub authored_field_change_count: usize,
+    pub revert_risk_field_count: usize,
+    pub merge_needed_field_count: usize,
+    pub overrides: Vec<OverrideSemanticDisclosure>,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedRefrDisclosure {
+    pub form_id: String,
+    pub origin_master: String,
+    pub winner_provider: String,
+    pub enclosing_cell_form_id: String,
+    pub base_form_id: String,
+    pub base_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_editor_id: Option<String>,
+    pub evidence: UndeleteDisableEvidence,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedOverridePolicyReport {
+    pub api: String,
+    pub status: String,
+    pub deletion_stub_count: usize,
+    pub transformable_count: usize,
+    pub base_object_kinds: BTreeMap<String, usize>,
+    pub records: Vec<DeletedRefrDisclosure>,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Complete fail-closed evaluation of a multi-master worldspace plugin's override
+/// semantics against the installed master chain, including the planned
+/// undelete-and-disable replacements for witness-shaped REFR deletion stubs.
+#[derive(Clone, Debug)]
+pub struct WorldspaceLaneEvaluation {
+    pub semantic_gate: WorldspaceSemanticGateReport,
+    pub deleted_override_policy: DeletedOverridePolicyReport,
+    pub deletion_replacements: HashMap<u32, Record>,
 }
 
 impl PluginSetReport {
@@ -266,6 +345,13 @@ fn analyze_parsed_plugin(
     let plugin_index = plugin.masters.len();
     let light_semantics = kind == "esl" || plugin.header_flags & LIGHT_PLUGIN != 0;
     let ordinary_form_ids = !light_semantics && plugin_index <= u8::MAX as usize;
+    let self_slot = ordinary_form_ids
+        .then(|| crate::tes4::infer_self_slot(plugin_index as u8, &plugin.records));
+    let owned_index = self_slot
+        .as_ref()
+        .and_then(SelfSlotInference::self_index)
+        .map(usize::from)
+        .unwrap_or(plugin_index);
 
     for record in &plugin.records {
         *record_type_counts.entry(record.kind.clone()).or_default() += 1;
@@ -288,7 +374,7 @@ fn analyze_parsed_plugin(
             *master_override_type_counts
                 .entry(record.kind.clone())
                 .or_default() += 1;
-        } else if source_index == plugin_index {
+        } else if source_index == owned_index {
             plugin_owned_record_count += 1;
             let local_id = record.form_id & 0x00ff_ffff;
             max_owned_local_id =
@@ -314,7 +400,38 @@ fn analyze_parsed_plugin(
     } else if plugin_index > u8::MAX as usize {
         structural_blockers.push("master-count-exceeds-full-plugin-index-space".to_owned());
     } else {
-        if out_of_range_record_count > 0 {
+        match self_slot.as_ref() {
+            Some(SelfSlotInference::Inferred { self_index, basis })
+                if *basis == crate::tes4::SELF_SLOT_BASIS_PRESERVED_OUT_OF_RANGE =>
+            {
+                warnings.push(format!(
+                    "Record FormIDs use preserved self slot {self_index} beyond the {plugin_index} declared master(s); unique-only inference keeps those records plugin-owned without rewriting their authored identities"
+                ));
+            }
+            Some(SelfSlotInference::Inferred { self_index, basis })
+                if *basis == "master-count-with-out-of-range-siblings" =>
+            {
+                warnings.push(format!(
+                    "Self slot inferred as {self_index} (= master count); {} record(s) in higher slots are byte-preserved out-of-range siblings from a removed master dependency",
+                    out_of_range_record_count
+                ));
+            }
+            Some(SelfSlotInference::Ambiguous { candidates }) => {
+                structural_blockers.push(format!(
+                    "self-slot-inference-ambiguous:candidates-{}",
+                    candidates
+                        .iter()
+                        .map(|index| format!("0x{index:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+            _ => {}
+        }
+        let self_slot_resolved = self_slot
+            .as_ref()
+            .is_some_and(|slot| slot.self_index().is_some());
+        if out_of_range_record_count > 0 && !self_slot_resolved {
             structural_blockers.push("record-form-ids-exceed-master-plugin-index-range".to_owned());
         }
         if reserved_local_form_id_count > 0 {
@@ -348,6 +465,12 @@ fn analyze_parsed_plugin(
             "Plugin contains deleted records; semantic update requires a dedicated record adapter"
                 .to_owned(),
         );
+    }
+    if plugin.recovered_zero_size_group_count > 0 {
+        warnings.push(format!(
+            "{} zero-size GRUP header(s) were recovered as empty groups during parsing; the plugin bytes stay untouched and any record-rewriting transform refuses this shape",
+            plugin.recovered_zero_size_group_count
+        ));
     }
     structural_blockers.sort();
     structural_blockers.dedup();
@@ -477,15 +600,10 @@ fn evaluate_additive_policy(
         if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
             blockers.push("requires-oblivion-esm-as-first-master".to_owned());
         }
-        if plugin
-            .master_override_type_counts
-            .keys()
-            .any(|kind| !supports_additive_inventory_record(kind))
-        {
-            blockers.push(
-                "master-overrides-outside-supported-inventory-records-are-unsupported".to_owned(),
-            );
-        }
+        // Master overrides outside the CONT/CREA/NPC_ inventory contract are no
+        // longer a policy-level rejection: the additive contract routes them
+        // through the per-subrecord three-way current-master semantic gate and
+        // fails closed there when identity or type resolution is unproven.
         blockers.extend(plugin.structural_blockers.iter().cloned());
     }
     blockers.sort();
@@ -494,12 +612,370 @@ fn evaluate_additive_policy(
         id: ADDITIVE_PLUGIN_POLICY.to_owned(),
         compatible: blockers.is_empty(),
         mutation_policy: if blockers.is_empty() {
-            "merge-current-master-inventory-and-preserve-plugin-additions".to_owned()
+            "merge-current-master-inventory-gate-validate-other-master-overrides-and-preserve-plugin-additions"
+                .to_owned()
         } else {
             "report-only".to_owned()
         },
         blockers,
     }
+}
+
+pub const MAGICLOADER_SYNCMAP_KEY_GATE_API: &str = "tes4-syncmap-plugin-key-gate-v1";
+
+/// Bounded SyncMap key gate for the MagicLoader worldspace lane: exactly one SyncMap INI,
+/// non-empty, unique keys, every key's 24-bit local FormID owned by the single staged ESP.
+/// Package-target closure is enforced separately by the update lane's layered resolver.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagicLoaderSyncMapGate {
+    pub api: String,
+    pub status: String,
+    pub entry_count: usize,
+    pub plugin_owned_key_count: usize,
+    pub blockers: Vec<String>,
+}
+
+pub fn inspect_magicloader_syncmap_gate(
+    input: &Path,
+    candidate_root: Option<&str>,
+) -> Result<MagicLoaderSyncMapGate> {
+    let (_staged, root, _scan_mode) = inspect_staged_plugin_input(input, candidate_root)?;
+    let mut gate = MagicLoaderSyncMapGate {
+        api: MAGICLOADER_SYNCMAP_KEY_GATE_API.to_owned(),
+        status: "blocked".to_owned(),
+        entry_count: 0,
+        plugin_owned_key_count: 0,
+        blockers: Vec::new(),
+    };
+    let esp_paths = bounded_tree_paths(&root, |path| {
+        plugin_kind(path).as_deref() == Some("esp")
+    })?;
+    let [esp_path] = esp_paths.as_slice() else {
+        gate.blockers.push(format!(
+            "requires-exactly-one-staged-esp:found-{}",
+            esp_paths.len()
+        ));
+        return Ok(gate);
+    };
+    let ini_paths = bounded_tree_paths(&root, |path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("ini"))
+            && direct_sync_map_ini(&normalize_relative(
+                path.strip_prefix(&root).unwrap_or(path),
+            ))
+    })?;
+    let [ini_path] = ini_paths.as_slice() else {
+        gate.blockers.push(format!(
+            "requires-exactly-one-syncmap-ini:found-{}",
+            ini_paths.len()
+        ));
+        return Ok(gate);
+    };
+    let esp_relative = normalize_relative(esp_path.strip_prefix(&root).unwrap_or(esp_path));
+    let payload = bounded_plugin_payload(esp_path, &esp_relative)?;
+    let plugin = read_plugin_bytes(&payload, &esp_relative)?;
+    let plugin_index = u8::try_from(plugin.masters.len())
+        .map_err(|_| anyhow::anyhow!("master count exceeds the full-plugin FormID index space"))?;
+    let Some(owned_index) = infer_self_slot(plugin_index, &plugin.records).self_index() else {
+        gate.blockers
+            .push("self-slot-inference-ambiguous".to_owned());
+        return Ok(gate);
+    };
+    let owned_local_ids = plugin
+        .records
+        .iter()
+        .filter(|record| (record.form_id >> 24) as u8 == owned_index)
+        .map(|record| record.form_id & 0x00ff_ffff)
+        .collect::<HashSet<_>>();
+    let ini_relative = normalize_relative(ini_path.strip_prefix(&root).unwrap_or(ini_path));
+    let ini_payload = bounded_file_payload(ini_path, &ini_relative, MAX_PLUGIN_BYTES)?;
+    let entries = read_sync_map_bytes(&ini_payload, &ini_relative)?;
+    gate.entry_count = entries.len();
+    if entries.is_empty() {
+        gate.blockers.push("syncmap-declares-no-meshes-entries".to_owned());
+    }
+    let mut seen = HashSet::new();
+    for entry in &entries {
+        let local_id =
+            u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)
+                .with_context(|| format!("SyncMap key {} is not hexadecimal", entry.key))?;
+        if !seen.insert(local_id) {
+            gate.blockers.push(format!(
+                "syncmap-key-duplicates-plugin-local-id:0x{local_id:06X}"
+            ));
+            continue;
+        }
+        if owned_local_ids.contains(&local_id) {
+            gate.plugin_owned_key_count += 1;
+        } else {
+            gate.blockers
+                .push(format!("syncmap-key-not-plugin-owned:0x{local_id:06X}"));
+        }
+    }
+    gate.blockers.sort();
+    gate.blockers.dedup();
+    if gate.blockers.is_empty() {
+        gate.status = "proven".to_owned();
+    }
+    Ok(gate)
+}
+
+pub const MAGICLOADER_WORLDSPACE_PLUGIN_POLICY: &str = "tes4-magicloader-worldspace-policy-v1";
+
+/// Plugin policy for the MagicLoader worldspace lane: one structurally sound full ESP
+/// directly under Data with Oblivion.esm first. Master overrides (including worldspace
+/// domains) are allowed here because the lane validates them through the current-master
+/// semantic gate and the undelete-and-disable deletion policy instead of the additive
+/// inventory contract.
+pub fn evaluate_magicloader_worldspace_policy(report: &PluginSetReport) -> PluginPolicyEvaluation {
+    let mut blockers = report.blockers.clone();
+    if report.artifacts.len() != 1 {
+        blockers.push("requires-exactly-one-plugin".to_owned());
+    }
+    if let Some(plugin) = report.artifacts.first().filter(|_| report.artifacts.len() == 1) {
+        if plugin.kind != "esp" {
+            blockers.push("requires-one-full-esp-not-esm-or-esl".to_owned());
+        }
+        if plugin.master_flag {
+            blockers.push("esp-header-declares-master-file".to_owned());
+        }
+        if plugin.light_plugin_flag {
+            blockers.push("esp-header-declares-light-plugin".to_owned());
+        }
+        if !direct_game_data_plugin(&plugin.relative_path) {
+            blockers.push("esp-is-not-directly-under-content-dev-obvdata-data".to_owned());
+        }
+        if plugin.parse_status != "parsed" {
+            blockers.push("esp-could-not-be-parsed".to_owned());
+        }
+        if plugin.masters.is_empty() || !plugin.masters[0].eq_ignore_ascii_case("Oblivion.esm") {
+            blockers.push("requires-oblivion-esm-as-first-master".to_owned());
+        }
+        blockers.extend(plugin.structural_blockers.iter().cloned());
+    }
+    blockers.sort();
+    blockers.dedup();
+    PluginPolicyEvaluation {
+        id: MAGICLOADER_WORLDSPACE_PLUGIN_POLICY.to_owned(),
+        compatible: blockers.is_empty(),
+        mutation_policy: if blockers.is_empty() {
+            "undelete-and-disable-witness-deletion-stubs-and-preserve-every-other-record-byte"
+                .to_owned()
+        } else {
+            "report-only".to_owned()
+        },
+        blockers,
+    }
+}
+
+/// Per-plugin additive policy over the LOGICAL plugin set (byte-identical
+/// SyncMap mirrors already collapsed). Each logical plugin is evaluated by the
+/// same single-plugin additive contract; set-level problems (filename
+/// collisions, bundled-master cycles, ambiguous masters) stay in the set
+/// report's own blockers and must be checked by the caller separately.
+pub fn evaluate_additive_policy_for_each(
+    report: &PluginSetReport,
+) -> Vec<(String, PluginPolicyEvaluation)> {
+    let mirror_paths = report
+        .plugin_mirrors
+        .iter()
+        .map(|mirror| mirror.mirror_relative_path.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    report
+        .artifacts
+        .iter()
+        .filter(|artifact| !mirror_paths.contains(&artifact.relative_path.to_ascii_lowercase()))
+        .map(|artifact| {
+            (
+                artifact.file_name.clone(),
+                evaluate_additive_policy(std::slice::from_ref(artifact), &[]),
+            )
+        })
+        .collect()
+}
+
+pub const MIXED_SYNCMAP_BINDING_GATE_API: &str = "tes4-mixed-syncmap-binding-gate-v1";
+
+/// One SyncMap INI bound to the plugin the TesSyncMapInjector pairs it with:
+/// the INI file stem must equal exactly one staged plugin stem, and every
+/// entry's 24-bit local FormID must be owned by that plugin's inferred self
+/// slot.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixedSyncMapBinding {
+    pub ini_relative_path: String,
+    pub plugin_file_name: String,
+    pub entry_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MixedSyncMapBindingGate {
+    pub api: String,
+    pub status: String,
+    pub logical_plugin_count: usize,
+    pub bound_plugin_count: usize,
+    pub bindings: Vec<MixedSyncMapBinding>,
+    pub blockers: Vec<String>,
+}
+
+/// N-ary SyncMap binding gate for mixed multi-plane mods: zero or more SyncMap
+/// INIs, each binding by file stem to exactly one staged plugin and owning all
+/// of its keys there. Plugins without a SyncMap remain valid (their plane needs
+/// no injector mapping); an INI that binds to no plugin or leaks keys outside
+/// its plugin's self slot fails closed.
+pub fn inspect_mixed_syncmap_binding_gate(
+    input: &Path,
+    candidate_root: Option<&str>,
+) -> Result<MixedSyncMapBindingGate> {
+    let (_staged, root, _scan_mode) = inspect_staged_plugin_input(input, candidate_root)?;
+    let mut gate = MixedSyncMapBindingGate {
+        api: MIXED_SYNCMAP_BINDING_GATE_API.to_owned(),
+        status: "blocked".to_owned(),
+        logical_plugin_count: 0,
+        bound_plugin_count: 0,
+        bindings: Vec::new(),
+        blockers: Vec::new(),
+    };
+    let esp_paths = bounded_tree_paths(&root, |path| {
+        plugin_kind(path).as_deref() == Some("esp")
+    })?;
+    // Collapse byte-identical duplicate stems (recognized mirrors) and refuse
+    // ambiguous distinct plugins sharing one stem: the injector pairs by stem.
+    let mut esp_by_stem = BTreeMap::<String, Vec<&PathBuf>>::new();
+    for path in &esp_paths {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("staged plugin has no Unicode stem")?
+            .to_ascii_lowercase();
+        esp_by_stem.entry(stem).or_default().push(path);
+    }
+    gate.logical_plugin_count = esp_by_stem.len();
+    let ini_paths = bounded_tree_paths(&root, |path| {
+        path.extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("ini"))
+            && direct_sync_map_ini(&normalize_relative(
+                path.strip_prefix(&root).unwrap_or(path),
+            ))
+    })?;
+    let mut bound_stems = HashSet::new();
+    for ini_path in &ini_paths {
+        let ini_relative = normalize_relative(ini_path.strip_prefix(&root).unwrap_or(ini_path));
+        let ini_stem = ini_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .context("SyncMap INI has no Unicode stem")?
+            .to_ascii_lowercase();
+        let Some(esp_candidates) = esp_by_stem.get(&ini_stem) else {
+            gate.blockers.push(format!(
+                "syncmap-ini-binds-to-no-staged-plugin-stem:{ini_relative}"
+            ));
+            continue;
+        };
+        let esp_path = esp_candidates[0];
+        if esp_candidates.len() > 1 {
+            let esp_relative =
+                normalize_relative(esp_path.strip_prefix(&root).unwrap_or(esp_path));
+            let payload = bounded_plugin_payload(esp_path, &esp_relative)?;
+            if esp_candidates.iter().skip(1).any(|candidate| {
+                let relative =
+                    normalize_relative(candidate.strip_prefix(&root).unwrap_or(candidate));
+                bounded_plugin_payload(candidate, &relative)
+                    .map(|bytes| bytes != payload)
+                    .unwrap_or(true)
+            }) {
+                gate.blockers.push(format!(
+                    "syncmap-ini-stem-is-ambiguous-across-distinct-plugins:{ini_relative}"
+                ));
+                continue;
+            }
+        }
+        let esp_relative = normalize_relative(esp_path.strip_prefix(&root).unwrap_or(esp_path));
+        let payload = bounded_plugin_payload(esp_path, &esp_relative)?;
+        let plugin = match read_plugin_bytes(&payload, &esp_relative) {
+            Ok(plugin) => plugin,
+            Err(_) => {
+                gate.blockers
+                    .push(format!("syncmap-bound-plugin-parse-failed:{esp_relative}"));
+                continue;
+            }
+        };
+        let Ok(master_count) = u8::try_from(plugin.masters.len()) else {
+            gate.blockers
+                .push(format!("syncmap-bound-plugin-master-overflow:{esp_relative}"));
+            continue;
+        };
+        let Some(owned_index) =
+            crate::tes4::infer_self_slot(master_count, &plugin.records).self_index()
+        else {
+            gate.blockers.push(format!(
+                "syncmap-bound-plugin-self-slot-ambiguous:{esp_relative}"
+            ));
+            continue;
+        };
+        let owned_local_ids = plugin
+            .records
+            .iter()
+            .filter(|record| (record.form_id >> 24) as u8 == owned_index)
+            .map(|record| record.form_id & 0x00ff_ffff)
+            .collect::<HashSet<_>>();
+        let ini_payload = bounded_file_payload(ini_path, &ini_relative, MAX_PLUGIN_BYTES)?;
+        let entries = read_sync_map_bytes(&ini_payload, &ini_relative)?;
+        if entries.is_empty() {
+            gate.blockers.push(format!(
+                "syncmap-declares-no-meshes-entries:{ini_relative}"
+            ));
+            continue;
+        }
+        let mut seen = HashSet::new();
+        let mut entry_blockers = 0_usize;
+        for entry in &entries {
+            let local_id = u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)
+                .with_context(|| format!("SyncMap key {} is not hexadecimal", entry.key))?;
+            if !seen.insert(local_id) {
+                gate.blockers.push(format!(
+                    "syncmap-key-duplicates-plugin-local-id:{ini_relative}:0x{local_id:06X}"
+                ));
+                entry_blockers += 1;
+                continue;
+            }
+            if !owned_local_ids.contains(&local_id) {
+                gate.blockers.push(format!(
+                    "syncmap-key-not-plugin-owned:{ini_relative}:0x{local_id:06X}"
+                ));
+                entry_blockers += 1;
+            }
+        }
+        if entry_blockers == 0 {
+            if bound_stems.insert(ini_stem.clone()) {
+                gate.bound_plugin_count += 1;
+            } else {
+                gate.blockers.push(format!(
+                    "multiple-syncmap-inis-bind-one-plugin-stem:{ini_relative}"
+                ));
+                continue;
+            }
+            gate.bindings.push(MixedSyncMapBinding {
+                ini_relative_path: ini_relative,
+                plugin_file_name: esp_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                entry_count: entries.len(),
+            });
+        }
+    }
+    gate.blockers.sort();
+    gate.blockers.dedup();
+    if gate.blockers.is_empty() {
+        gate.status = "proven".to_owned();
+    }
+    Ok(gate)
 }
 
 fn bounded_file_payload(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>> {
@@ -1281,9 +1757,11 @@ fn case_insensitive_data_entries(
     Ok(entries)
 }
 
-/// Resolves records against the effective installed master chain. Requiring every master's own
-/// dependency list to be the exact preceding prefix keeps all embedded full-plugin FormIDs aligned
-/// with the staged plugin while still supporting arbitrary-length DLC/mod master chains.
+/// Resolves records against the effective installed master chain. When records must resolve
+/// through the chain, every master's own dependency list must be the exact preceding prefix so
+/// all embedded full-plugin FormIDs stay aligned with the staged plugin; when nothing resolves
+/// through the chain, name-based presence of each declared master is the complete requirement
+/// and every installed master keeps its own free master order.
 pub fn resolve_installed_master_records(
     plugin: &Plugin,
     game_data_dir: &Path,
@@ -1312,6 +1790,38 @@ pub fn resolve_installed_master_records(
         staged_identities.push((form_id, identity));
     }
     let data_entries = case_insensitive_data_entries(game_data_dir)?;
+    if wanted.is_empty() {
+        // Nothing in the staged plugin resolves through the chain, so raw
+        // FormID alignment is irrelevant. TES4 MAST entries name the defining
+        // plugin directly (the Unblivion lineage model), so name-based
+        // presence of every declared master as one direct regular TES4 Data
+        // file is the complete requirement; each installed master keeps its
+        // own free master order.
+        for declared_name in &plugin.masters {
+            let candidates = data_entries
+                .get(&declared_name.to_ascii_lowercase())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if candidates.len() != 1 {
+                bail!(
+                    "declared master {declared_name} requires one case-insensitive Data match; found {}",
+                    candidates.len()
+                );
+            }
+            let candidate = &candidates[0];
+            if !candidate.regular_file || candidate.symlink {
+                bail!("declared master {declared_name} is not a direct regular Data file");
+            }
+            let mut magic = [0_u8; 4];
+            fs::File::open(&candidate.path)
+                .and_then(|mut file| file.read_exact(&mut magic))
+                .with_context(|| format!("reading installed master {declared_name}"))?;
+            if &magic != b"TES4" {
+                bail!("installed master {declared_name} does not begin with a TES4 header");
+            }
+        }
+        return Ok(HashMap::new());
+    }
     let mut effective = BTreeMap::<CanonicalFormId, IndexedMasterRecord>::new();
     for (master_index, declared_name) in plugin.masters.iter().enumerate() {
         let candidates = data_entries
@@ -1369,9 +1879,496 @@ pub fn resolve_installed_master_records(
     Ok(resolved)
 }
 
+fn subrecord_tag_values(record: &Record) -> BTreeMap<String, Vec<Vec<u8>>> {
+    let mut values = BTreeMap::<String, Vec<Vec<u8>>>::new();
+    for sub in &record.subrecords {
+        values.entry(sub.kind.clone()).or_default().push(sub.data.clone());
+    }
+    values
+}
+
+fn three_way_field_classification(
+    mod_values: Option<&Vec<Vec<u8>>>,
+    winner_values: Option<&Vec<Vec<u8>>>,
+    origin_values: Option<&Vec<Vec<u8>>>,
+) -> Option<&'static str> {
+    if mod_values == winner_values {
+        return None;
+    }
+    if mod_values == origin_values {
+        Some("revert-risk")
+    } else if winner_values == origin_values {
+        Some("authored")
+    } else {
+        Some("merge-needed")
+    }
+}
+
+struct DeletionCandidate<'a> {
+    record: &'a Record,
+    origin_master: String,
+    enclosing_cell_form_id: u32,
+    winner: IndexedMasterRecord,
+    remap: HashMap<u8, u8>,
+    base_form_id: u32,
+    base_identity: CanonicalFormId,
+    base_master_index: usize,
+    player_form_id: u32,
+}
+
+/// Evaluates every master override of a multi-master worldspace plugin against the
+/// installed master chain: a per-subrecord three-way semantic classification for live
+/// overrides, and the fail-closed undelete-and-disable policy for deletion stubs.
+/// Master FormIDs are resolved through each installed master's OWN master list, so a
+/// current master whose declared order differs from the staged plugin's still aligns.
+pub fn evaluate_worldspace_lane_semantics(
+    plugin: &Plugin,
+    plugin_bytes: &[u8],
+    plugin_source: &str,
+    game_data_dir: &Path,
+) -> Result<WorldspaceLaneEvaluation> {
+    if plugin.masters.is_empty() || plugin.masters.len() > u8::MAX as usize {
+        bail!("worldspace semantics require a non-empty full-master chain");
+    }
+    let mut names = HashSet::new();
+    if plugin
+        .masters
+        .iter()
+        .any(|name| !names.insert(name.to_ascii_lowercase()))
+    {
+        bail!("plugin declares duplicate case-insensitive master names");
+    }
+    let mut overrides = Vec::new();
+    let mut wanted = BTreeSet::new();
+    for record in &plugin.records {
+        let source_index = (record.form_id >> 24) as usize;
+        if source_index < plugin.masters.len() {
+            let identity = canonical_form_id(plugin_source, &plugin.masters, record.form_id)?;
+            wanted.insert(identity.clone());
+            overrides.push((record, identity));
+        }
+    }
+    overrides.sort_by_key(|(record, _)| record.form_id);
+
+    let data_entries = case_insensitive_data_entries(game_data_dir)?;
+    let single_data_entry = |declared_name: &str| -> Result<&DataEntryCandidate> {
+        let candidates = data_entries
+            .get(&declared_name.to_ascii_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match candidates {
+            [candidate] if candidate.regular_file && !candidate.symlink => Ok(candidate),
+            [_] => bail!("declared master {declared_name} is not a direct regular Data file"),
+            [] => bail!("declared master is missing: {declared_name}"),
+            _ => bail!("declared master {declared_name} matches multiple Data entries"),
+        }
+    };
+    let mut master_indexes = Vec::new();
+    for declared_name in &plugin.masters {
+        let candidate = single_data_entry(declared_name)?;
+        let index = index_installed_master(&candidate.path, declared_name, &wanted)
+            .with_context(|| format!("indexing declared master {declared_name}"))?;
+        master_indexes.push(index);
+    }
+
+    let mut semantic_gate = WorldspaceSemanticGateReport {
+        api: WORLDSPACE_SEMANTIC_GATE_API.to_owned(),
+        status: "blocked".to_owned(),
+        evaluated_override_count: 0,
+        identical_override_count: 0,
+        authored_field_change_count: 0,
+        revert_risk_field_count: 0,
+        merge_needed_field_count: 0,
+        overrides: Vec::new(),
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let mut deletion_policy = DeletedOverridePolicyReport {
+        api: UNDELETE_DISABLE_POLICY_API.to_owned(),
+        status: "not-applicable".to_owned(),
+        deletion_stub_count: 0,
+        transformable_count: 0,
+        base_object_kinds: BTreeMap::new(),
+        records: Vec::new(),
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+    };
+    for (master_index, index) in master_indexes.iter().enumerate() {
+        for form_id in &index.unmappable_target_collisions {
+            semantic_gate.blockers.push(format!(
+                "installed-master-unmappable-record-collides-with-target-local-id:{}:0x{form_id:08X}",
+                plugin.masters[master_index]
+            ));
+        }
+        if index.unmappable_record_count > 0 {
+            semantic_gate.warnings.push(format!(
+                "{}: {} record(s) whose source index cannot be mapped by that master's own master list were excluded from winner resolution",
+                plugin.masters[master_index], index.unmappable_record_count
+            ));
+        }
+    }
+
+    // Effective winner per canonical identity: last declared master in ESP order wins.
+    let mut effective = BTreeMap::<CanonicalFormId, (usize, IndexedMasterRecord)>::new();
+    for (master_index, index) in master_indexes.iter().enumerate() {
+        for (identity, record) in &index.matching_records {
+            effective.insert(identity.clone(), (master_index, record.clone()));
+        }
+    }
+
+    let group_contexts = record_group_contexts(plugin_bytes, plugin_source)?;
+    let oblivion_master_index = plugin
+        .masters
+        .iter()
+        .position(|master| master.eq_ignore_ascii_case("Oblivion.esm"));
+
+    let mut deletion_replacements = HashMap::new();
+    let mut deletion_candidates = Vec::new();
+    for (record, identity) in &overrides {
+        let form_id = record.form_id;
+        let winner = effective.get(identity);
+        if record.flags & DELETED_RECORD != 0 {
+            deletion_policy.deletion_stub_count += 1;
+            if record.kind != "REFR" {
+                deletion_policy
+                    .blockers
+                    .push(format!("deleted-override-not-a-refr:0x{form_id:08X}:{}", record.kind));
+                continue;
+            }
+            if record.flags != DELETED_RECORD {
+                deletion_policy
+                    .blockers
+                    .push(format!("deleted-override-carries-extra-flags:0x{form_id:08X}"));
+                continue;
+            }
+            if !record.subrecords.is_empty() {
+                deletion_policy
+                    .blockers
+                    .push(format!("deleted-override-carries-subrecords:0x{form_id:08X}"));
+                continue;
+            }
+            let contexts = group_contexts.get(&form_id).map(Vec::as_slice).unwrap_or_default();
+            let [context] = contexts else {
+                deletion_policy
+                    .blockers
+                    .push(format!("deleted-override-placement-ambiguous:0x{form_id:08X}"));
+                continue;
+            };
+            if context.group_types.last() != Some(&GROUP_CELL_TEMPORARY_CHILDREN)
+                || context.enclosing_cell_form_id.is_none()
+            {
+                deletion_policy.blockers.push(format!(
+                    "deleted-override-not-in-a-cell-temporary-group:0x{form_id:08X}"
+                ));
+                continue;
+            }
+            let Some((winner_master_index, winner)) = winner else {
+                deletion_policy
+                    .blockers
+                    .push(format!("deleted-override-winner-unresolved:0x{form_id:08X}"));
+                continue;
+            };
+            if winner.kind != "REFR" {
+                deletion_policy.blockers.push(format!(
+                    "deleted-override-winner-type-mismatch:0x{form_id:08X}:{}",
+                    winner.kind
+                ));
+                continue;
+            }
+            let Some(oblivion_index) = oblivion_master_index else {
+                deletion_policy
+                    .blockers
+                    .push("undelete-requires-a-declared-oblivion-esm-master".to_owned());
+                continue;
+            };
+            let provider_masters = &master_indexes[*winner_master_index].masters;
+            let mut remap = HashMap::new();
+            let mut remap_complete = true;
+            for (provider_index, provider_master) in provider_masters.iter().enumerate() {
+                match plugin
+                    .masters
+                    .iter()
+                    .position(|master| master.eq_ignore_ascii_case(provider_master))
+                {
+                    Some(position) => {
+                        remap.insert(provider_index as u8, position as u8);
+                    }
+                    None => {
+                        deletion_policy.blockers.push(format!(
+                            "deleted-override-winner-master-not-declared:0x{form_id:08X}:{provider_master}"
+                        ));
+                        remap_complete = false;
+                    }
+                }
+            }
+            remap.insert(provider_masters.len() as u8, *winner_master_index as u8);
+            if !remap_complete {
+                continue;
+            }
+            // Base object class must be in the proven-inert set.
+            let base_form_id = winner
+                .record
+                .subrecords
+                .iter()
+                .find(|sub| sub.kind == "NAME" && sub.data.len() == 4)
+                .map(|sub| u32::from_le_bytes(sub.data[..4].try_into().unwrap()));
+            let Some(base_form_id) = base_form_id else {
+                deletion_policy
+                    .blockers
+                    .push(format!("deleted-override-winner-has-no-base-object:0x{form_id:08X}"));
+                continue;
+            };
+            let base_identity = match canonical_form_id(
+                &winner.provider,
+                provider_masters,
+                base_form_id,
+            ) {
+                Ok(identity) => identity,
+                Err(_) => {
+                    deletion_policy.blockers.push(format!(
+                        "deleted-override-base-object-unmappable:0x{form_id:08X}:0x{base_form_id:08X}"
+                    ));
+                    continue;
+                }
+            };
+            let Some(base_master_index) = plugin
+                .masters
+                .iter()
+                .position(|master| master.to_ascii_lowercase() == base_identity.origin)
+            else {
+                deletion_policy.blockers.push(format!(
+                    "deleted-override-base-object-master-not-declared:0x{form_id:08X}:{}",
+                    base_identity.origin
+                ));
+                continue;
+            };
+            let player_form_id = (u32::try_from(oblivion_index)? << 24) | 0x14;
+            deletion_candidates.push(DeletionCandidate {
+                record,
+                origin_master: identity.origin.clone(),
+                enclosing_cell_form_id: context.enclosing_cell_form_id.unwrap_or_default(),
+                winner: winner.clone(),
+                remap,
+                base_form_id,
+                base_identity,
+                base_master_index,
+                player_form_id,
+            });
+            continue;
+        }
+
+        // Live override: per-subrecord three-way classification.
+        semantic_gate.evaluated_override_count += 1;
+        let Some((_, winner)) = winner else {
+            semantic_gate
+                .blockers
+                .push(format!("master-override-target-unresolved:0x{form_id:08X}"));
+            continue;
+        };
+        if winner.kind != record.kind {
+            semantic_gate.blockers.push(format!(
+                "master-override-type-mismatch:0x{form_id:08X}:expected-{}:found-{}",
+                record.kind, winner.kind
+            ));
+            continue;
+        }
+        let origin_index = (form_id >> 24) as usize;
+        let Some(origin) = master_indexes[origin_index].matching_records.get(identity) else {
+            semantic_gate.blockers.push(format!(
+                "master-override-origin-record-missing:0x{form_id:08X}:{}",
+                plugin.masters[origin_index]
+            ));
+            continue;
+        };
+        let mod_values = subrecord_tag_values(record);
+        let winner_values = subrecord_tag_values(&winner.record);
+        let origin_values = subrecord_tag_values(&origin.record);
+        let mut tags = BTreeSet::new();
+        tags.extend(mod_values.keys().cloned());
+        tags.extend(winner_values.keys().cloned());
+        let mut authored = Vec::new();
+        let mut revert_risk = Vec::new();
+        let mut merge_needed = Vec::new();
+        for tag in tags {
+            match three_way_field_classification(
+                mod_values.get(&tag),
+                winner_values.get(&tag),
+                origin_values.get(&tag),
+            ) {
+                Some("authored") => authored.push(tag),
+                Some("revert-risk") => revert_risk.push(tag),
+                Some("merge-needed") => merge_needed.push(tag),
+                _ => {}
+            }
+        }
+        let flags_of = |flags: u32| flags & !COMPRESSED_RECORD;
+        let flag_classification = match three_way_field_classification(
+            Some(&vec![flags_of(record.flags).to_le_bytes().to_vec()]),
+            Some(&vec![flags_of(winner.record.flags).to_le_bytes().to_vec()]),
+            Some(&vec![flags_of(origin.record.flags).to_le_bytes().to_vec()]),
+        ) {
+            Some(class) => class,
+            None => "identical",
+        };
+        if authored.is_empty()
+            && revert_risk.is_empty()
+            && merge_needed.is_empty()
+            && flag_classification == "identical"
+        {
+            semantic_gate.identical_override_count += 1;
+            continue;
+        }
+        semantic_gate.authored_field_change_count += authored.len();
+        semantic_gate.revert_risk_field_count += revert_risk.len();
+        semantic_gate.merge_needed_field_count += merge_needed.len();
+        semantic_gate.overrides.push(OverrideSemanticDisclosure {
+            form_id: format!("0x{form_id:08X}"),
+            kind: record.kind.clone(),
+            origin_master: identity.origin.clone(),
+            winner_provider: winner.provider.clone(),
+            authored_fields: authored,
+            revert_risk_fields: revert_risk,
+            merge_needed_fields: merge_needed,
+            flag_classification: flag_classification.to_owned(),
+        });
+    }
+
+    // Batched base-object resolution: index each involved declared master exactly once.
+    let mut base_wanted_by_master = BTreeMap::<usize, BTreeSet<CanonicalFormId>>::new();
+    for candidate in &deletion_candidates {
+        base_wanted_by_master
+            .entry(candidate.base_master_index)
+            .or_default()
+            .insert(candidate.base_identity.clone());
+    }
+    let mut base_records = BTreeMap::<CanonicalFormId, IndexedMasterRecord>::new();
+    for (master_index, base_wanted) in &base_wanted_by_master {
+        let declared_name = &plugin.masters[*master_index];
+        let candidate = single_data_entry(declared_name)?;
+        let base_index = index_installed_master(&candidate.path, declared_name, base_wanted)
+            .with_context(|| format!("indexing base objects in declared master {declared_name}"))?;
+        for (identity, record) in base_index.matching_records {
+            base_records.insert(identity, record);
+        }
+    }
+    for candidate in &deletion_candidates {
+        let form_id = candidate.record.form_id;
+        let Some(base_record) = base_records.get(&candidate.base_identity) else {
+            deletion_policy.blockers.push(format!(
+                "deleted-override-base-object-unresolved:0x{form_id:08X}:0x{:08X}",
+                candidate.base_form_id
+            ));
+            continue;
+        };
+        if !INERT_DELETION_BASE_KINDS.contains(&base_record.kind.as_str()) {
+            deletion_policy.blockers.push(format!(
+                "deleted-override-base-object-class-not-proven-inert:0x{form_id:08X}:{}",
+                base_record.kind
+            ));
+            continue;
+        }
+        match undelete_and_disable_refr(
+            candidate.record,
+            &candidate.winner.record,
+            &candidate.remap,
+            candidate.player_form_id,
+        ) {
+            Ok((rewritten, evidence)) => {
+                deletion_policy.transformable_count += 1;
+                *deletion_policy
+                    .base_object_kinds
+                    .entry(base_record.kind.clone())
+                    .or_default() += 1;
+                deletion_policy.records.push(DeletedRefrDisclosure {
+                    form_id: format!("0x{form_id:08X}"),
+                    origin_master: candidate.origin_master.clone(),
+                    winner_provider: candidate.winner.provider.clone(),
+                    enclosing_cell_form_id: format!("0x{:08X}", candidate.enclosing_cell_form_id),
+                    base_form_id: format!("0x{:08X}", candidate.base_form_id),
+                    base_kind: base_record.kind.clone(),
+                    base_editor_id: crate::tes4::record_editor_id(&base_record.record),
+                    evidence,
+                });
+                if deletion_replacements.insert(form_id, rewritten).is_some() {
+                    deletion_policy
+                        .blockers
+                        .push(format!("deleted-override-duplicate-form-id:0x{form_id:08X}"));
+                }
+            }
+            Err(error) => {
+                deletion_policy.blockers.push(format!(
+                    "deleted-override-transform-failed:0x{form_id:08X}:{error}"
+                ));
+            }
+        }
+    }
+
+    if deletion_policy.deletion_stub_count > 0 {
+        deletion_policy.status = if deletion_policy.blockers.is_empty()
+            && deletion_policy.transformable_count == deletion_policy.deletion_stub_count
+        {
+            deletion_policy.warnings.push(format!(
+                "{} witness-shaped REFR deletion stub(s) can be rewritten as undeleted, initially disabled, player-opposite enable-parented overrides; runtime cell-reset and save-game behavior still requires an in-game test",
+                deletion_policy.transformable_count
+            ));
+            "provable".to_owned()
+        } else {
+            "blocked".to_owned()
+        };
+    }
+    if semantic_gate.revert_risk_field_count > 0 || semantic_gate.merge_needed_field_count > 0 {
+        semantic_gate.warnings.push(format!(
+            "{} revert-risk field(s) and {} merge-needed field(s) carry pre-update master values over newer master changes; the shipping-game runtime test must cover these records",
+            semantic_gate.revert_risk_field_count, semantic_gate.merge_needed_field_count
+        ));
+    }
+    semantic_gate.blockers.sort();
+    semantic_gate.blockers.dedup();
+    semantic_gate.status = if semantic_gate.blockers.is_empty() {
+        "proven".to_owned()
+    } else {
+        "blocked".to_owned()
+    };
+    deletion_policy.blockers.sort();
+    deletion_policy.blockers.dedup();
+    if deletion_policy.status == "blocked" {
+        deletion_replacements.clear();
+    }
+    Ok(WorldspaceLaneEvaluation {
+        semantic_gate,
+        deleted_override_policy: deletion_policy,
+        deletion_replacements,
+    })
+}
+
 fn finish_worldspace_master_probe(
     mut report: WorldspaceMasterProbeReport,
 ) -> WorldspaceMasterProbeReport {
+    let deletion_policy_proven = report
+        .deleted_override_policy
+        .as_ref()
+        .is_some_and(|policy| policy.status == "provable");
+    if report.deleted_master_override_count > 0 && !deletion_policy_proven {
+        report.blockers.push(format!(
+            "deleted-master-overrides-require-dedicated-semantic-validation:found-{}",
+            report.deleted_master_override_count
+        ));
+    }
+    if report.deleted_master_override_count > 0 && deletion_policy_proven {
+        report.warnings.push(format!(
+            "{} deleted master override(s) satisfy the fail-closed undelete-and-disable witness contract; the rewrite is applied only by the guarded update lane and requires an in-game runtime test",
+            report.deleted_master_override_count
+        ));
+    }
+    if report
+        .semantic_gate
+        .as_ref()
+        .is_some_and(|gate| gate.status != "proven")
+    {
+        report
+            .blockers
+            .push("current-master-semantic-gate-blocked".to_owned());
+    }
     report.blockers.sort();
     report.blockers.dedup();
     report.warnings.sort();
@@ -1408,6 +2405,8 @@ fn worldspace_master_probe_from_staged(
         type_mismatch_override_count: 0,
         deleted_master_override_count: 0,
         masters: Vec::new(),
+        semantic_gate: None,
+        deleted_override_policy: None,
         blockers: Vec::new(),
         warnings: vec![
             "This probe proves only installed-master identity and record-type resolution; it does not prove record semantics, load-order safety, or runtime compatibility."
@@ -1510,6 +2509,24 @@ fn worldspace_master_probe_from_staged(
         return finish_worldspace_master_probe(report);
     }
 
+    let probe_self_slot = u8::try_from(plugin.masters.len())
+        .ok()
+        .map(|master_count| infer_self_slot(master_count, &plugin.records));
+    let probe_owned_index = probe_self_slot
+        .as_ref()
+        .and_then(SelfSlotInference::self_index)
+        .map(usize::from)
+        .unwrap_or(plugin.masters.len());
+    if let Some(SelfSlotInference::Ambiguous { candidates }) = probe_self_slot.as_ref() {
+        report.blockers.push(format!(
+            "self-slot-inference-ambiguous:candidates-{}",
+            candidates
+                .iter()
+                .map(|index| format!("0x{index:02X}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     let mut overrides = Vec::new();
     let mut wanted = BTreeSet::new();
     for record in &plugin.records {
@@ -1531,7 +2548,7 @@ fn worldspace_master_probe_from_staged(
             if record.flags & DELETED_RECORD != 0 {
                 report.deleted_master_override_count += 1;
             }
-        } else if source_index > plugin.masters.len() {
+        } else if source_index != probe_owned_index {
             report.blockers.push(format!(
                 "staged-plugin-record-index-out-of-range:0x{:08X}",
                 record.form_id
@@ -1539,12 +2556,6 @@ fn worldspace_master_probe_from_staged(
         }
     }
     report.master_override_count = overrides.len();
-    if report.deleted_master_override_count > 0 {
-        report.blockers.push(format!(
-            "deleted-master-overrides-require-dedicated-semantic-validation:found-{}",
-            report.deleted_master_override_count
-        ));
-    }
 
     let data_entries = match case_insensitive_data_entries(game_data_dir) {
         Ok(entries) => entries,
@@ -1677,6 +2688,24 @@ fn worldspace_master_probe_from_staged(
             }
         }
     }
+    let identity_resolved = report.declared_master_count > 0
+        && report.parsed_master_count == report.declared_master_count
+        && report.master_override_count > 0
+        && report.resolved_master_override_count == report.master_override_count
+        && report.type_mismatch_override_count == 0;
+    if identity_resolved {
+        match evaluate_worldspace_lane_semantics(&plugin, &payload, &relative, game_data_dir) {
+            Ok(evaluation) => {
+                report.semantic_gate = Some(evaluation.semantic_gate);
+                report.deleted_override_policy = Some(evaluation.deleted_override_policy);
+            }
+            Err(error) => {
+                report
+                    .warnings
+                    .push(format!("worldspace semantic gate could not run: {error}"));
+            }
+        }
+    }
     finish_worldspace_master_probe(report)
 }
 
@@ -1763,21 +2792,32 @@ fn additive_contract_from_staged(
         match plugin_paths {
             Ok(paths) if paths.len() == 1 => {
                 let relative = normalize_relative(paths[0].strip_prefix(root).unwrap_or(&paths[0]));
-                let semantic_result = (|| -> Result<usize> {
+                let semantic_result = (|| -> Result<(usize, Option<String>)> {
                     let payload = bounded_plugin_payload(&paths[0], &relative)?;
                     let plugin = read_plugin_bytes(&payload, &relative)?;
                     let plugin_index = u8::try_from(plugin.masters.len())?;
+                    let owned_index = infer_self_slot(plugin_index, &plugin.records)
+                        .self_index()
+                        .context("self-slot inference is ambiguous")?;
                     let owned_ids = plugin
                         .records
                         .iter()
-                        .filter(|record| (record.form_id >> 24) as u8 == plugin_index)
+                        .filter(|record| (record.form_id >> 24) as u8 >= plugin_index)
                         .map(|record| record.form_id)
                         .collect::<HashSet<_>>();
                     for entry in &sync_entries {
                         let local_id =
                             u32::from_str_radix(entry.local_form_id.trim_start_matches("0x"), 16)?;
-                        let full_id = ((plugin_index as u32) << 24) | local_id;
-                        if !owned_ids.contains(&full_id) {
+                        let owned_slots = plugin
+                            .records
+                            .iter()
+                            .map(|r| (r.form_id >> 24) as u8)
+                            .filter(|idx| *idx >= plugin_index)
+                            .collect::<HashSet<_>>();
+                        let matched = owned_slots
+                            .iter()
+                            .any(|slot| owned_ids.contains(&((*slot as u32) << 24 | local_id)));
+                        if !matched {
                             bail!(
                                 "SyncMap local FormID {} has no plugin-owned record",
                                 entry.local_form_id
@@ -1794,6 +2834,49 @@ fn additive_contract_from_staged(
                         .iter()
                         .filter(|record| ((record.form_id >> 24) as u8) < plugin_index)
                         .collect::<Vec<_>>();
+                    let inventory_only = overrides.iter().all(|record| {
+                        supports_additive_inventory_record(&record.kind)
+                            && record.flags & DELETED_RECORD == 0
+                    });
+                    if !inventory_only {
+                        // Overrides outside the proven inventory-merge contract:
+                        // byte-preserved acceptance requires the per-subrecord
+                        // three-way current-master semantic gate to resolve every
+                        // override's identity and type, and every deletion stub to
+                        // satisfy the undelete-and-disable witness policy.
+                        let evaluation = evaluate_worldspace_lane_semantics(
+                            &plugin,
+                            &payload,
+                            &relative,
+                            game_data_dir,
+                        )?;
+                        let gate = &evaluation.semantic_gate;
+                        if gate.status != "proven" {
+                            bail!(
+                                "current-master-semantic-gate-blocked:{}",
+                                gate.blockers.join(",")
+                            );
+                        }
+                        let deletion = &evaluation.deleted_override_policy;
+                        match deletion.status.as_str() {
+                            "not-applicable" | "provable" => {}
+                            _ => bail!(
+                                "undelete-and-disable-policy-blocked:{}",
+                                deletion.blockers.join(",")
+                            ),
+                        }
+                        let disclosure = format!(
+                            "{} master override(s) outside the inventory contract validated byte-preserved through {}: {} identical, {} authored field(s), {} revert-risk field(s), {} merge-needed field(s), {} deletion stub(s) transformable by the guarded update lane",
+                            gate.evaluated_override_count,
+                            WORLDSPACE_SEMANTIC_GATE_API,
+                            gate.identical_override_count,
+                            gate.authored_field_change_count,
+                            gate.revert_risk_field_count,
+                            gate.merge_needed_field_count,
+                            deletion.transformable_count,
+                        );
+                        return Ok((overrides.len(), Some(disclosure)));
+                    }
                     let target_ids = overrides
                         .iter()
                         .map(|record| record.form_id)
@@ -1846,10 +2929,13 @@ fn additive_contract_from_staged(
                         game_data_dir,
                         &referenced_master_ids,
                     )?;
-                    Ok(overrides.len())
+                    Ok((overrides.len(), None))
                 })();
                 match semantic_result {
-                    Ok(count) => validated_master_override_count = count,
+                    Ok((count, disclosure)) => {
+                        validated_master_override_count = count;
+                        warnings.extend(disclosure);
+                    }
                     Err(error) => {
                         let mut detail = format!("{error:#}");
                         if let Some(path) = game_data_dir {
@@ -1940,6 +3026,21 @@ pub fn verify_plugin_set_with_rewritten_esp(
     candidate_root: &Path,
     rewritten_relative_path: &str,
 ) -> Result<()> {
+    verify_plugin_set_with_rewritten_esps(
+        source_root,
+        candidate_root,
+        std::slice::from_ref(&rewritten_relative_path.to_owned()),
+    )
+}
+
+/// Same structural preservation proof as the single-ESP variant, allowing a
+/// declared set of semantically rewritten plugin paths; every other plugin
+/// artifact must remain byte-identical.
+pub fn verify_plugin_set_with_rewritten_esps(
+    source_root: &Path,
+    candidate_root: &Path,
+    rewritten_relative_paths: &[String],
+) -> Result<()> {
     let source = inspect_plugin_set(source_root)?;
     let candidate = inspect_plugin_set(candidate_root)?;
     let source = source
@@ -1955,12 +3056,13 @@ pub fn verify_plugin_set_with_rewritten_esp(
     if source.keys().collect::<Vec<_>>() != candidate.keys().collect::<Vec<_>>() {
         bail!("candidate plugin set differs in paths");
     }
-    let rewritten = rewritten_relative_path
-        .to_ascii_lowercase()
-        .replace('\\', "/");
+    let rewritten = rewritten_relative_paths
+        .iter()
+        .map(|path| path.to_ascii_lowercase().replace('\\', "/"))
+        .collect::<HashSet<_>>();
     for (path, source) in source {
         let candidate = candidate[&path];
-        if path == rewritten {
+        if rewritten.contains(&path) {
             if source.kind != "esp"
                 || candidate.kind != "esp"
                 || candidate.parse_status != "parsed"
@@ -2138,6 +3240,125 @@ mod tests {
     }
 
     #[test]
+    fn mixed_syncmap_binding_gate_binds_by_stem_and_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Fixture");
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\AlphaSaber.esp",
+            &plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801),
+        );
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\BetaSaber.esp",
+            &plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801),
+        );
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\SyncMap\AlphaSaber.ini",
+            b"[Meshes]\n000800=/Game/Fixture/Alpha.Alpha\n",
+        );
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\SyncMap\BetaSaber.ini",
+            b"[Meshes]\n000800=/Game/Fixture/Beta.Beta\n",
+        );
+        let gate = inspect_mixed_syncmap_binding_gate(&root, None).unwrap();
+        assert_eq!(gate.status, "proven");
+        assert_eq!(gate.logical_plugin_count, 2);
+        assert_eq!(gate.bound_plugin_count, 2);
+        assert_eq!(gate.bindings.len(), 2);
+
+        // A plugin without any SyncMap stays valid.
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\GammaSaber.esp",
+            &plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801),
+        );
+        let gate = inspect_mixed_syncmap_binding_gate(&root, None).unwrap();
+        assert_eq!(gate.status, "proven");
+        assert_eq!(gate.logical_plugin_count, 3);
+        assert_eq!(gate.bound_plugin_count, 2);
+    }
+
+    #[test]
+    fn mixed_syncmap_binding_gate_fails_closed_on_unbound_or_leaking_inis() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Fixture");
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\AlphaSaber.esp",
+            &plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801),
+        );
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\SyncMap\Orphan.ini",
+            b"[Meshes]\n000800=/Game/Fixture/Orphan.Orphan\n",
+        );
+        let gate = inspect_mixed_syncmap_binding_gate(&root, None).unwrap();
+        assert_eq!(gate.status, "blocked");
+        assert!(
+            gate.blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("syncmap-ini-binds-to-no-staged-plugin-stem"))
+        );
+
+        // A key outside the bound plugin's self slot fails closed.
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\SyncMap\AlphaSaber.ini",
+            b"[Meshes]\n000900=/Game/Fixture/Alpha.Alpha\n",
+        );
+        let gate = inspect_mixed_syncmap_binding_gate(&root, None).unwrap();
+        assert!(
+            gate.blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("syncmap-key-not-plugin-owned"))
+        );
+    }
+
+    #[test]
+    fn per_plugin_additive_policy_covers_each_logical_plugin() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Fixture");
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\AlphaSaber.esp",
+            &plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801),
+        );
+        write_plugin(
+            &root,
+            r"Content\Dev\ObvData\Data\BetaSaber.esp",
+            &plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801),
+        );
+        let report = inspect_plugin_set(&root).unwrap();
+        assert!(!report.additive_syncmap_v1.compatible);
+        let each = evaluate_additive_policy_for_each(&report);
+        assert_eq!(each.len(), 2);
+        assert!(each.iter().all(|(_, policy)| policy.compatible));
+
+        // The mirror-recognized duplicate collapses to one logical evaluation.
+        let mirror_root = temp.path().join("Mirror");
+        let bytes = plugin_bytes(&["Oblivion.esm"], &[("WEAP", 0x0100_0800)], 0x801);
+        write_plugin(&mirror_root, r"Content\Dev\ObvData\Data\Solo.esp", &bytes);
+        write_plugin(
+            &mirror_root,
+            r"Content\Dev\ObvData\Data\SyncMap\Solo.esp",
+            &bytes,
+        );
+        write_plugin(
+            &mirror_root,
+            r"Content\Dev\ObvData\Data\SyncMap\Solo.ini",
+            b"[Meshes]\n000800=/Game/Fixture/Solo.Solo\n",
+        );
+        let report = inspect_plugin_set(&mirror_root).unwrap();
+        assert_eq!(report.logical_plugin_count, 1);
+        let each = evaluate_additive_policy_for_each(&report);
+        assert_eq!(each.len(), 1);
+        assert!(each[0].1.compatible);
+    }
+
+    #[test]
     fn accepts_only_the_proven_single_esp_shape_for_mutation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("Fixture");
@@ -2150,6 +3371,56 @@ mod tests {
         assert_eq!(report.status, "complete");
         assert!(report.additive_syncmap_v1.compatible);
         assert_eq!(report.artifacts[0].plugin_owned_record_count, 1);
+    }
+
+    #[test]
+    fn treats_a_unique_preserved_self_slot_as_plugin_owned() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[
+                    ("CELL", 0x0004_9E28),
+                    ("WEAP", 0x0200_0ED4),
+                    ("REFR", 0x0200_30F7),
+                ],
+                0x4C48,
+            ),
+        );
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.parse_status, "parsed");
+        assert_eq!(artifact.plugin_owned_record_count, 2);
+        assert_eq!(artifact.master_override_record_count, 1);
+        assert_eq!(artifact.out_of_range_record_count, 0);
+        assert!(artifact.structural_blockers.is_empty());
+        assert!(
+            artifact
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("preserved self slot 2"))
+        );
+    }
+
+    #[test]
+    fn resolves_master_count_self_slot_with_out_of_range_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        write_plugin(
+            temp.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("WEAP", 0x0100_0800), ("REFR", 0x0200_0801)],
+                0x802,
+            ),
+        );
+        let report = inspect_plugin_set(temp.path()).unwrap();
+        let artifact = &report.artifacts[0];
+        assert_eq!(artifact.out_of_range_record_count, 1);
+        assert!(artifact.structural_blockers.is_empty());
+        assert!(artifact.warnings.iter().any(|w| w.contains("out-of-range siblings")));
     }
 
     #[test]
@@ -2201,7 +3472,9 @@ mod tests {
                 .blockers
                 .contains(&"case-insensitive-plugin-filename-collision".to_owned())
         );
-        assert!(report.additive_syncmap_v1.blockers.contains(
+        // Non-inventory master overrides are no longer a policy-level
+        // rejection; the additive contract's semantic gate decides them.
+        assert!(!report.additive_syncmap_v1.blockers.contains(
             &"master-overrides-outside-supported-inventory-records-are-unsupported".to_owned()
         ));
         assert!(
@@ -2704,5 +3977,344 @@ mod tests {
             blocker
                 == "installed-master-unmappable-record-collides-with-target-local-id:Base.esm:0x01001234"
         }));
+    }
+
+    #[test]
+    fn additive_contract_gates_non_inventory_master_overrides_through_current_master_semantics() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // One owned WEAP mapped by the SyncMap plus one CELL master override
+        // whose bytes match the installed master exactly: the worldspace
+        // parenting pattern that additive mods use to place their content.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("CELL", 0x0000_4499), ("WEAP", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_4499)], 0x900),
+        );
+
+        let (plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(
+            plugins.additive_syncmap_v1.compatible,
+            "policy blockers: {:?}",
+            plugins.additive_syncmap_v1.blockers
+        );
+        assert!(
+            contract.compatible,
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+        assert!(contract.current_master_checked);
+        assert_eq!(contract.validated_master_override_count, 1);
+        assert!(
+            contract
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(WORLDSPACE_SEMANTIC_GATE_API)),
+            "warnings: {:?}",
+            contract.warnings
+        );
+    }
+
+    #[test]
+    fn additive_contract_still_fails_closed_when_the_semantic_gate_cannot_resolve() {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // The CELL override targets a record the installed master does not
+        // contain, so the gate must block the contract.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm"],
+                &[("CELL", 0x0000_4499), ("WEAP", 0x0100_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("CELL", 0x0000_9999)], 0x900),
+        );
+
+        let (_plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(!contract.compatible);
+        assert!(
+            contract
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("current-master-semantic-gate-blocked")),
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+    }
+
+    #[test]
+    fn additive_contract_accepts_installed_masters_with_free_master_order_when_nothing_resolves_through_them()
+     {
+        let staged = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        // The staged plugin owns one WEAP and overrides nothing, exactly like
+        // a standalone-weapon mod that declares the remaster's own base ESP as
+        // a late master.
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\Fixture.esp",
+            &plugin_bytes(
+                &["Oblivion.esm", "AltarESPMain.esp"],
+                &[("WEAP", 0x0200_0800)],
+                0x801,
+            ),
+        );
+        write_plugin(
+            staged.path(),
+            r"Content\Dev\ObvData\Data\SyncMap\Fixture.ini",
+            b"[Meshes]\n000800=/Game/Forms/items/weapons/Fixture.Fixture",
+        );
+        write_plugin(
+            data.path(),
+            "Oblivion.esm",
+            &plugin_bytes(&[], &[("STAT", 0x0000_0800)], 0x900),
+        );
+        // The installed base ESP declares its own master order, which is not a
+        // prefix of the staged plugin's chain. Nothing in the staged plugin
+        // resolves through it, so name-based presence is sufficient.
+        write_plugin(
+            data.path(),
+            "AltarESPMain.esp",
+            &plugin_bytes(
+                &["Oblivion.esm", "DLCFoo.esp"],
+                &[("STAT", 0x0200_0800)],
+                0x900,
+            ),
+        );
+
+        let (_plugins, contract) =
+            inspect_additive_contract_input(staged.path(), None, Some(data.path())).unwrap();
+        assert!(
+            contract.compatible,
+            "contract blockers: {:?}",
+            contract.blockers
+        );
+        assert!(contract.current_master_checked);
+    }
+
+    fn raw_record(kind: &str, form_id: u32, flags: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = kind.as_bytes().to_vec();
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&form_id.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn raw_group(label: [u8; 4], group_type: u32, children: &[u8]) -> Vec<u8> {
+        let mut out = b"GRUP".to_vec();
+        out.extend_from_slice(&((children.len() + 20) as u32).to_le_bytes());
+        out.extend_from_slice(&label);
+        out.extend_from_slice(&group_type.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(children);
+        out
+    }
+
+    fn raw_plugin(masters: &[&str], entry_count: u32, body: &[u8]) -> Vec<u8> {
+        let mut header_data = Vec::new();
+        let mut hedr = 1.0_f32.to_le_bytes().to_vec();
+        hedr.extend_from_slice(&entry_count.to_le_bytes());
+        hedr.extend_from_slice(&0x2000_u32.to_le_bytes());
+        header_data.extend(subrecord("HEDR", &hedr));
+        for master in masters {
+            let mut name = master.as_bytes().to_vec();
+            name.push(0);
+            header_data.extend(subrecord("MAST", &name));
+            header_data.extend(subrecord("DATA", &[0; 8]));
+        }
+        let mut bytes = raw_record("TES4", 0, 0, &header_data);
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn refr_data(z: f32) -> Vec<u8> {
+        let mut data = Vec::new();
+        for value in [10.0_f32, 20.0, z, 0.0, 0.0, 1.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data
+    }
+
+    fn semantic_fixture(deleted_stub_group_type: u32) -> (tempfile::TempDir, Vec<u8>) {
+        let data_dir = tempfile::tempdir().unwrap();
+
+        // Oblivion.esm: FURN base, vanilla REFR placement, and the original CELL.
+        let mut esm_body = Vec::new();
+        esm_body.extend(raw_record(
+            "FURN",
+            0x0001_D5C0,
+            0,
+            &subrecord("EDID", b"BedrollFixture\0"),
+        ));
+        let mut refr_payload = subrecord("NAME", &0x0001_D5C0_u32.to_le_bytes());
+        refr_payload.extend(subrecord("XACN", b"0.06.0\0"));
+        refr_payload.extend(subrecord("DATA", &refr_data(300.0)));
+        esm_body.extend(raw_record("REFR", 0x0009_47D3, 0, &refr_payload));
+        let mut cell_payload = subrecord("FULL", b"Old Name\0");
+        cell_payload.extend(subrecord("XCLL", &[1, 2, 3, 4]));
+        esm_body.extend(raw_record("CELL", 0x0000_4499, 0, &cell_payload));
+        fs::write(
+            data_dir.path().join("Oblivion.esm"),
+            raw_plugin(&[], 3, &esm_body),
+        )
+        .unwrap();
+
+        // Patch.esp (the newer master): rewrites the CELL's XCLL and adds XTLI.
+        let mut patched_cell = subrecord("FULL", b"Old Name\0");
+        patched_cell.extend(subrecord("XCLL", &[9, 9, 9, 9]));
+        patched_cell.extend(subrecord("XTLI", &2_u32.to_le_bytes()));
+        let patch_body = raw_record("CELL", 0x0000_4499, 0, &patched_cell);
+        fs::write(
+            data_dir.path().join("Patch.esp"),
+            raw_plugin(&["Oblivion.esm"], 1, &patch_body),
+        )
+        .unwrap();
+
+        // The staged mod: one authored CELL override and one zero-body deleted REFR stub
+        // inside (by default) a cell-temporary group chain.
+        let mut authored_cell = subrecord("FULL", b"Renamed Camp\0");
+        authored_cell.extend(subrecord("XCLL", &[1, 2, 3, 4]));
+        let mut mod_body = raw_record("CELL", 0x0000_4499, 0, &authored_cell);
+        let stub = raw_record("REFR", 0x0009_47D3, DELETED_RECORD, &[]);
+        let temporary = raw_group(
+            0x0000_4499_u32.to_le_bytes(),
+            deleted_stub_group_type,
+            &stub,
+        );
+        let cell_children = raw_group(
+            0x0000_4499_u32.to_le_bytes(),
+            crate::tes4::GROUP_CELL_CHILDREN,
+            &temporary,
+        );
+        mod_body.extend_from_slice(&raw_group(*b"WRLD", 0, &cell_children));
+        let mod_bytes = raw_plugin(&["Oblivion.esm", "Patch.esp"], 5, &mod_body);
+        (data_dir, mod_bytes)
+    }
+
+    #[test]
+    fn worldspace_semantics_prove_witness_deletion_and_classify_fields() {
+        let (data_dir, mod_bytes) = semantic_fixture(crate::tes4::GROUP_CELL_TEMPORARY_CHILDREN);
+        let plugin = read_plugin_bytes(&mod_bytes, "mod.esp").unwrap();
+        let evaluation =
+            evaluate_worldspace_lane_semantics(&plugin, &mod_bytes, "mod.esp", data_dir.path())
+                .unwrap();
+
+        let policy = &evaluation.deleted_override_policy;
+        assert_eq!(policy.status, "provable", "blockers: {:?}", policy.blockers);
+        assert_eq!(policy.deletion_stub_count, 1);
+        assert_eq!(policy.transformable_count, 1);
+        assert_eq!(policy.base_object_kinds.get("FURN"), Some(&1));
+        assert_eq!(policy.records.len(), 1);
+        assert_eq!(policy.records[0].base_editor_id.as_deref(), Some("BedrollFixture"));
+        assert_eq!(policy.records[0].enclosing_cell_form_id, "0x00004499");
+        let replacement = &evaluation.deletion_replacements[&0x0009_47D3];
+        assert_eq!(
+            replacement.flags,
+            crate::tes4::INITIALLY_DISABLED_RECORD
+        );
+        let kinds = replacement
+            .subrecords
+            .iter()
+            .map(|sub| sub.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["NAME", "XESP", "XACN", "DATA"]);
+
+        let gate = &evaluation.semantic_gate;
+        assert_eq!(gate.status, "proven", "blockers: {:?}", gate.blockers);
+        assert_eq!(gate.evaluated_override_count, 1);
+        assert_eq!(gate.identical_override_count, 0);
+        assert_eq!(gate.overrides.len(), 1);
+        let cell = &gate.overrides[0];
+        assert_eq!(cell.form_id, "0x00004499");
+        assert_eq!(cell.winner_provider, "Patch.esp");
+        assert_eq!(cell.authored_fields, vec!["FULL"]);
+        assert_eq!(cell.revert_risk_fields, vec!["XCLL", "XTLI"]);
+        assert!(cell.merge_needed_fields.is_empty());
+        assert_eq!(cell.flag_classification, "identical");
+        assert!(gate.warnings.iter().any(|warning| warning.contains("revert-risk")));
+    }
+
+    #[test]
+    fn worldspace_semantics_fail_closed_outside_the_deletion_witness_shape() {
+        // The same stub placed in a cell-persistent group must be refused.
+        let (data_dir, mod_bytes) =
+            semantic_fixture(crate::tes4::GROUP_CELL_PERSISTENT_CHILDREN);
+        let plugin = read_plugin_bytes(&mod_bytes, "mod.esp").unwrap();
+        let evaluation =
+            evaluate_worldspace_lane_semantics(&plugin, &mod_bytes, "mod.esp", data_dir.path())
+                .unwrap();
+        let policy = &evaluation.deleted_override_policy;
+        assert_eq!(policy.status, "blocked");
+        assert!(policy.blockers.iter().any(|blocker| {
+            blocker == "deleted-override-not-in-a-cell-temporary-group:0x000947D3"
+        }));
+        assert!(evaluation.deletion_replacements.is_empty());
+    }
+
+    #[test]
+    fn worldspace_probe_discloses_proven_deletion_policy_without_the_deleted_blocker() {
+        let (data_dir, mod_bytes) = semantic_fixture(crate::tes4::GROUP_CELL_TEMPORARY_CHILDREN);
+        let staged = tempfile::tempdir().unwrap();
+        write_plugin(
+            staged.path(),
+            "Content/Dev/ObvData/Data/mod.esp",
+            &mod_bytes,
+        );
+        let plugin_set = inspect_plugin_set(staged.path()).unwrap();
+        let probe =
+            worldspace_master_probe_from_staged(staged.path(), &plugin_set, data_dir.path());
+        assert_eq!(probe.deleted_master_override_count, 1);
+        assert!(
+            !probe
+                .blockers
+                .iter()
+                .any(|blocker| blocker.starts_with("deleted-master-overrides-require")),
+            "blockers: {:?}",
+            probe.blockers
+        );
+        assert_eq!(
+            probe
+                .deleted_override_policy
+                .as_ref()
+                .map(|policy| policy.status.as_str()),
+            Some("provable")
+        );
+        assert_eq!(
+            probe
+                .semantic_gate
+                .as_ref()
+                .map(|gate| gate.status.as_str()),
+            Some("proven")
+        );
+        assert!(probe.resolution_complete, "blockers: {:?}", probe.blockers);
     }
 }

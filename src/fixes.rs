@@ -45,6 +45,12 @@ pub struct UnresolvedDependencyEdgeTrace {
     pub source_package_id: u64,
     pub source_package_path: String,
     pub missing_dependency_package_id: u64,
+    /// Mounted package names spelled inside the consumer package's own Zen
+    /// name map whose derived package ID equals the missing dependency ID.
+    /// Empty whenever no hash-exact authored name was recovered; the field is
+    /// evidence only and never resolves, drops, or rebinds the edge.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub authored_package_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -184,6 +190,7 @@ pub fn diagnose_package_dependencies(
                     source_package_id: package.package_id,
                     source_package_path: package.path.clone(),
                     missing_dependency_package_id: *dependency,
+                    authored_package_names: Vec::new(),
                 });
             }
         }
@@ -242,13 +249,6 @@ pub fn package_filter_path(path: &str) -> Result<String> {
     if parts.is_empty() || parts.iter().any(|part| matches!(*part, "." | "..")) {
         bail!("package filter path contains unresolved traversal: {path}");
     }
-    let content_index = parts
-        .iter()
-        .position(|part| part.eq_ignore_ascii_case("Content"))
-        .with_context(|| format!("package filter path has no Content root: {path}"))?;
-    if content_index > 1 || content_index + 1 >= parts.len() {
-        bail!("package filter path has an unsupported mount layout: {path}");
-    }
     let extension = Path::new(parts.last().unwrap())
         .extension()
         .and_then(|value| value.to_str())
@@ -256,7 +256,20 @@ pub fn package_filter_path(path: &str) -> Result<String> {
     if !matches!(extension.to_ascii_lowercase().as_str(), "uasset" | "umap") {
         bail!("package filter path is not a UAsset or UMap: {path}");
     }
-    Ok(parts.join("/"))
+    let content_index = parts
+        .iter()
+        .position(|part| part.eq_ignore_ascii_case("Content"));
+    if let Some(content_index) = content_index {
+        if content_index > 1 || content_index + 1 >= parts.len() {
+            bail!("package filter path has an unsupported mount layout: {path}");
+        }
+        Ok(parts.join("/"))
+    } else {
+        // Bare mount-root packages (../../../Leaf.uasset) have no Content
+        // directory; they are only used as retoc --filter values, which match
+        // by substring. The filename without extension is the safest filter.
+        Ok((*parts.last().unwrap()).to_owned())
+    }
 }
 
 pub fn extract_packages_with_dependency_view(
@@ -273,6 +286,12 @@ pub fn extract_packages_with_dependency_view(
     let mut filters = Vec::with_capacity(packages.len());
     for package in packages {
         let filter = package_filter_path(&package.path)?;
+        let bare_root = !package
+            .path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+            .any(|part| part.eq_ignore_ascii_case("Content"));
         let result = retoc.run([
             OsString::from("to-legacy"),
             dependency_view.as_os_str().to_owned(),
@@ -287,7 +306,15 @@ pub fn extract_packages_with_dependency_view(
         ])?;
         let package_label = format!("{label} {}", package.path);
         let (extracted, failed) = RetocTool::extraction_summary(&result, &package_label)?;
-        if failed != 0 || extracted != 1 {
+        if failed != 0 || extracted == 0 {
+            bail!(
+                "{package_label} extracted no packages; extracted {extracted}, failed {failed}"
+            );
+        }
+        // Bare mount-root packages (../../../Leaf.uasset) use a stem-only
+        // filter that can match more than one entry; the composite migration
+        // resolves them by package ID, so imprecise extraction is safe here.
+        if !bare_root && extracted != 1 {
             bail!(
                 "{package_label} expected exactly one package; extracted {extracted}, failed {failed}"
             );
@@ -448,9 +475,23 @@ mod tests {
                 (20, 99, "../../../Content/Forms/B.uasset"),
             ]
         );
+        assert!(
+            report
+                .unresolved_edges
+                .iter()
+                .all(|edge| edge.authored_package_names.is_empty())
+        );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["api"], DEPENDENCY_DIAGNOSTIC_API);
         assert_eq!(json["unresolvedEdges"][0]["missingDependencyPackageId"], 98);
+        assert!(
+            json["unresolvedEdges"][0]
+                .as_object()
+                .unwrap()
+                .get("authoredPackageNames")
+                .is_none(),
+            "unproven authored names must stay out of the serialized report"
+        );
 
         let reordered = diagnose_package_dependencies(
             &[

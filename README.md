@@ -48,6 +48,149 @@ The desktop application is `target/release/obr-mod-updater.exe`. The repository 
 
 To assemble the Windows tester package, run `scripts/Build-Release.ps1`. The generated package is written under `dist/` and is not committed.
 
+## Tested Mods (v0.7.0)
+
+Structurally verified against the conversion pipeline. Each mod passed preflight, adapter selection, and candidate production. In-game runtime testing is separate.
+
+### Passing (126 mods)
+
+| Nexus ID | Mod | Adapter |
+|----------|-----|---------|
+| 509 | Zireael | Armor Replacement |
+| 511 | Long-Neck Poison Club | Armor Replacement |
+| 534 | Sweet Roll Club | Armor Replacement |
+| 845 | Zireael - Ciri's Sword | Armor Replacement |
+| 860 | BeksBlades | Armor Replacement |
+| 977 | Super Sledge Standalone | Additive SyncMap |
+| 1069 | Anduril | Armor Replacement |
+| 1592 | Off-hand Staves (Standalone) | Additive SyncMap |
+| 1592 | Parrying Daggers (Standalone) | Additive SyncMap |
+| 1943 | Shadowrend One-Handed Sword | Armor Replacement |
+| 1951 | Skull Mask of Nocturnal | Armor Replacement |
+| 2469 | LegolasDagger | Mixed Composite |
+| 2505 | Jack of Blades v2.1 | Armor Replacement |
+| 2511 | Sword of Aeons v1 | Armor Replacement |
+| 2623 | Excalibur | Mixed Composite |
+| 2661 | Super Sledge in Blacksmith Basement | Additive SyncMap |
+| 2674 | Moonveil Standalone | Additive SyncMap |
+| 2674 | Replaces Shadowrend Two Handed | Armor Replacement |
+| 2674 | Replaces Sword of Jyggalag | Armor Replacement |
+| 2674 | Replaces Umbra One Handed | Armor Replacement |
+| 2674 | Replaces Umbra Katana | Armor Replacement |
+| 2699 | Dragonslayer - Regular Size | Armor Replacement |
+| 2811 | DaneAxe v1.1 | Armor Replacement |
+| 2833 | SaroumaneStaff | Mixed Composite |
+| 2889 | Sword Of Aeons (Standalone) | Logical Install |
+| 2936 | Unbroken Blade | Plugin-Only ESP |
+| 3004 | Jack Of Blades Armor (Standalone) | Logical Install |
+| 3058 | Dragon Slayer | Additive SyncMap |
+| 3091 | Dildo Sword | Armor Replacement |
+| 3140 | Dante's Rebellion (Daedric Claymore) | Armor Replacement |
+| 3140 | Dante's Rebellion (Shadowrend) | Armor Replacement |
+| 3140 | Dante's Rebellion (Sword of Jyggalag) | Armor Replacement |
+| 3140 | Dante's Rebellion (Umbra) | Armor Replacement |
+| 3180 | Blackwater Basket-Hilt | Armor Replacement |
+| 3180 | Debaser Replacer Steel | Armor Replacement |
+| 3180 | Scabbard Remover | Armor Replacement |
+| 3180 | Shortsword of Akatosh | Armor Replacement |
+| 3184 | Imperial Glock | Armor Replacement |
+| 3184 | Glock (Standalone) | Additive SyncMap |
+| 3194 | Cutlass Shortsword Conversion | Mixed Composite |
+| 3265 | Fortnite Peter Griffin (Mesh) | Armor Replacement |
+| 3265 | Fortnite Peter Griffin (Standalone) | Logical Install |
+| 3274 | The Quint (Less shiny, Shadowrend) | Heterogeneous |
+| 3274 | The Quint (Less shiny, Jyggalag) | Heterogeneous |
+| 3274 | The Quint (Shadowrend) | Heterogeneous |
+| 3274 | The Quint (Sword of Jyggalag) | Heterogeneous |
+| 3310 | Minecraft Sword | Heterogeneous |
+| 3362 | Wilburgurs LIL REE | Plugin-Only ESP |
+| 3453 | All Heads Invisible | Armor Replacement |
+| 3525 | Berserker Armor (Standalone) | Logical Install |
+| 3569 | NecroCarnis | Additive SyncMap |
+| 3569 | NecroCarnis No Enchant | Additive SyncMap |
+| 3599 | Scythe Standalone | Logical Install |
+| 3634 | Ashbringer (Standalone) | Logical Install |
+| 3640 | Sword | Armor Replacement |
+| 3874 | N12 - Transmute Apparel | Plugin-Only ESP |
+| 3999 | Torch Weapons | Additive SyncMap |
+| 4065 | EBONY XIPHOS v1 | Armor Replacement |
+| 4065 | EBONY XIPHOS v2 | Armor Replacement |
+| 4076 | Brick (Standalone) | Additive SyncMap |
+| 4226 | The Bereaver | Additive SyncMap |
+| 4228 | Avo's Tear | Additive SyncMap |
+| 4230 | Brass Katana | Additive SyncMap |
+| 4230 | Shadow Katana | Additive SyncMap |
+| 4230 | Steel Katana | Additive SyncMap |
+| 4232 | Tree | Additive SyncMap |
+| 4233 | Invincible | Additive SyncMap |
+| 4234 | Casca's Sword | Additive SyncMap |
+| 4279 | Soul Edge (SHINY) | Additive SyncMap |
+| 4279 | Soul Edge v2 (NOT SHINY) | Additive SyncMap |
+| 4290 | Cataclysm's Edge | Additive SyncMap |
+| 4291 | Lion's Head Halberd | Additive SyncMap |
+| 4322 | Flame Assassin Set | Additive SyncMap |
+| 4322 | Regular Assassin Set | Additive SyncMap |
+| 4326 | Skorm's Bow | Additive SyncMap |
+| 4327 | Dragon Longsword (Runescape 3) | Additive SyncMap |
+| 4394 | Caladbolg - Non Shiny | Additive SyncMap |
+| 4394 | Caladbolg - Shiny | Additive SyncMap |
+| 4430 | Farm Scythe (FOMOD) | FOMOD Logical Install |
+| 4432 | Ancient Muramasa | Mixed Composite |
+| 4459 | Icebreaker | Additive SyncMap |
+| 4626 | Mihawk's Kogatana (Mini Yoru) | Additive SyncMap |
+| 4626 | Mihawk's Yoru | Additive SyncMap |
+| 4630 | The Infinity Blade | Additive SyncMap |
+| 4633 | Corrupted Ashbringer | Additive SyncMap |
+| 4634 | Frying Pan (Mega included) | Additive SyncMap |
+| 4635 | The Penetrator | Additive SyncMap |
+| 4636 | Morgul Blade | Additive SyncMap |
+| 4637 | Moonlight Greatsword | Additive SyncMap |
+| 4639 | Mugen's Katana | Additive SyncMap |
+| 4640 | Oblivion Blade of Nulgath | Additive SyncMap |
+| 4641 | Shovel | Additive SyncMap |
+| 4642 | Gael's Greatsword | Additive SyncMap |
+| 4681 | Cosmic's Glock Sounds Effects | Pak-Only Passthrough |
+| 4681 | Glock Standalone w/ Holster | Mixed Composite |
+| 4702 | Cosmic's Lightsaber Sound Effects | Pak-Only Passthrough |
+| 4702 | Lightsabers All in One | Mixed Composite |
+| 4709 | Cosmic's Spear | Additive SyncMap |
+| 4710 | Sepulchure's DOOMBlade | Additive SyncMap |
+| 4720 | Ray Gun | Additive SyncMap |
+| 4720 | Ray Gun (sound variant) | Pak-Only Passthrough |
+| 4725 | Hotdog Bun Quiver and Arrow | Additive SyncMap |
+| 4729 | Warglaives of Azzinoth | Additive SyncMap |
+| 4748 | Cosmic's Backpack LOWERED | Additive SyncMap |
+| 4758 | Link's Backpack | Additive SyncMap |
+| 4770 | The Master Sword | Additive SyncMap |
+| 4771 | The Kingdom Key Keyblade | Additive SyncMap |
+| 4778 | THE ALMIGHTY HAIRBALL | Additive SyncMap |
+| 4840 | Cosmic's Black Cape | Additive SyncMap |
+| 4840 | Cosmic's Capes | Additive SyncMap |
+| 4843 | Anakin Easter with Force Push | Additive SyncMap |
+| 5027 | Cosmic's Stances - Dual Wielding (Anime) | Additive SyncMap |
+| 5027 | Cosmic's Stances - Dual Wielding (Regular) | Additive SyncMap |
+| 5027 | Nerfed Weapon Damage ESP | Plugin-Only ESP |
+| 5039 | Cosmic's Dances n Emotes | Armor Replacement |
+| 5050 | Cosmic's Simple Flip (MultiJump) | Armor Replacement |
+| 5050 | Cosmic's Simple Flip (Single Jump) | Armor Replacement |
+| 5051 | Cosmic's Simple Slide | Armor Replacement |
+| 5081 | Cosmic's Flail | Additive SyncMap |
+| 5086 | Cosmic's Equippable Wings | Additive SyncMap |
+| 5086 | Cosmic's Permanent Wings | Additive SyncMap |
+| 5095 | Cosmic's Movement | Additive Container-Only |
+| 5469 | Cosmic's Homelander Armor | Mixed Composite |
+
+### Known Issues (6 mods)
+
+| Nexus ID | Mod | Reason |
+|----------|-----|--------|
+| 1757 | BaskethiltSwordResource | Source resource pack (loose FBX/PNG files only, no game containers) |
+| 4891 | C.A.F.E | External standalone tool (exe + DLLs), not a game mod |
+| 4979 | Berserk Armor | Multi-container structural conflict under investigation |
+| 5497 | CosmicMCM | Pure UE4SS Lua script mod, no game containers to update |
+| 5498 | TimeCrunch | Mixed script + container mod, script sidecar publication pending |
+| 5503 | Better Horse Control | Pure UE4SS Lua script mod, no game containers to update |
+
 ## Project layout
 
 - `src/` contains the Rust application, preflight checks, conversion adapters, and verification code.

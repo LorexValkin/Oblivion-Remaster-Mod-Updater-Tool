@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 const ADDITIVE_SYNCMAP_ADAPTER: &str = "native-additive-syncmap-v1";
+const MAGICLOADER_WORLDSPACE_ADAPTER: &str = "native-magicloader-worldspace-syncmap-v1";
 
 #[derive(Clone, Debug)]
 pub struct CandidateInstallRequest {
@@ -163,7 +164,10 @@ fn prepare_direct_container_candidate(candidate_root: &Path) -> Result<PreparedC
 }
 
 fn prepare_candidate(adapter: &str, candidate_root: &Path) -> Result<PreparedCandidate> {
-    if adapter == ADDITIVE_SYNCMAP_ADAPTER || nested_logical_install_adapter(adapter).is_some() {
+    if adapter == ADDITIVE_SYNCMAP_ADAPTER
+        || adapter == MAGICLOADER_WORLDSPACE_ADAPTER
+        || nested_logical_install_adapter(adapter).is_some()
+    {
         prepare_structured_candidate(candidate_root)
     } else if is_direct_container_adapter(adapter) {
         prepare_direct_container_candidate(candidate_root)

@@ -3493,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "obr-mod-updater"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -3508,6 +3508,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-rust",
+ "sha1",
  "sha2 0.11.0",
  "slint",
  "slint-build",
@@ -4344,6 +4345,17 @@ dependencies = [
  "nt-time",
  "sha2 0.10.9",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
 ]
 
 [[package]]

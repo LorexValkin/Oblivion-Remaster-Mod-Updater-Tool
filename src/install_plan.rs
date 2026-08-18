@@ -189,11 +189,13 @@ pub fn nested_logical_install_adapter(adapter: &str) -> Option<&str> {
 /// group currently has only one possible selection.
 pub fn supports_logical_install_publication(plan: &InstallPlan) -> bool {
     plan.api == INSTALL_PLAN_API
-        && plan.choice_groups.is_empty()
+        && plan.choice_groups.iter().all(|group| group.options.len() == 1)
         && !plan.mappings.is_empty()
         && matches!(
             plan.evidence,
-            LayoutEvidence::Canonical | LayoutEvidence::ManualStructural
+            LayoutEvidence::Canonical
+                | LayoutEvidence::ManualStructural
+                | LayoutEvidence::Fomod
         )
 }
 
@@ -1244,6 +1246,7 @@ fn parse_fomod(sources: &SourceIndex, xml: &[u8]) -> Result<InstallPlan> {
                 let name = event_name(&start);
                 let frame = match name.as_str() {
                     "requiredinstallfiles" => XmlFrame::Required,
+                    "typedescriptor" | "image" => XmlFrame::Other,
                     "moduledependencies"
                     | "conditionalfileinstalls"
                     | "dependencies"
@@ -1253,7 +1256,6 @@ fn parse_fomod(sources: &SourceIndex, xml: &[u8]) -> Result<InstallPlan> {
                     | "fommdependency"
                     | "visible"
                     | "conditionflags"
-                    | "typedescriptor"
                     | "dependencytype" => {
                         bail!(
                             "conditional or type-dependent FOMOD element is not supported by this bounded reader: {name}"
@@ -1334,7 +1336,6 @@ fn parse_fomod(sources: &SourceIndex, xml: &[u8]) -> Result<InstallPlan> {
                         | "fommdependency"
                         | "visible"
                         | "conditionflags"
-                        | "typedescriptor"
                         | "dependencytype"
                 ) {
                     bail!(
@@ -1398,8 +1399,21 @@ struct ManualPath {
     tail: Vec<String>,
 }
 
+/// Published manual layouts spell the same instruction with irregular spacing
+/// ("Place in Paks  folder") or possessive filler ("Place in your Data folder").
+/// Matching compares whitespace-collapsed lowercase tokens with filler words
+/// removed, so the recognizer stays pattern-based instead of spelling-exact.
+fn phrase_tokens(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .filter(|token| !matches!(token.as_str(), "your" | "the"))
+        .collect()
+}
+
 fn phrase(part: &str, values: &[&str]) -> bool {
-    values.iter().any(|value| part.eq_ignore_ascii_case(value))
+    let tokens = phrase_tokens(part);
+    !tokens.is_empty() && values.iter().any(|value| phrase_tokens(value) == tokens)
 }
 
 fn manual_data_path(path: &PathBuf) -> Option<ManualPath> {
@@ -1430,6 +1444,7 @@ fn manual_paks_path(path: &PathBuf) -> Option<ManualPath> {
                 "Place in Content Paks Mods Folder",
                 "Content Paks Mods",
                 "Mods",
+                "~mods",
             ],
         ) && index + 1 < components.len()
         {
@@ -1463,6 +1478,36 @@ fn manual_paks_path(path: &PathBuf) -> Option<ManualPath> {
     None
 }
 
+/// A plugin dropped directly beside a recognized container folder, without any
+/// Data-labelled wrapper: `<Wrapper>/<X>.esp` next to `<Wrapper>/~mods/...`.
+/// The container anchor supplies the structural evidence the plugin lacks.
+fn manual_bare_plugin_paths(
+    sources: &SourceIndex,
+    pak_candidates: &[ManualPath],
+) -> Vec<ManualPath> {
+    let pak_wrappers: BTreeSet<&str> = pak_candidates
+        .iter()
+        .map(|path| path.wrapper.as_str())
+        .collect();
+    sources
+        .ordered
+        .iter()
+        .filter(|path| matches!(extension(path).as_str(), "esp" | "esm" | "esl"))
+        .filter_map(|path| {
+            let components = parts(path);
+            let (file, wrapper_parts) = components.split_last()?;
+            let wrapper = wrapper_parts.join("/").to_lowercase();
+            pak_wrappers
+                .contains(wrapper.as_str())
+                .then(|| ManualPath {
+                    source: path.clone(),
+                    wrapper,
+                    tail: vec![file.clone()],
+                })
+        })
+        .collect()
+}
+
 fn manual_plan(sources: &SourceIndex) -> Result<InstallPlan> {
     let data_candidates: Vec<ManualPath> = sources
         .ordered
@@ -1476,20 +1521,27 @@ fn manual_plan(sources: &SourceIndex) -> Result<InstallPlan> {
         .filter(|path| matches!(extension(&path.source).as_str(), "pak" | "ucas" | "utoc"))
         .collect();
 
-    let plugins: Vec<&ManualPath> = data_candidates
+    let anchored_plugins: Vec<ManualPath> = data_candidates
         .iter()
         .filter(|path| {
             path.tail.len() == 1
                 && matches!(extension(&path.source).as_str(), "esp" | "esm" | "esl")
         })
+        .cloned()
         .collect();
+    let bare_plugin_lane = anchored_plugins.is_empty();
+    let plugins: Vec<ManualPath> = if bare_plugin_lane {
+        manual_bare_plugin_paths(sources, &pak_candidates)
+    } else {
+        anchored_plugins
+    };
     if plugins.len() != 1 {
         bail!(
             "manual layout requires exactly one structurally anchored plugin; found {}",
             plugins.len()
         );
     }
-    let plugin = plugins[0];
+    let plugin = &plugins[0];
     let plugin_stem = plugin
         .source
         .file_stem()
@@ -1508,14 +1560,16 @@ fn manual_plan(sources: &SourceIndex) -> Result<InstallPlan> {
                     .is_some_and(|stem| stem.eq_ignore_ascii_case(plugin_stem))
         })
         .collect();
-    if sync_maps.len() != 1 {
+    if sync_maps.len() > 1 {
         bail!(
-            "manual layout requires one same-stem SyncMap for the plugin; found {}",
+            "manual layout requires at most one same-stem SyncMap for the plugin; found {}",
             sync_maps.len()
         );
     }
-    let sync_map = sync_maps[0];
-    if plugin.wrapper != sync_map.wrapper {
+    let sync_map = sync_maps.first().copied();
+    if let Some(sync_map) = sync_map
+        && plugin.wrapper != sync_map.wrapper
+    {
         bail!("plugin and SyncMap do not share one structural wrapper");
     }
 
@@ -1562,21 +1616,25 @@ fn manual_plan(sources: &SourceIndex) -> Result<InstallPlan> {
             )
         })
         .count();
-    if payload_candidates != 2 || pak_candidates.len() != triples.len() * 3 {
+    let expected_data_payloads =
+        usize::from(!bare_plugin_lane) + usize::from(sync_map.is_some());
+    if payload_candidates != expected_data_payloads
+        || pak_candidates.len() != triples.len() * 3
+    {
         bail!("manual layout contains additional or cross-wrapper payload candidates");
     }
 
-    let mut mappings = vec![
-        InstallMapping {
-            physical_source: plugin.source.clone(),
-            logical_destination: safe_path(&format!(
-                "Content/Dev/ObvData/Data/{}",
-                plugin.tail.join("/")
-            ))?,
-            priority: 0,
-            scope: MappingScope::Required,
-        },
-        InstallMapping {
+    let mut mappings = vec![InstallMapping {
+        physical_source: plugin.source.clone(),
+        logical_destination: safe_path(&format!(
+            "Content/Dev/ObvData/Data/{}",
+            plugin.tail.join("/")
+        ))?,
+        priority: 0,
+        scope: MappingScope::Required,
+    }];
+    if let Some(sync_map) = sync_map {
+        mappings.push(InstallMapping {
             physical_source: sync_map.source.clone(),
             logical_destination: safe_path(&format!(
                 "Content/Dev/ObvData/Data/{}",
@@ -1584,8 +1642,8 @@ fn manual_plan(sources: &SourceIndex) -> Result<InstallPlan> {
             ))?,
             priority: 0,
             scope: MappingScope::Required,
-        },
-    ];
+        });
+    }
     for files in triples.values() {
         for path in files.values() {
             mappings.push(InstallMapping {
@@ -1597,6 +1655,30 @@ fn manual_plan(sources: &SourceIndex) -> Result<InstallPlan> {
                 priority: 0,
                 scope: MappingScope::Required,
             });
+        }
+    }
+    if bare_plugin_lane {
+        // The bare-plugin lane carries no Data-labelled evidence, so every
+        // functional payload must be claimed by the plan; a stray plugin, INI,
+        // or container file means the recognizer cannot prove this layout.
+        let mapped: BTreeSet<String> = mappings
+            .iter()
+            .map(|mapping| path_key(&mapping.physical_source))
+            .collect();
+        let stray = sources
+            .ordered
+            .iter()
+            .filter(|path| {
+                matches!(
+                    extension(path).as_str(),
+                    "esp" | "esm" | "esl" | "ini" | "pak" | "ucas" | "utoc"
+                ) && !mapped.contains(&path_key(path))
+            })
+            .count();
+        if stray != 0 {
+            bail!(
+                "manual bare-plugin layout leaves {stray} functional payload(s) unanchored"
+            );
         }
     }
     make_plan(
@@ -1664,6 +1746,89 @@ mod tests {
             mapping.physical_source == Path::new("Wrapped/Place in Paks/Example.utoc")
                 && mapping.logical_destination == Path::new("Content/Paks/~mods/Example.utoc")
         }));
+    }
+
+    #[test]
+    fn infers_place_in_folders_with_collapsed_whitespace_and_filler_words() {
+        // "Place in Paks  folder" (double space) is a real published layout quirk.
+        let doubled_space = files(&[
+            "Wrapped/Oblivion Remastered/Place in Data folder/Example.esp",
+            "Wrapped/Oblivion Remastered/Place in Data folder/SyncMap/Example.ini",
+            "Wrapped/Oblivion Remastered/Place in Paks  folder/Example.pak",
+            "Wrapped/Oblivion Remastered/Place in Paks  folder/Example.ucas",
+            "Wrapped/Oblivion Remastered/Place in Paks  folder/Example.utoc",
+            "Wrapped/Installation.txt",
+        ]);
+        let plan = resolve_install_plan(&doubled_space, None).unwrap();
+        assert_eq!(plan.evidence, LayoutEvidence::ManualStructural);
+        assert_eq!(plan.mappings.len(), 5);
+        assert_eq!(plan.unmapped_sources, files(&["Wrapped/Installation.txt"]));
+
+        // "Place in your Data folder" carries a possessive filler word.
+        let filler_word = files(&[
+            "Wrapped/Place in your Data folder/Example.esp",
+            "Wrapped/Place in your Data folder/SyncMap/Example.ini",
+            "Wrapped/Place in your Paks folder/Example.pak",
+            "Wrapped/Place in your Paks folder/Example.ucas",
+            "Wrapped/Place in your Paks folder/Example.utoc",
+        ]);
+        let plan = resolve_install_plan(&filler_word, None).unwrap();
+        assert_eq!(plan.evidence, LayoutEvidence::ManualStructural);
+        assert_eq!(plan.mappings.len(), 5);
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.physical_source == Path::new("Wrapped/Place in your Data folder/Example.esp")
+                && mapping.logical_destination == Path::new("Content/Dev/ObvData/Data/Example.esp")
+        }));
+    }
+
+    #[test]
+    fn anchors_a_bare_plugin_beside_a_mods_container_folder() {
+        // `<Wrapper>/<X>.esp` next to `<Wrapper>/~mods/<triple>` is the common
+        // early standalone drop layout without any SyncMap sidecar.
+        let source = files(&[
+            "ExampleWeapon/ExampleWeapon.esp",
+            "ExampleWeapon/~mods/ExampleWeapon_P.pak",
+            "ExampleWeapon/~mods/ExampleWeapon_P.ucas",
+            "ExampleWeapon/~mods/ExampleWeapon_P.utoc",
+        ]);
+        let plan = resolve_install_plan(&source, None).unwrap();
+        assert_eq!(plan.evidence, LayoutEvidence::ManualStructural);
+        assert_eq!(plan.mappings.len(), 4);
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.physical_source == Path::new("ExampleWeapon/ExampleWeapon.esp")
+                && mapping.logical_destination
+                    == Path::new("Content/Dev/ObvData/Data/ExampleWeapon.esp")
+        }));
+        assert!(plan.mappings.iter().any(|mapping| {
+            mapping.physical_source == Path::new("ExampleWeapon/~mods/ExampleWeapon_P.utoc")
+                && mapping.logical_destination
+                    == Path::new("Content/Paks/~mods/ExampleWeapon_P.utoc")
+        }));
+        assert!(plan.unmapped_sources.is_empty());
+    }
+
+    #[test]
+    fn bare_plugin_anchoring_stays_fail_closed_for_stray_functional_payloads() {
+        // A second unanchored plugin means the recognizer cannot claim the layout.
+        let two_plugins = files(&[
+            "ExampleWeapon/ExampleWeapon.esp",
+            "ExampleWeapon/Alternate.esp",
+            "ExampleWeapon/~mods/ExampleWeapon_P.pak",
+            "ExampleWeapon/~mods/ExampleWeapon_P.ucas",
+            "ExampleWeapon/~mods/ExampleWeapon_P.utoc",
+        ]);
+        assert!(resolve_install_plan(&two_plugins, None).is_err());
+
+        // A functional INI outside any recognized structure must not be silently
+        // excluded from the logical view.
+        let stray_ini = files(&[
+            "ExampleWeapon/ExampleWeapon.esp",
+            "ExampleWeapon/ExampleWeapon.ini",
+            "ExampleWeapon/~mods/ExampleWeapon_P.pak",
+            "ExampleWeapon/~mods/ExampleWeapon_P.ucas",
+            "ExampleWeapon/~mods/ExampleWeapon_P.utoc",
+        ]);
+        assert!(resolve_install_plan(&stray_ini, None).is_err());
     }
 
     #[test]
@@ -1825,7 +1990,7 @@ mod tests {
             </files><typeDescriptor><type name="Optional" /></typeDescriptor></plugin>
           </plugins></group>
         </optionalFileGroups></installStep></installSteps></config>"#;
-        assert!(resolve_install_plan(&source, Some(typed_option)).is_err());
+        assert!(resolve_install_plan(&source, Some(typed_option)).is_ok());
     }
 
     #[test]

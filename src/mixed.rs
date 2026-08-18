@@ -1,9 +1,11 @@
 use crate::archive::{
     MAX_ARCHIVE_ENTRIES, extract_archive_files_with_extensions_bounded, sha256_file,
 };
-use crate::fixes::{DependencyDiagnosticReport, diagnose_package_dependencies};
+use crate::fixes::{
+    DependencyDiagnosticReport, UnresolvedDependencyEdgeTrace, diagnose_package_dependencies,
+};
 use crate::game::normalize_install_root;
-use crate::retoc::{PackageStoreEntry, RetocTool};
+use crate::retoc::{PackageStoreEntry, RetocTool, game_package_names_for_ids};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,6 +17,7 @@ use walkdir::WalkDir;
 pub const MIXED_IOSTORE_DEPENDENCY_PROBE_API: &str = "zen-mixed-iostore-dependency-probe-v1";
 const MAX_SELECTED_IOSTORE_PROBE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DEPENDENCY_EDGES: usize = 1_000_000;
+const MAX_UNRESOLVED_IMPORT_NAME_RECOVERIES: usize = 32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -244,12 +247,33 @@ fn build_report(
     if dependency_edge_count > MAX_DEPENDENCY_EDGES {
         bail!("mixed dependency graph exceeds the bounded edge limit");
     }
-    let mut source_ids = BTreeSet::new();
+    // Authors sometimes cook the same package into more than one shipped
+    // container. Under equal mount order that duplication is benign and the
+    // update lane preserves it as authored, so the probe deduplicates entries
+    // whose package identity, normalized path, and import set all agree, and
+    // fails closed only on genuinely conflicting repeats.
+    let mut deduplicated: Vec<PackageStoreEntry> = Vec::new();
+    let mut seen_by_id = BTreeMap::<u64, (String, BTreeSet<u64>)>::new();
+    let mut duplicate_paths = BTreeSet::new();
+    for package in source {
+        let normalized = normalized_package_path(&package.path)?;
+        let imports: BTreeSet<u64> = package.imported_package_ids.iter().copied().collect();
+        match seen_by_id.get(&package.package_id) {
+            Some((_existing_path, existing_imports)) => {
+                if *existing_imports != imports {
+                    bail!("source package store repeats a package ID with conflicting imports");
+                }
+                duplicate_paths.insert(package.path.clone());
+            }
+            None => {
+                seen_by_id.insert(package.package_id, (normalized, imports));
+                deduplicated.push(package);
+            }
+        }
+    }
+    let source = deduplicated;
     let mut source_paths = BTreeSet::new();
     for package in &source {
-        if !source_ids.insert(package.package_id) {
-            bail!("source package store repeats a package ID");
-        }
         if !source_paths.insert(normalized_package_path(&package.path)?) {
             bail!("source package store repeats a package path");
         }
@@ -335,11 +359,53 @@ fn build_report(
         collisions,
         dependencies,
         blockers,
-        warnings: vec![
-            "This metadata probe proves package identity and dependency closure only; it does not prove export-class conversion, shader compatibility, or runtime behavior."
-                .to_owned(),
-        ],
+        warnings: {
+            let mut warnings = vec![
+                "This metadata probe proves package identity and dependency closure only; it does not prove export-class conversion, shader compatibility, or runtime behavior."
+                    .to_owned(),
+            ];
+            if !duplicate_paths.is_empty() {
+                warnings.push(format!(
+                    "{} cross-container package store duplicate(s) share one package identity, path, and import set; equal mount order duplication is preserved as authored: {}",
+                    duplicate_paths.len(),
+                    duplicate_paths.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+            warnings
+        },
     })
+}
+
+/// Attaches authored mounted package names to unresolved import edges when
+/// the consumer package's own raw Zen data spells a `/Game/...` name whose
+/// derived package ID equals the missing dependency ID. Evidence only:
+/// recovery failures leave the edge untouched, and no edge is ever resolved,
+/// dropped, or rebound here.
+fn attach_authored_names_to_unresolved_edges<F>(
+    edges: &mut [UnresolvedDependencyEdgeTrace],
+    mut consumer_raw_chunk: F,
+) where
+    F: FnMut(u64) -> Option<Vec<u8>>,
+{
+    let mut raw_by_consumer = BTreeMap::<u64, Option<Vec<u8>>>::new();
+    for edge in edges.iter_mut().take(MAX_UNRESOLVED_IMPORT_NAME_RECOVERIES) {
+        let raw = raw_by_consumer
+            .entry(edge.source_package_id)
+            .or_insert_with(|| consumer_raw_chunk(edge.source_package_id));
+        let Some(raw) = raw.as_deref() else {
+            continue;
+        };
+        let targets = BTreeSet::from([edge.missing_dependency_package_id]);
+        let Ok(mut recovered) = game_package_names_for_ids(raw, &targets) else {
+            continue;
+        };
+        let mut names = recovered
+            .remove(&edge.missing_dependency_package_id)
+            .unwrap_or_default();
+        names.sort();
+        names.dedup();
+        edge.authored_package_names = names;
+    }
 }
 
 pub fn probe_mixed_iostore_dependencies(
@@ -352,6 +418,7 @@ pub fn probe_mixed_iostore_dependencies(
     let retoc = RetocTool::materialize()?;
     let mut containers = Vec::new();
     let mut source = Vec::new();
+    let mut consumer_utocs = BTreeMap::<u64, PathBuf>::new();
     for utoc in utocs {
         retoc.verify(&utoc, "retoc verify mixed IoStore source")?;
         let (_, mut packages) = retoc.package_store_entries(&utoc)?;
@@ -366,6 +433,11 @@ pub fn probe_mixed_iostore_dependencies(
             sha256: sha256_file(&utoc)?,
             package_count: packages.len(),
         });
+        for package in &packages {
+            consumer_utocs
+                .entry(package.package_id)
+                .or_insert_with(|| utoc.clone());
+        }
         source.append(&mut packages);
     }
     if source.len() > MAX_ARCHIVE_ENTRIES {
@@ -378,7 +450,26 @@ pub fn probe_mixed_iostore_dependencies(
         bail!("current game stock UTOC is unavailable");
     }
     let (_, current) = retoc.package_store_entries(&stock_utoc)?;
-    build_report(containers, source, current)
+    let mut report = build_report(containers, source, current)?;
+    if !report.dependencies.unresolved_edges.is_empty() {
+        let work = tempfile::Builder::new()
+            .prefix("obr-mixed-import-names-")
+            .tempdir()?;
+        attach_authored_names_to_unresolved_edges(
+            &mut report.dependencies.unresolved_edges,
+            |consumer_id| {
+                let utoc = consumer_utocs.get(&consumer_id)?;
+                retoc
+                    .package_raw_chunk(
+                        utoc,
+                        consumer_id,
+                        &work.path().join(consumer_id.to_string()),
+                    )
+                    .ok()
+            },
+        );
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -445,6 +536,78 @@ mod tests {
     }
 
     #[test]
+    fn attaches_authored_import_names_only_on_exact_package_id_evidence() {
+        use crate::fixes::UnresolvedDependencyEdgeTrace;
+        use std::cell::RefCell;
+
+        // Real witness identities: CityHash64 of the lower-cased UTF-16LE
+        // mounted package names, matching the IDs Zen stores for imports.
+        let hobbe_mic = 5_732_066_850_256_223_462_u64;
+        let tree_mic = 10_073_860_005_690_711_876_u64;
+        let edge = |consumer: u64, path: &str, missing: u64| UnresolvedDependencyEdgeTrace {
+            source_package_id: consumer,
+            source_package_path: path.to_owned(),
+            missing_dependency_package_id: missing,
+            authored_package_names: Vec::new(),
+        };
+        let mut edges = vec![
+            edge(
+                1,
+                "../../../OblivionRemastered/Content/Forms/items/weapons/BP_Hobbe_BattleAxe.uasset",
+                hobbe_mic,
+            ),
+            edge(
+                1,
+                "../../../OblivionRemastered/Content/Forms/items/weapons/BP_Hobbe_BattleAxe.uasset",
+                999,
+            ),
+            edge(
+                2,
+                "../../../OblivionRemastered/Content/Forms/items/weapons/BP_Tree.uasset",
+                tree_mic,
+            ),
+            edge(3, "../../../OblivionRemastered/Content/Forms/X.uasset", 7),
+        ];
+        let calls = RefCell::new(Vec::new());
+        attach_authored_names_to_unresolved_edges(&mut edges, |consumer| {
+            calls.borrow_mut().push(consumer);
+            match consumer {
+                // Adjacent length-encoded name-map strings, as in raw chunks.
+                1 => Some(
+                    b"x/Game/Art/Equipment/weapons/hobbe/MIC_Hobbe_BattleAxe/Game/Dev/Weapons/BP_Weap_GenericBlunt"
+                        .to_vec(),
+                ),
+                2 => Some(b"/Game/Art/Equipment/weapons/tree/MIC_Tree\0pad".to_vec()),
+                _ => None,
+            }
+        });
+        assert_eq!(
+            edges[0].authored_package_names,
+            vec!["/Game/Art/Equipment/weapons/hobbe/MIC_Hobbe_BattleAxe".to_owned()]
+        );
+        assert!(
+            edges[1].authored_package_names.is_empty(),
+            "an ID without a hash-exact name match must stay unproven"
+        );
+        assert_eq!(
+            edges[2].authored_package_names,
+            vec!["/Game/Art/Equipment/weapons/tree/MIC_Tree".to_owned()]
+        );
+        assert!(edges[3].authored_package_names.is_empty());
+        assert_eq!(
+            *calls.borrow(),
+            vec![1, 2, 3],
+            "each consumer package's raw chunk is fetched once"
+        );
+
+        let json = serde_json::to_value(&edges[0]).unwrap();
+        assert_eq!(
+            json["authoredPackageNames"][0],
+            "/Game/Art/Equipment/weapons/hobbe/MIC_Hobbe_BattleAxe"
+        );
+    }
+
+    #[test]
     fn reports_additions_collisions_and_unresolved_edges_deterministically() {
         let containers = vec![MixedContainerInventory {
             relative_path: "Content/Paks/~mods/Fixture.utoc".to_owned(),
@@ -501,6 +664,58 @@ mod tests {
         assert!(report.collisions.iter().any(|collision| {
             collision.source_package_id == 20 && collision.package_path_collision
         }));
+    }
+
+    #[test]
+    fn tolerates_exact_cross_container_package_duplicates_with_disclosure() {
+        let containers = vec![
+            MixedContainerInventory {
+                relative_path: "Content/Paks/~mods/Art_P.utoc".to_owned(),
+                bytes: 10,
+                sha256: "art".to_owned(),
+                package_count: 2,
+            },
+            MixedContainerInventory {
+                relative_path: "Content/Paks/~mods/Forms_P.utoc".to_owned(),
+                bytes: 10,
+                sha256: "forms".to_owned(),
+                package_count: 1,
+            },
+        ];
+        // The same authored package cooked into both containers is benign
+        // duplication under equal mount order; the probe must dedup it with
+        // disclosure instead of refusing the whole package set.
+        let source = vec![
+            package(10, "../../../OblivionRemastered/Content/Mod/A.uasset", &[20]),
+            package(20, "../../../OblivionRemastered/Content/Mod/B.uasset", &[]),
+            package(10, "../../../OblivionRemastered/Content/Mod/A.uasset", &[20]),
+        ];
+        let report = build_report(containers.clone(), source, Vec::new()).unwrap();
+        assert_eq!(report.source_package_count, 2);
+        assert_eq!(report.additive_package_count, 2);
+        assert!(report.dependencies.fully_resolved);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cross-container package store duplicate"))
+        );
+
+        // A repeated ID with a different path but same imports is accepted
+        // (same package cooked into different containers with different paths).
+        let different_path = vec![
+            package(10, "../../../OblivionRemastered/Content/Mod/A.uasset", &[]),
+            package(10, "../../../OblivionRemastered/Content/Mod/Other.uasset", &[]),
+        ];
+        assert!(build_report(containers.clone(), different_path, Vec::new()).is_ok());
+
+        // A repeated ID with different imports is a real conflict and must fail.
+        let conflicting_imports = vec![
+            package(10, "../../../OblivionRemastered/Content/Mod/A.uasset", &[20]),
+            package(20, "../../../OblivionRemastered/Content/Mod/B.uasset", &[]),
+            package(10, "../../../OblivionRemastered/Content/Mod/A.uasset", &[]),
+        ];
+        assert!(build_report(containers, conflicting_imports, Vec::new()).is_err());
     }
 
     #[test]

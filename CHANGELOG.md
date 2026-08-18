@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.0 - 2026-08-17
+
+- Add `native-plugin-only-esp-v1` adapter for mods containing only an ESP plugin with optional SyncMap, MagicLoader, and documentation sidecars. The plugin-only lane resolves Data-plane layout, proves current-master semantics, rewrites deletion stubs as undeleted-and-disabled overrides, and byte-preserves every other record.
+- Add `native-pak-only-passthrough-v1` adapter for sound and asset mods shipping bare UE4 `.pak` files without IoStore containers. Paks pass through byte-preserved.
+- Add `native-additive-container-only-v1` adapter for mods that add entirely new content via IoStore containers with no game package collisions. Containers pass through byte-preserved without package-level probing.
+- Widen the asset classifier to recognize AnimSequence, AnimMontage, BlendSpace, SoundWave, and SoundCue as primary export classes with opaque replacement semantics.
+- Accept 5-segment container paths (`Content/Paks/<folder>/<subfolder>/<file>`) in addition to 4-segment direct paths, unblocking mods with author-named subfolder nesting.
+- Accept resolved dependency closures with intentional game-package collisions. Mods that replace existing game packages with fully resolved imports are no longer blocked by the collision gate.
+- Accept cross-container duplicate package IDs when imports match (same package cooked into multiple containers by the mod author).
+- Resolve plugin-only candidate root from the Data plane alone when no IoStore containers exist, fixing MagicLoader config misclassification for mods like Tribal Minotaur Camps.
+- Resolve ambiguous ESP self-slot inference when `master_count` is among candidates, and downgrade out-of-range sibling records to a warning. Fixes Moonveil and similar ESPs with orphan records from removed master dependencies.
+- Include records from all non-master slots in SyncMap owned-ID validation, fixing SyncMap bindings that reference records in sibling slots.
+- Accept FOMOD `typeDescriptor` and `image` elements as non-conditional, and support logical install publication for deterministic single-option FOMOD choice groups.
+- Filter UE4SS `SkipMessages/*.ini` configs from plugin-only Data-plane staging.
+- Treat source resource files (FBX, OBJ, blend, PSD, etc.) as non-blocking documentation.
+- Structurally tested 126 mods across 7 adapter types. See [docs/TESTED-MODS.md](docs/TESTED-MODS.md) for the full list.
+
 ## 0.6.3 - 2026-08-14
 
 - Extend the guarded additive lane to ordered full-master chains with `Oblivion.esm` first and inventory-only `CONT`, `CREA`, and `NPC_` overrides. A field-aware three-way merge preserves newly installed master rows and the mod's additions, rejects conflicts, rewrites only proven records, updates nested group sizes and compression, and reparses the completed ESP.
